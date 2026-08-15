@@ -101,3 +101,28 @@ def test_snapshot_integrity_check_requires_every_selected_file(tmp_path):
     assert verify(snapshot, files, include=["config.json"], exclude=[]) == ["config.json"]
     with pytest.raises(RuntimeError, match="model.safetensors"):
         verify(snapshot, files, include=[], exclude=[])
+
+
+def test_huggingface_cli_uses_writable_cache_home(tmp_path):
+    cache = tmp_path / "hf-cache" / "hub"
+    build_environment = getattr(
+        huggingface,
+        "huggingface_environment",
+        lambda *_args, **_kwargs: {},
+    )
+
+    environment = build_environment(cache, {"HOME": "/"})
+
+    assert environment["HOME"] == str(cache.parent)
+    assert environment["HF_HOME"] == str(cache.parent)
+    assert environment["HF_HUB_CACHE"] == str(cache)
+    assert environment["HF_XET_CACHE"] == str(cache.parent / "xet")
+    assert environment["XDG_CACHE_HOME"] == str(cache.parent / ".cache")
+
+
+def test_huggingface_cli_errors_are_sanitized():
+    sanitize = getattr(huggingface, "sanitize_cli_output", lambda _value: "")
+
+    result = sanitize("\x1b[31mPermission denied hf_abcdefghijklmnopqrstuvwxyz\x1b[0m")
+
+    assert result == "Permission denied [REDACTED_HF_TOKEN]"

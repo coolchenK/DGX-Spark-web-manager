@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from fnmatch import fnmatch
 from pathlib import Path
@@ -15,6 +16,8 @@ from app.services.discovery import directory_size, resolve_hf_snapshot
 from app.tasks.engine import TaskCancelled, TaskContext, TaskPaused
 
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+HF_TOKEN_PATTERN = re.compile(r"hf_[A-Za-z0-9]{10,}", re.IGNORECASE)
 
 
 def validate_repository_id(value: str) -> str:
@@ -105,6 +108,32 @@ def verify_snapshot_files(
     return expected
 
 
+def huggingface_environment(cache_dir: Path, base_environment: dict[str, str]) -> dict[str, str]:
+    cache_home = cache_dir.parent
+    environment = dict(base_environment)
+    environment.update(
+        {
+            "HOME": str(cache_home),
+            "HF_HOME": str(cache_home),
+            "HF_HUB_CACHE": str(cache_dir),
+            "HF_XET_CACHE": str(cache_home / "xet"),
+            "XDG_CACHE_HOME": str(cache_home / ".cache"),
+        }
+    )
+    return environment
+
+
+def sanitize_cli_output(value: str) -> str:
+    sanitized = ANSI_ESCAPE.sub("", value)
+    sanitized = HF_TOKEN_PATTERN.sub("[REDACTED_HF_TOKEN]", sanitized)
+    sanitized = "".join(
+        character
+        for character in sanitized
+        if character in "\n\t" or ord(character) >= 32
+    )
+    return sanitized.strip()[-4000:]
+
+
 class HuggingFaceService:
     def __init__(self, cache_dir: Path, token: str | None = None):
         self.cache_dir = cache_dir
@@ -185,40 +214,49 @@ class HuggingFaceService:
             command.extend(["--include", str(pattern)])
         for pattern in exclude:
             command.extend(["--exclude", str(pattern)])
-        env = os.environ.copy()
+        cache_home = self.cache_dir.parent
+        (cache_home / "xet").mkdir(parents=True, exist_ok=True)
+        (cache_home / ".cache").mkdir(parents=True, exist_ok=True)
+        env = huggingface_environment(self.cache_dir, dict(os.environ))
         if self.token:
             env["HF_TOKEN"] = self.token
         context.update(total_bytes=total_bytes, message=f"Downloading {repository_id}@{revision}")
-        process = subprocess.Popen(
-            command,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            while process.poll() is None:
-                completed = directory_size(target) if target.exists() else 0
-                progress = completed / total_bytes * 100 if total_bytes else 0
-                context.update(
-                    progress=min(progress, 99),
-                    completed_bytes=completed,
-                    total_bytes=total_bytes,
-                )
-                try:
-                    context.check_control()
-                except (TaskPaused, TaskCancelled):
-                    process.terminate()
+        with tempfile.TemporaryFile() as cli_output:
+            process = subprocess.Popen(
+                command,
+                env=env,
+                stdout=cli_output,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                while process.poll() is None:
+                    completed = directory_size(target) if target.exists() else 0
+                    progress = completed / total_bytes * 100 if total_bytes else 0
+                    context.update(
+                        progress=min(progress, 99),
+                        completed_bytes=completed,
+                        total_bytes=total_bytes,
+                    )
                     try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    raise
-                time.sleep(1)
-        finally:
-            if process.poll() is None:
-                process.terminate()
-        if process.returncode != 0:
-            raise RuntimeError(f"Hugging Face download exited with code {process.returncode}")
+                        context.check_control()
+                    except (TaskPaused, TaskCancelled):
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        raise
+                    time.sleep(1)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+            if process.returncode != 0:
+                cli_output.seek(0)
+                details = sanitize_cli_output(cli_output.read().decode("utf-8", errors="replace"))
+                suffix = f": {details}" if details else ""
+                raise RuntimeError(
+                    f"Hugging Face download exited with code {process.returncode}{suffix}"
+                )
         completed = directory_size(target)
         snapshot = resolve_hf_snapshot(target)
         verified_files = verify_snapshot_files(

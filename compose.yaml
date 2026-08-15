@@ -24,6 +24,11 @@ services:
       DGX_MODEL_ROOTS: /models,/hf-cache/hub
       DGX_MODEL_ROOT_MAPPINGS: /models=${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env};/hf-cache/hub=${HF_HOME_HOST:?Set HF_HOME_HOST in .env}/hub
       DGX_HF_CACHE_DIR: /hf-cache/hub
+      HOME: /hf-cache
+      HF_HOME: /hf-cache
+      HF_HUB_CACHE: /hf-cache/hub
+      HF_XET_CACHE: /hf-cache/xet
+      XDG_CACHE_HOME: /hf-cache/.cache
       DGX_AUTO_DISCOVERY: "true"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
