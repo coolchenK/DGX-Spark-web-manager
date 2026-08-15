@@ -22,8 +22,8 @@ WORKDIR /app
 COPY pyproject.toml README.md alembic.ini ./
 COPY backend/ ./backend/
 COPY scripts/entrypoint.sh ./scripts/entrypoint.sh
-COPY --from=frontend-builder /build/frontend/dist ./frontend/dist
 RUN python -m pip install . && chmod +x ./scripts/entrypoint.sh && mkdir -p /app/data && chown -R manager:manager /app
+COPY --from=frontend-builder --chown=manager:manager /build/frontend/dist ./frontend/dist
 
 USER manager
 EXPOSE 3000
