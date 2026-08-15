@@ -119,6 +119,7 @@ def test_settings_preserve_container_to_host_model_root_order(tmp_path):
     )
 
     assert getattr(settings, "host_model_root_paths", ()) == (host_models, host_hf)
+    assert getattr(settings, "deployment_startup_timeout_seconds", None) == 300
 
 
 def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):
@@ -194,4 +195,77 @@ def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):
         "Type": "json-file",
         "Config": {"max-size": "10m", "max-file": "5"},
     }
+
+
+def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path, monkeypatch):
+    model_root = tmp_path / "models"
+    model_path = model_root / "model"
+    model_path.mkdir(parents=True)
+    database = Database(f"sqlite:///{tmp_path / 'timeout.db'}")
+    database.create_schema()
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(model_root,))
+    service = deployment_service.DeploymentService(
+        adapters={"vllm": adapter},
+        session_factory=database.session_factory,
+        model_roots=(model_root,),
+        startup_timeout_seconds=2,
+    )
+
+    class FakeContainer:
+        id = "new-container"
+        name = "dgx-timeout"
+        status = "running"
+        stopped = False
+        removed = False
+
+        def logs(self, **_kwargs):
+            return b"engine failed while allocating memory"
+
+        def stop(self, **_kwargs):
+            self.stopped = True
+
+        def remove(self):
+            self.removed = True
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def get(self, _name):
+            raise docker.errors.NotFound("missing")
+
+        def run(self, _image, **_kwargs):
+            return container
+
+    class Context:
+        def update(self, **_kwargs):
+            return None
+
+        def check_control(self):
+            return None
+
+    client_type = type("Client", (), {"containers": FakeContainers()})
+    monkeypatch.setattr(service, "docker_client", lambda: client_type())
+    response_type = type("Response", (), {"is_success": False})
+    monkeypatch.setattr(
+        deployment_service.httpx,
+        "get",
+        lambda *_args, **_kwargs: response_type(),
+    )
+    monkeypatch.setattr(deployment_service.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="engine failed while allocating memory"):
+        service.create_handler(
+            Context(),
+            DeploymentSpec(
+                name="Timeout",
+                model_path=str(model_path),
+                api_model_name="timeout",
+                runtime="vllm",
+                image="vllm:test",
+                port=8100,
+            ).model_dump(),
+        )
+
+    assert container.stopped is True
+    assert container.removed is True
 

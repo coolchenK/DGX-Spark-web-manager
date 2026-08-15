@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Deployment
 from app.runtime.base import DeploymentSpec, RuntimeAdapter, deterministic_container_name
+from app.services.diagnostics import redact_log
 from app.tasks.engine import TaskContext
 
 
@@ -37,6 +39,7 @@ class DeploymentService:
         session_factory: sessionmaker[Session],
         model_roots: tuple[Path, ...],
         host_model_roots: tuple[Path, ...] | None = None,
+        startup_timeout_seconds: int = 300,
     ):
         self.adapters = adapters
         self.session_factory = session_factory
@@ -44,6 +47,7 @@ class DeploymentService:
         self.host_model_roots = host_model_roots or model_roots
         if len(self.model_roots) != len(self.host_model_roots):
             raise ValueError("Model roots and host model roots must have the same length")
+        self.startup_timeout_seconds = startup_timeout_seconds
 
     @staticmethod
     def docker_client():
@@ -64,6 +68,7 @@ class DeploymentService:
         preview = adapter.preview(spec)
         client = self.docker_client()
         name = deterministic_container_name(spec.name)
+        created_container = False
         try:
             container = client.containers.get(name)
             labels = (container.attrs.get("Config") or {}).get("Labels") or {}
@@ -99,10 +104,12 @@ class DeploymentService:
                 device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
                 environment={"HF_HUB_OFFLINE": "1"},
             )
+            created_container = True
         endpoint = f"http://127.0.0.1:{spec.port}"
         context.update(progress=25, message=f"Container {name} started; waiting for health")
         healthy = False
-        for attempt in range(60):
+        attempts = max(1, math.ceil(self.startup_timeout_seconds / 2))
+        for attempt in range(attempts):
             context.check_control()
             try:
                 response = httpx.get(f"{endpoint}/v1/models", timeout=3)
@@ -114,9 +121,23 @@ class DeploymentService:
             context.update(progress=min(25 + attempt, 90))
             time.sleep(2)
         if not healthy:
-            container.stop(timeout=15)
-            container.remove()
-            raise RuntimeError("Deployment did not become healthy within 120 seconds")
+            try:
+                logs = redact_log(
+                    container.logs(tail=200, timestamps=True).decode(
+                        "utf-8", errors="replace"
+                    )
+                )[-4000:]
+            except Exception as exc:
+                logs = f"Container logs unavailable: {exc}"
+            context.update(message=f"Startup failed. Last container logs:\n{logs}")
+            if created_container:
+                container.stop(timeout=15)
+                container.remove()
+            detail = f" Last container logs:\n{logs}" if logs else ""
+            raise RuntimeError(
+                f"Deployment did not become healthy within "
+                f"{self.startup_timeout_seconds} seconds.{detail}"
+            )
         container.reload()
         with self.session_factory() as db:
             deployment = Deployment(

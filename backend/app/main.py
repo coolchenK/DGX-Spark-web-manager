@@ -59,6 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session_factory=database.session_factory,
         model_roots=app_settings.model_root_paths,
         host_model_roots=app_settings.host_model_root_paths,
+        startup_timeout_seconds=app_settings.deployment_startup_timeout_seconds,
     )
     provider_service = ProviderService(SecretBox(app_settings.secret_key))
     diagnostic_service = DiagnosticService(
