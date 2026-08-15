@@ -1,3 +1,6 @@
+from datetime import UTC, datetime, timedelta
+
+from app.api import tasks as task_api
 from app.models import TaskRecord
 from app.tasks.engine import TaskEngine, transition_task
 from sqlalchemy import select
@@ -90,3 +93,21 @@ def test_task_transition_rejects_invalid_state_change():
         assert "succeeded -> running" in str(exc)
     else:
         raise AssertionError("Expected invalid transition to raise")
+
+
+def test_transfer_stats_report_speed_and_remaining_time():
+    started = datetime(2026, 8, 16, tzinfo=UTC)
+    task = TaskRecord(
+        type="model.download",
+        title="Download",
+        status="running",
+        started_at=started,
+        completed_bytes=1_000,
+        total_bytes=2_000,
+    )
+    calculate = getattr(task_api, "calculate_transfer_stats", lambda *_args, **_kwargs: {})
+
+    assert calculate(task, now=started + timedelta(seconds=10)) == {
+        "speed_bytes_per_second": 100.0,
+        "eta_seconds": 10,
+    }

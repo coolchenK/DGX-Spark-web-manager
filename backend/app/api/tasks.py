@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -10,6 +11,28 @@ from app.dependencies import Admin, CsrfAdmin, DbSession
 from app.models import TaskRecord
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+
+def calculate_transfer_stats(
+    task: TaskRecord,
+    *,
+    now: datetime | None = None,
+) -> dict[str, float | int | None]:
+    if not task.started_at or task.completed_bytes <= 0:
+        return {"speed_bytes_per_second": None, "eta_seconds": None}
+    started_at = task.started_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=UTC)
+    ended_at = task.finished_at or now or datetime.now(UTC)
+    if ended_at.tzinfo is None:
+        ended_at = ended_at.replace(tzinfo=UTC)
+    elapsed = max((ended_at - started_at).total_seconds(), 0)
+    if elapsed == 0:
+        return {"speed_bytes_per_second": None, "eta_seconds": None}
+    speed = task.completed_bytes / elapsed
+    remaining = max((task.total_bytes or 0) - task.completed_bytes, 0)
+    eta = round(remaining / speed) if task.status == "running" and speed > 0 else None
+    return {"speed_bytes_per_second": round(speed, 2), "eta_seconds": eta}
 
 
 def serialize_task(task: TaskRecord) -> dict[str, Any]:
@@ -28,6 +51,7 @@ def serialize_task(task: TaskRecord) -> dict[str, Any]:
         "updated_at": task.updated_at,
         "started_at": task.started_at,
         "finished_at": task.finished_at,
+        **calculate_transfer_stats(task),
     }
 
 

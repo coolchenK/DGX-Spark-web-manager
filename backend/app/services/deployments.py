@@ -6,12 +6,27 @@ from typing import Any
 
 import docker
 import httpx
-from docker.types import DeviceRequest
+from docker.types import DeviceRequest, LogConfig
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Deployment
 from app.runtime.base import DeploymentSpec, RuntimeAdapter, deterministic_container_name
 from app.tasks.engine import TaskContext
+
+
+def resolve_host_model_mount(
+    model_path: Path,
+    model_roots: tuple[Path, ...],
+    host_model_roots: tuple[Path, ...],
+) -> Path:
+    if len(model_roots) != len(host_model_roots):
+        raise ValueError("Model roots and host model roots must have the same length")
+    resolved_model = model_path.resolve()
+    for model_root, host_root in zip(model_roots, host_model_roots, strict=True):
+        resolved_root = model_root.resolve()
+        if resolved_model == resolved_root or resolved_model.is_relative_to(resolved_root):
+            return host_root
+    raise ValueError("Model path is outside configured model roots")
 
 
 class DeploymentService:
@@ -21,10 +36,14 @@ class DeploymentService:
         adapters: dict[str, RuntimeAdapter],
         session_factory: sessionmaker[Session],
         model_roots: tuple[Path, ...],
+        host_model_roots: tuple[Path, ...] | None = None,
     ):
         self.adapters = adapters
         self.session_factory = session_factory
         self.model_roots = model_roots
+        self.host_model_roots = host_model_roots or model_roots
+        if len(self.model_roots) != len(self.host_model_roots):
+            raise ValueError("Model roots and host model roots must have the same length")
 
     @staticmethod
     def docker_client():
@@ -54,10 +73,10 @@ class DeploymentService:
                 container.start()
         except docker.errors.NotFound:
             model_path = Path(spec.model_path).resolve()
-            mount_root = next(
-                root.resolve()
-                for root in self.model_roots
-                if model_path == root.resolve() or model_path.is_relative_to(root.resolve())
+            host_mount_root = resolve_host_model_mount(
+                model_path,
+                self.model_roots,
+                self.host_model_roots,
             )
             container = client.containers.run(
                 spec.image,
@@ -65,13 +84,18 @@ class DeploymentService:
                 name=name,
                 detach=True,
                 ports={"8000/tcp": spec.port},
-                volumes={str(mount_root): {"bind": "/models", "mode": "ro"}},
+                volumes={str(host_mount_root): {"bind": "/models", "mode": "ro"}},
                 labels={
                     "com.dgx-spark-manager.managed": "true",
                     "com.dgx-spark-manager.model": spec.api_model_name,
+                    "com.dgx-spark-manager.route": spec.route_alias or spec.api_model_name,
                     "com.dgx-spark-manager.runtime": spec.runtime,
                 },
                 restart_policy={"Name": "unless-stopped"},
+                log_config=LogConfig(
+                    type=LogConfig.types.JSON,
+                    config={"max-size": "10m", "max-file": "5"},
+                ),
                 device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
                 environment={"HF_HUB_OFFLINE": "1"},
             )
@@ -109,7 +133,7 @@ class DeploymentService:
                 image=spec.image,
                 port=spec.port,
                 config=preview,
-                capabilities=["chat", "completion", "tools"],
+                capabilities=["chat", "completion"],
             )
             db.add(deployment)
             db.commit()

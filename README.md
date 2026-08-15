@@ -52,6 +52,27 @@ docker compose ps
 curl -fsS http://127.0.0.1:3000/api/health
 ```
 
+### Native systemd Installation
+
+The manager can run directly from an ARM64 Python virtual environment while continuing to use the
+host Docker Engine for model runtimes. Python 3.11+, Node.js 22+, Corepack, Docker, and user systemd
+are required. The first command only prints the changes, disk estimate, commands, and rollback path.
+
+```bash
+./scripts/install-native.sh
+./scripts/install-native.sh --apply
+
+# Upgrade (creates a SQLite backup first)
+./scripts/update-native.sh
+
+# Preview removal, then remove the service while retaining data/models
+./scripts/uninstall-native.sh
+./scripts/uninstall-native.sh --apply
+```
+
+Native logs are managed by journald and can be read with
+`journalctl --user -u dgx-spark-web-manager.service`.
+
 Do not expose port 3000 to the public internet without TLS and an authenticated reverse proxy. Set `DGX_COOKIE_SECURE=true` when the panel is served over HTTPS.
 
 ## Existing Services

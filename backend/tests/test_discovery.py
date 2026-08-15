@@ -1,5 +1,7 @@
+import json
 import os
 
+from app.services import discovery
 from app.services.discovery import (
     DiscoveryService,
     container_candidate,
@@ -95,3 +97,45 @@ def test_container_candidate_extracts_openai_endpoint_and_model():
     assert candidate["endpoint_url"] == "http://127.0.0.1:8001"
     assert candidate["api_model_name"] == "qwen3.8-27b"
     assert candidate["managed"] is False
+
+
+def test_model_metadata_is_derived_from_snapshot_and_config(tmp_path):
+    snapshot = tmp_path / "models--Qwen--Qwen2.5-0.5B-Instruct" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen2ForCausalLM"],
+                "quantization_config": {"quant_method": "awq"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    infer = getattr(discovery, "infer_model_metadata", lambda *_args, **_kwargs: {})
+
+    assert infer(snapshot, "Qwen/Qwen2.5-0.5B-Instruct") == {
+        "commit_hash": "abc123",
+        "format": "safetensors",
+        "quantization": "awq",
+        "parameter_count": "0.5B",
+        "capabilities": ["chat", "completion"],
+    }
+
+
+def test_scan_uses_commit_as_revision_when_no_named_ref_exists(settings):
+    repository = settings.model_root_paths[0] / "models--org--model"
+    snapshot = repository / "snapshots" / "commit123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text('{"architectures": ["CausalLM"]}')
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    from app.db import Database
+
+    database = Database(settings.database_url)
+    database.create_schema()
+    service = DiscoveryService(settings.model_root_paths)
+    with database.session_factory() as db:
+        model = service.scan_models(db)[0]
+
+    assert model.commit_hash == "commit123"
+    assert model.revision == "commit123"

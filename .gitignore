@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-native/
 *.egg-info/
 
 # Node

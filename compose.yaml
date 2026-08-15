@@ -22,6 +22,7 @@ services:
       DGX_COOKIE_SECURE: ${DGX_COOKIE_SECURE:-false}
       DGX_ALLOWED_ORIGINS: ${DGX_ALLOWED_ORIGINS:-http://localhost:3000}
       DGX_MODEL_ROOTS: /models,/hf-cache/hub
+      DGX_MODEL_ROOT_MAPPINGS: /models=${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env};/hf-cache/hub=${HF_HOME_HOST:?Set HF_HOME_HOST in .env}/hub
       DGX_HF_CACHE_DIR: /hf-cache/hub
       DGX_AUTO_DISCOVERY: "true"
       NVIDIA_VISIBLE_DEVICES: all
@@ -34,3 +35,8 @@ services:
       - /etc/os-release:/host/etc/os-release:ro
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"

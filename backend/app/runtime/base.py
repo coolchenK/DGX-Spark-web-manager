@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import platform
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -13,6 +15,7 @@ class DeploymentSpec(BaseModel):
     model_id: str | None = None
     model_path: str
     api_model_name: str = Field(min_length=1, max_length=255)
+    route_alias: str | None = Field(default=None, min_length=1, max_length=255)
     runtime: str
     image: str
     port: int = Field(ge=1024, le=65535)
@@ -21,9 +24,11 @@ class DeploymentSpec(BaseModel):
     max_concurrency: int = Field(default=8, ge=1, le=1024)
     trust_remote_code: bool = False
 
-    @field_validator("api_model_name")
+    @field_validator("api_model_name", "route_alias")
     @classmethod
-    def validate_api_model_name(cls, value: str) -> str:
+    def validate_api_model_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", value):
             raise ValueError("API model name contains unsupported characters")
         return value
@@ -68,8 +73,70 @@ class RuntimeAdapter(ABC):
                 return str(Path("/models", relative)).replace("\\", "/")
         raise ValueError("Model path is outside configured model roots")
 
+    def detect_environment(self, spec: DeploymentSpec) -> dict[str, Any]:
+        return {
+            "runtime": self.runtime,
+            "architecture": platform.machine(),
+            "image": spec.image,
+            "image_allowed": spec.image in self.allowed_images,
+        }
+
+    def check_model_compatibility(self, model_path: Path) -> dict[str, Any]:
+        config_path = model_path / "config.json"
+        architectures: list[str] = []
+        config_error: str | None = None
+        if config_path.is_file():
+            try:
+                payload = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict) and isinstance(payload.get("architectures"), list):
+                    architectures = [str(item) for item in payload["architectures"][:20]]
+            except (OSError, json.JSONDecodeError) as exc:
+                config_error = str(exc)
+        weight_files = [
+            path
+            for pattern in ("*.safetensors", "*.bin")
+            for path in model_path.rglob(pattern)
+            if path.is_file()
+        ]
+        reasons: list[str] = []
+        if not config_path.is_file():
+            reasons.append("config.json was not found")
+        if config_error:
+            reasons.append(f"config.json is invalid: {config_error}")
+        if not weight_files:
+            reasons.append("No Safetensors or PyTorch weight files were found")
+        return {
+            "compatible": not reasons,
+            "architectures": architectures,
+            "weight_files": len(weight_files),
+            "reasons": reasons,
+        }
+
+    @staticmethod
+    def model_size(model_path: Path) -> int:
+        total = 0
+        seen: set[Path] = set()
+        for path in model_path.rglob("*"):
+            try:
+                if not path.is_file():
+                    continue
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def openai_capabilities(self) -> list[str]:
+        return ["chat", "completion"]
+
     def preview(self, spec: DeploymentSpec) -> dict[str, Any]:
         model_path = self.validate(spec)
+        compatibility = self.check_model_compatibility(model_path)
+        model_size = self.model_size(model_path)
+        route_name = spec.route_alias or spec.api_model_name
         return {
             "container_name": deterministic_container_name(spec.name),
             "runtime": self.runtime,
@@ -77,8 +144,26 @@ class RuntimeAdapter(ABC):
             "model_path": str(model_path),
             "container_model_path": self.container_model_path(spec),
             "port": spec.port,
+            "route_alias": spec.route_alias,
             "command": self.command(spec),
             "estimated_memory_fraction": spec.memory_fraction,
+            "estimated_disk_bytes": model_size,
+            "estimated_memory_bytes": int(model_size * 1.2),
+            "environment": self.detect_environment(spec),
+            "compatibility": compatibility,
+            "capabilities": self.openai_capabilities(),
+            "operations": [
+                f"Create manager-owned container {deterministic_container_name(spec.name)}",
+                "Mount the selected model root read-only",
+                f"Publish runtime port 8000 on host port {spec.port}",
+                "Wait for runtime startup with cancellation enabled",
+                "Probe /v1/models and register the gateway route",
+            ],
+            "api_example": (
+                "client.chat.completions.create("
+                f"model=\"{route_name}\", "
+                "messages=[{\"role\": \"user\", \"content\": \"Hello\"}])"
+            ),
             "rollback": "Remove the newly created manager-owned container and retain model files.",
         }
 

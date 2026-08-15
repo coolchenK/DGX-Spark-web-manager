@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -55,6 +55,7 @@ async def proxy_openai_request(
     deployment: Deployment,
     endpoint: str,
     body: dict[str, Any],
+    on_finished: Callable[[], None] | None = None,
 ) -> Response:
     body["model"] = deployment.api_model_name
     started_at = time.perf_counter()
@@ -73,6 +74,8 @@ async def proxy_openai_request(
             status_code=502,
             started_at=started_at,
         )
+        if on_finished:
+            on_finished()
         return openai_error(f"Upstream inference service is unavailable: {exc}", status_code=502)
 
     if body.get("stream"):
@@ -90,6 +93,8 @@ async def proxy_openai_request(
                     status_code=upstream.status_code,
                     started_at=started_at,
                 )
+                if on_finished:
+                    on_finished()
 
         headers = {}
         if content_type := upstream.headers.get("content-type"):
@@ -114,6 +119,8 @@ async def proxy_openai_request(
         started_at=started_at,
         usage=usage,
     )
+    if on_finished:
+        on_finished()
     return Response(
         content=content,
         status_code=upstream.status_code,

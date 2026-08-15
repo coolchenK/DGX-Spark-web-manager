@@ -70,6 +70,8 @@ export interface TaskRecord {
   progress: number
   completed_bytes: number
   total_bytes: number | null
+  speed_bytes_per_second: number | null
+  eta_seconds: number | null
   result: Record<string, unknown>
   error: string | null
   log: string
@@ -86,6 +88,9 @@ export interface GatewayStats {
   average_latency_ms: number
   prompt_tokens: number
   completion_tokens: number
+  requests_last_minute: number
+  tokens_per_second: number
+  active_requests: number
 }
 
 export interface ApiKeyRecord {

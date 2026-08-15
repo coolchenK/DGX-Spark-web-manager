@@ -55,3 +55,7 @@ Authorization: Bearer dgx_...
 - `POST /v1/embeddings` for deployments advertising `embedding`
 
 The gateway replaces the request model only with the selected deployment's upstream model name. SSE bytes are relayed without buffering. Upstream status/content types are preserved. Manager-generated failures use the standard OpenAI `error` object.
+
+Set the optional deployment `route_alias` to the same value on multiple instances to expose one
+gateway model name. Healthy instances are selected round-robin; `/v1/models` reports the instance
+count and only capabilities shared by every instance.

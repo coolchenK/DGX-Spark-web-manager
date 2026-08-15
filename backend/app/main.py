@@ -10,7 +10,7 @@ from sqlalchemy import text
 from app import models  # noqa: F401
 from app.api.deployments import router as deployments_router
 from app.api.diagnostics import router as diagnostics_router
-from app.api.gateway import GatewayAuthError
+from app.api.gateway import GatewayActivity, GatewayAuthError
 from app.api.gateway import router as gateway_router
 from app.api.huggingface import router as huggingface_router
 from app.api.inventory import router as inventory_router
@@ -58,6 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         },
         session_factory=database.session_factory,
         model_roots=app_settings.model_root_paths,
+        host_model_roots=app_settings.host_model_root_paths,
     )
     provider_service = ProviderService(SecretBox(app_settings.secret_key))
     diagnostic_service = DiagnosticService(
@@ -116,6 +117,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.provider_service = provider_service
     app.state.diagnostic_service = diagnostic_service
     app.state.operation_executor = operation_executor
+    app.state.gateway_activity = GatewayActivity()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_origins,

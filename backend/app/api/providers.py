@@ -1,12 +1,13 @@
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from app.audit import record_audit
 from app.dependencies import Admin, CsrfAdmin, DbSession
 from app.models import Provider
+from app.services.providers import validate_custom_headers
 
 router = APIRouter(prefix="/api/providers", tags=["providers"])
 
@@ -20,6 +21,8 @@ class ProviderCreate(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
 
+    _validate_headers = field_validator("headers")(validate_custom_headers)
+
 
 class ProviderUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
@@ -29,6 +32,8 @@ class ProviderUpdate(BaseModel):
     timeout_seconds: int | None = Field(default=None, ge=5, le=600)
     headers: dict[str, str] | None = None
     enabled: bool | None = None
+
+    _validate_headers = field_validator("headers")(validate_custom_headers)
 
 
 @router.get("")

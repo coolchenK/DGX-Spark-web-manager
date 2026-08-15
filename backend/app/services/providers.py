@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -14,6 +15,15 @@ from app.models import Provider
 from app.security import SecretBox, mask_secret
 
 Resolver = Callable[..., list[tuple]]
+HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+FORBIDDEN_CUSTOM_HEADERS = {
+    "authorization",
+    "connection",
+    "content-length",
+    "host",
+    "proxy-authorization",
+    "transfer-encoding",
+}
 
 
 def _is_forbidden_ip(value: str) -> bool:
@@ -62,6 +72,17 @@ def normalize_openai_base_url(value: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
+def validate_custom_headers(headers: dict[str, str]) -> dict[str, str]:
+    if len(headers) > 50:
+        raise ValueError("At most 50 custom headers are allowed")
+    for name, value in headers.items():
+        if not HEADER_NAME.fullmatch(name) or name.lower() in FORBIDDEN_CUSTOM_HEADERS:
+            raise ValueError(f"Unsafe custom header name: {name}")
+        if len(value) > 8192 or any(character in value for character in "\r\n\0"):
+            raise ValueError(f"Unsafe custom header value for: {name}")
+    return headers
+
+
 class ProviderService:
     def __init__(self, secret_box: SecretBox):
         self.secret_box = secret_box
@@ -79,6 +100,7 @@ class ProviderService:
         enabled: bool,
     ) -> Provider:
         validate_provider_url(base_url)
+        validate_custom_headers(headers)
         provider = Provider(
             name=name.strip(),
             base_url=normalize_openai_base_url(base_url),

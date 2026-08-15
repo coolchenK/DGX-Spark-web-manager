@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +97,11 @@ def container_candidate(attrs: dict[str, Any]) -> dict[str, Any] | None:
         "status": state.get("Status", "unknown"),
         "health": health or ("healthy" if state.get("Status") == "running" else "unknown"),
         "managed": labels.get("com.dgx-spark-manager.managed") == "true",
-        "config": {"command": command, "model_path": model_path},
+        "config": {
+            "command": command,
+            "model_path": model_path,
+            "route_alias": labels.get("com.dgx-spark-manager.route"),
+        },
     }
 
 
@@ -111,6 +117,76 @@ def directory_size(path: Path) -> int:
     except OSError:
         return total
     return total
+
+
+def infer_model_metadata(model_path: Path, name: str) -> dict[str, Any]:
+    config: dict[str, Any] = {}
+    try:
+        value = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            config = value
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    suffixes: set[str] = set()
+    try:
+        for path in model_path.rglob("*"):
+            if path.is_file():
+                suffixes.add(path.suffix.lower())
+    except OSError:
+        pass
+    if ".safetensors" in suffixes:
+        model_format = "safetensors"
+    elif ".gguf" in suffixes:
+        model_format = "gguf"
+    elif ".bin" in suffixes:
+        model_format = "pytorch-bin"
+    else:
+        model_format = None
+
+    quantization = None
+    quantization_config = config.get("quantization_config")
+    if isinstance(quantization_config, dict):
+        method = quantization_config.get("quant_method") or quantization_config.get("quantization")
+        if method:
+            quantization = str(method).lower()
+    if not quantization:
+        lowered_name = name.lower()
+        quantization = next(
+            (
+                method
+                for method in ("nvfp4", "fp8", "int8", "int4", "awq", "gptq")
+                if method in lowered_name
+            ),
+            None,
+        )
+
+    parameter_match = re.search(r"(?:^|[-_/])(\d+(?:\.\d+)?)b(?:$|[-_/])", name, re.IGNORECASE)
+    parameter_count = f"{parameter_match.group(1)}B" if parameter_match else None
+    architectures = [
+        str(value).lower()
+        for value in config.get("architectures", [])
+        if isinstance(value, str)
+    ]
+    if any("causallm" in architecture for architecture in architectures):
+        capabilities = ["chat", "completion"]
+    elif any(
+        marker in architecture
+        for architecture in architectures
+        for marker in ("embedding", "sequenceclassification")
+    ):
+        capabilities = ["embedding"]
+    else:
+        capabilities = []
+
+    commit_hash = model_path.name if model_path.parent.name == "snapshots" else None
+    return {
+        "commit_hash": commit_hash,
+        "format": model_format,
+        "quantization": quantization,
+        "parameter_count": parameter_count,
+        "capabilities": capabilities,
+    }
 
 
 class DiscoveryService:
@@ -177,7 +253,7 @@ class DiscoveryService:
                 "config",
             ):
                 setattr(existing, key, candidate[key])
-            existing.capabilities = ["chat", "completion", "tools"]
+            existing.capabilities = ["chat", "completion"]
             existing.last_checked_at = utc_now()
             discovered.append(existing)
         db.commit()
@@ -219,12 +295,30 @@ class DiscoveryService:
                         source=source,
                         repository_id=repository_id,
                         local_path=str(local_path),
-                        capabilities=["chat", "completion"],
+                        capabilities=[],
                     )
                     db.add(existing)
+                metadata = infer_model_metadata(local_path, repository_id or child.name)
                 existing.local_path = str(local_path)
                 existing.size_bytes = directory_size(child)
                 existing.status = "available"
+                existing.commit_hash = metadata["commit_hash"]
+                revision = None
+                if repository_id and metadata["commit_hash"]:
+                    try:
+                        main_commit = (child / "refs" / "main").read_text(encoding="utf-8").strip()
+                    except OSError:
+                        main_commit = ""
+                    revision = (
+                        "main"
+                        if main_commit == metadata["commit_hash"]
+                        else metadata["commit_hash"]
+                    )
+                existing.revision = revision
+                existing.format = metadata["format"]
+                existing.quantization = metadata["quantization"]
+                existing.parameter_count = metadata["parameter_count"]
+                existing.capabilities = metadata["capabilities"]
                 discovered.append(existing)
         db.commit()
         return discovered

@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     admin_password: str = Field(min_length=12)
     data_dir: Path = Path("./data")
     model_roots: str = "/models,/root/.cache/huggingface/hub"
+    model_root_mappings: str = ""
     hf_cache_dir: Path = Path("/root/.cache/huggingface/hub")
     hf_token: str | None = None
     static_dir: Path = Path("frontend/dist")
@@ -43,6 +44,18 @@ class Settings(BaseSettings):
     @property
     def model_root_paths(self) -> tuple[Path, ...]:
         return tuple(Path(item.strip()) for item in self.model_roots.split(",") if item.strip())
+
+    @property
+    def host_model_root_paths(self) -> tuple[Path, ...]:
+        mappings: dict[str, Path] = {}
+        for item in self.model_root_mappings.split(";"):
+            if not item.strip():
+                continue
+            container_path, separator, host_path = item.partition("=")
+            if not separator or not container_path.strip() or not host_path.strip():
+                raise ValueError("Model root mappings must use container_path=host_path")
+            mappings[str(Path(container_path.strip()))] = Path(host_path.strip())
+        return tuple(mappings.get(str(root), root) for root in self.model_root_paths)
 
     @property
     def cors_origins(self) -> list[str]:

@@ -23,6 +23,8 @@ echo "  HF cache:     $HF_HOME_HOST"
 echo "  Model root:   $MODEL_HOME_HOST"
 echo "  Data:         $ROOT_DIR/data"
 echo "  Changes:      build one ARM64 image, create one manager container, create .env/data"
+echo "  Commands:     docker compose build; docker compose up -d; health check"
+echo "  Estimated:    2-5 GiB temporary/build image space; model downloads excluded"
 echo "  Rollback:     ./scripts/uninstall.sh (model files and existing inference containers remain)"
 
 [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] || { echo "Unsupported architecture: $ARCH" >&2; exit 1; }

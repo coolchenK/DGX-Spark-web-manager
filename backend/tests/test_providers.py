@@ -45,3 +45,30 @@ def test_provider_api_encrypts_secret_and_returns_masked_value(authenticated_cli
         provider = db.get(Provider, response.json()["id"])
         assert "sk-provider-secret-123456" not in provider.encrypted_api_key
 
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-Test\r\nInjected": "value"},
+        {"X-Test": "value\r\nInjected: true"},
+        {"Host": "attacker.example"},
+        {"Content-Length": "999"},
+        {"Authorization": "Bearer override"},
+    ],
+)
+def test_provider_rejects_unsafe_custom_headers(authenticated_client, monkeypatch, headers):
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+
+    response = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": "Unsafe headers",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "sk-provider-secret-123456",
+            "default_model": "ops-model",
+            "headers": headers,
+        },
+    )
+
+    assert response.status_code == 422
+

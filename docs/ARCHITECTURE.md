@@ -12,6 +12,10 @@ Mounted resources:
 - `/app/data`: SQLite, task state, audit records, and encrypted secrets.
 - `/host/etc/os-release`: host operating-system identity.
 
+`DGX_MODEL_ROOT_MAPPINGS` translates the manager container paths back to their host bind sources
+before the Docker API creates a runtime container. This prevents container-local paths such as
+`/hf-cache/hub` from being interpreted as nonexistent host directories.
+
 The manager container does not replace or wrap inference containers. Runtime adapters create normal NVIDIA containers using the same host GPU and model caches.
 
 ## Backend Domains

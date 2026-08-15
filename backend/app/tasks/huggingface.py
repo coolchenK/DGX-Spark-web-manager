@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import time
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,61 @@ def serialize_card_data(value: Any) -> dict[str, Any]:
         for key, item in vars(value).items()
         if not str(key).startswith("_")
     }
+
+
+def selected_file_names(
+    files: list[dict[str, Any]],
+    *,
+    include: list[str],
+    exclude: list[str],
+) -> list[str]:
+    selected: list[str] = []
+    for item in files:
+        name = str(item.get("name") or "")
+        included = not include or any(fnmatch(name, pattern) for pattern in include)
+        excluded = any(fnmatch(name, pattern) for pattern in exclude)
+        if included and not excluded:
+            selected.append(name)
+    return selected
+
+
+def selected_download_size(
+    files: list[dict[str, Any]],
+    *,
+    include: list[str],
+    exclude: list[str],
+) -> int:
+    selected = set(selected_file_names(files, include=include, exclude=exclude))
+    return sum(int(item.get("size") or 0) for item in files if item.get("name") in selected)
+
+
+def validate_disk_capacity(*, total_bytes: int, existing_bytes: int, free_bytes: int) -> int:
+    required_bytes = max(0, total_bytes - existing_bytes)
+    if required_bytes > free_bytes:
+        raise RuntimeError(
+            f"Insufficient free disk space: need {required_bytes} bytes, have {free_bytes} bytes"
+        )
+    return required_bytes
+
+
+def verify_snapshot_files(
+    snapshot: Path,
+    files: list[dict[str, Any]],
+    *,
+    include: list[str],
+    exclude: list[str],
+) -> list[str]:
+    expected = selected_file_names(files, include=include, exclude=exclude)
+    resolved_snapshot = snapshot.resolve()
+    missing: list[str] = []
+    for name in expected:
+        candidate = (snapshot / name).resolve()
+        if not candidate.is_relative_to(resolved_snapshot) or not candidate.is_file():
+            missing.append(name)
+    if missing:
+        preview = ", ".join(missing[:10])
+        raise RuntimeError(f"Downloaded snapshot failed integrity check; missing: {preview}")
+    return expected
 
 
 class HuggingFaceService:
@@ -99,9 +155,20 @@ class HuggingFaceService:
         repository_id = validate_repository_id(str(payload["repository_id"]))
         revision = str(payload.get("revision") or "main")
         info = self.info(repository_id, revision)
-        total_bytes = int(info["total_size"] or 0)
+        include = [str(pattern) for pattern in (payload.get("include") or [])]
+        exclude = [str(pattern) for pattern in (payload.get("exclude") or [])]
+        total_bytes = selected_download_size(
+            info["siblings"], include=include, exclude=exclude
+        )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         target = cache_repository_path(self.cache_dir, repository_id)
+        existing_bytes = directory_size(target) if target.exists() else 0
+        disk = shutil.disk_usage(self.cache_dir)
+        validate_disk_capacity(
+            total_bytes=total_bytes,
+            existing_bytes=existing_bytes,
+            free_bytes=disk.free,
+        )
         executable = shutil.which("hf")
         if not executable:
             raise RuntimeError("Hugging Face CLI 'hf' is not installed")
@@ -114,8 +181,6 @@ class HuggingFaceService:
             "--cache-dir",
             str(self.cache_dir),
         ]
-        include = payload.get("include") or []
-        exclude = payload.get("exclude") or []
         for pattern in include:
             command.extend(["--include", str(pattern)])
         for pattern in exclude:
@@ -156,6 +221,12 @@ class HuggingFaceService:
             raise RuntimeError(f"Hugging Face download exited with code {process.returncode}")
         completed = directory_size(target)
         snapshot = resolve_hf_snapshot(target)
+        verified_files = verify_snapshot_files(
+            snapshot,
+            info["siblings"],
+            include=include,
+            exclude=exclude,
+        )
         context.update(progress=100, completed_bytes=completed, total_bytes=total_bytes)
         return {
             "repository_id": repository_id,
@@ -163,4 +234,5 @@ class HuggingFaceService:
             "commit_hash": info["sha"],
             "local_path": str(snapshot),
             "size_bytes": completed,
+            "verified_files": len(verified_files),
         }

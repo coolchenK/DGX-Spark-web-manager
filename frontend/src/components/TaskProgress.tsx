@@ -21,7 +21,7 @@ export function TaskProgress({ task, onPause, onResume, onCancel, busy }: { task
         </Space>
       </Flex>
       <Progress percent={Math.round(task.progress)} status={task.status === 'failed' ? 'exception' : task.status === 'succeeded' ? 'success' : 'active'} />
-      {task.total_bytes != null && <Typography.Text type="secondary">{formatBytes(task.completed_bytes)} / {formatBytes(task.total_bytes)}</Typography.Text>}
+      {task.total_bytes != null && <Typography.Text type="secondary">{formatBytes(task.completed_bytes)} / {formatBytes(task.total_bytes)}{task.speed_bytes_per_second ? ` · ${formatBytes(task.speed_bytes_per_second)}/s` : ''}{task.eta_seconds != null ? ` · 剩余约 ${Math.max(1, Math.ceil(task.eta_seconds / 60))} 分钟` : ''}</Typography.Text>}
       {task.error && <Alert type="error" showIcon message={task.error} />}
     </article>
   )
