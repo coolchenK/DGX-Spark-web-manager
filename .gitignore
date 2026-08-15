@@ -17,6 +17,7 @@ frontend/dist/
 frontend/coverage/
 playwright-report/
 test-results/
+.playwright-cli/
 
 # Runtime data and secrets
 .env
