@@ -1,0 +1,61 @@
+from app.models import TaskRecord
+from app.tasks.engine import TaskEngine, transition_task
+from sqlalchemy import select
+
+
+def test_task_creation_is_idempotent(settings):
+    engine = TaskEngine(lambda: None)
+
+    from app.db import Database
+
+    database = Database(settings.database_url)
+    database.create_schema()
+    with database.session_factory() as db:
+        first = engine.create_task(
+            db,
+            task_type="model.download",
+            title="Download org/model",
+            input_json={"repository_id": "org/model"},
+            idempotency_key="download:org/model:main",
+        )
+        second = engine.create_task(
+            db,
+            task_type="model.download",
+            title="Download org/model again",
+            input_json={"repository_id": "org/model"},
+            idempotency_key="download:org/model:main",
+        )
+
+        assert first.id == second.id
+        assert len(list(db.scalars(select(TaskRecord)))) == 1
+
+
+def test_running_tasks_are_recovered_to_queue(settings):
+    from app.db import Database
+
+    database = Database(settings.database_url)
+    database.create_schema()
+    with database.session_factory() as db:
+        task = TaskRecord(type="scan", title="Scan", status="running")
+        db.add(task)
+        db.commit()
+
+    engine = TaskEngine(database.session_factory)
+    assert engine.recover_interrupted() == 1
+
+    with database.session_factory() as db:
+        recovered = db.get(TaskRecord, task.id)
+        assert recovered.status == "queued"
+        assert "Recovered after manager restart" in recovered.log
+
+
+def test_task_transition_rejects_invalid_state_change():
+    task = TaskRecord(type="scan", title="Scan", status="succeeded")
+
+    try:
+        transition_task(task, "running")
+    except ValueError as exc:
+        assert "succeeded -> running" in str(exc)
+    else:
+        raise AssertionError("Expected invalid transition to raise")
+
