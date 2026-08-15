@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     session_ttl_seconds: int = 43_200
     cookie_secure: bool = False
+    allowed_vllm_images: str = "vllm/vllm-openai:v0.27.1"
+    allowed_sglang_images: str = (
+        "sglang-inkling:specforge,lmsysorg/sglang:dev-cu13-inkling-dspark"
+    )
 
     @field_validator("database_url")
     @classmethod
@@ -40,3 +44,15 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [item.strip() for item in self.allowed_origins.split(",") if item.strip()]
+
+    @staticmethod
+    def _csv_set(value: str) -> set[str]:
+        return {item.strip() for item in value.split(",") if item.strip()}
+
+    @property
+    def vllm_images(self) -> set[str]:
+        return self._csv_set(self.allowed_vllm_images)
+
+    @property
+    def sglang_images(self) -> set[str]:
+        return self._csv_set(self.allowed_sglang_images)
