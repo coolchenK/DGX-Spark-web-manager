@@ -31,6 +31,18 @@ def test_unknown_and_shell_operations_are_not_executable():
     assert "command" not in steps[1]
 
 
+def test_compact_string_steps_are_safely_normalized():
+    steps = sanitize_steps(
+        ["rescan_inventory", "run arbitrary shell"],
+        known_deployment_ids=set(),
+    )
+
+    assert steps[0]["operation"] == "rescan_inventory"
+    assert steps[0]["executable"] is True
+    assert steps[1]["operation"] == "explain_only"
+    assert steps[1]["executable"] is False
+
+
 def test_diagnostic_provider_request_limits_generated_output():
     build = getattr(diagnostics, "build_diagnostic_request", None)
     assert callable(build)

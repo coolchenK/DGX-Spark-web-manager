@@ -66,11 +66,25 @@ def parse_diagnostic_content(content: str) -> dict[str, Any]:
     return value
 
 
-def sanitize_steps(
-    steps: list[dict[str, Any]], *, known_deployment_ids: set[str]
-) -> list[dict[str, Any]]:
+def sanitize_steps(steps: Any, *, known_deployment_ids: set[str]) -> list[dict[str, Any]]:
+    if isinstance(steps, dict | str):
+        source_steps = [steps]
+    elif isinstance(steps, list):
+        source_steps = steps
+    else:
+        source_steps = []
     sanitized: list[dict[str, Any]] = []
-    for step in steps[:20]:
+    for value in source_steps[:20]:
+        if isinstance(value, dict):
+            step = value
+        elif isinstance(value, str):
+            operation = value if value in ALLOWED_OPERATIONS else "explain_only"
+            step = {
+                "operation": operation,
+                "reason": value if operation == "explain_only" else "Provider compact step",
+            }
+        else:
+            continue
         operation = str(step.get("operation") or "explain_only")
         deployment_id = step.get("deployment_id")
         executable = operation in ALLOWED_OPERATIONS
