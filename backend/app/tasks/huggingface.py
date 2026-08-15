@@ -32,6 +32,23 @@ def cache_repository_path(cache_dir: Path, repository_id: str) -> Path:
     return target
 
 
+def serialize_card_data(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        serialized = to_dict()
+        if isinstance(serialized, dict):
+            return serialized
+    return {
+        str(key): item
+        for key, item in vars(value).items()
+        if not str(key).startswith("_")
+    }
+
+
 class HuggingFaceService:
     def __init__(self, cache_dir: Path, token: str | None = None):
         self.cache_dir = cache_dir
@@ -75,7 +92,7 @@ class HuggingFaceService:
             "tags": list(model.tags or []),
             "siblings": siblings,
             "total_size": total_size,
-            "card_data": dict(model.card_data or {}),
+            "card_data": serialize_card_data(model.card_data),
         }
 
     def download_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
