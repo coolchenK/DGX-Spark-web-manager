@@ -62,6 +62,29 @@ class DeploymentService:
     def preview(self, spec: DeploymentSpec) -> dict[str, Any]:
         return self.adapter(spec.runtime).preview(spec)
 
+    def wait_for_health(
+        self,
+        context: TaskContext,
+        endpoint: str,
+        *,
+        progress_start: float = 25,
+        progress_end: float = 90,
+    ) -> bool:
+        attempts = max(1, math.ceil(self.startup_timeout_seconds / 2))
+        for attempt in range(attempts):
+            context.check_control()
+            try:
+                response = httpx.get(f"{endpoint}/v1/models", timeout=3)
+                if response.is_success:
+                    return True
+            except httpx.HTTPError:
+                pass
+            fraction = (attempt + 1) / attempts
+            progress = progress_start + fraction * (progress_end - progress_start)
+            context.update(progress=min(progress, progress_end))
+            time.sleep(2)
+        return False
+
     def create_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         spec = DeploymentSpec.model_validate(payload)
         adapter = self.adapter(spec.runtime)
@@ -107,19 +130,7 @@ class DeploymentService:
             created_container = True
         endpoint = f"http://127.0.0.1:{spec.port}"
         context.update(progress=25, message=f"Container {name} started; waiting for health")
-        healthy = False
-        attempts = max(1, math.ceil(self.startup_timeout_seconds / 2))
-        for attempt in range(attempts):
-            context.check_control()
-            try:
-                response = httpx.get(f"{endpoint}/v1/models", timeout=3)
-                if response.is_success:
-                    healthy = True
-                    break
-            except httpx.HTTPError:
-                pass
-            context.update(progress=min(25 + attempt, 90))
-            time.sleep(2)
+        healthy = self.wait_for_health(context, endpoint)
         if not healthy:
             try:
                 logs = redact_log(
@@ -174,6 +185,11 @@ class DeploymentService:
             if action == "delete" and not deployment.managed:
                 raise ValueError("Discovered containers cannot be deleted by the manager")
             container_id = deployment.container_id
+            endpoint_url = deployment.endpoint_url
+            if action in {"start", "restart"}:
+                deployment.status = "starting"
+                deployment.health = "unknown"
+                db.commit()
         container = self.docker_client().containers.get(container_id)
         context.update(progress=20, message=f"Executing {action} on {container.name}")
         if action == "start":
@@ -189,6 +205,30 @@ class DeploymentService:
             container.stop(timeout=30)
             container.remove()
             new_status = "deleted"
+        health = "unknown"
+        if action in {"start", "restart"}:
+            context.update(progress=30, message="Waiting for runtime health")
+            if not self.wait_for_health(context, endpoint_url, progress_start=30, progress_end=95):
+                try:
+                    logs = redact_log(
+                        container.logs(tail=200, timestamps=True).decode(
+                            "utf-8", errors="replace"
+                        )
+                    )[-4000:]
+                except Exception as exc:
+                    logs = f"Container logs unavailable: {exc}"
+                with self.session_factory() as db:
+                    deployment = db.get(Deployment, deployment_id)
+                    if deployment:
+                        deployment.status = "running"
+                        deployment.health = "unhealthy"
+                        db.commit()
+                context.update(message=f"Runtime health check failed:\n{logs}")
+                raise RuntimeError(
+                    f"Runtime did not become healthy within "
+                    f"{self.startup_timeout_seconds} seconds. Last logs:\n{logs}"
+                )
+            health = "healthy"
         with self.session_factory() as db:
             deployment = db.get(Deployment, deployment_id)
             if deployment:
@@ -196,9 +236,14 @@ class DeploymentService:
                     db.delete(deployment)
                 else:
                     deployment.status = new_status
-                    deployment.health = "unknown" if action == "stop" else "healthy"
+                    deployment.health = health
                 db.commit()
-        return {"deployment_id": deployment_id, "action": action, "status": new_status}
+        return {
+            "deployment_id": deployment_id,
+            "action": action,
+            "status": new_status,
+            "health": health,
+        }
 
     def logs(self, deployment: Deployment, tail: int = 500) -> str:
         if not deployment.container_id:

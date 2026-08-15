@@ -4,6 +4,7 @@ import docker
 import pytest
 from app.config import Settings
 from app.db import Database
+from app.models import Deployment
 from app.runtime.base import DeploymentSpec, deterministic_container_name, validate_model_path
 from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
@@ -268,4 +269,69 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
 
     assert container.stopped is True
     assert container.removed is True
+
+
+def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
+    database = Database(f"sqlite:///{tmp_path / 'action.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        deployment = Deployment(
+            name="managed",
+            runtime="vllm",
+            container_id="container-id",
+            container_name="dgx-managed",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="managed",
+            status="exited",
+            health="unknown",
+            managed=True,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+    service = deployment_service.DeploymentService(
+        adapters={},
+        session_factory=database.session_factory,
+        model_roots=(tmp_path,),
+        startup_timeout_seconds=4,
+    )
+
+    class FakeContainer:
+        name = "dgx-managed"
+        starts = 0
+
+        def start(self):
+            self.starts += 1
+
+    container = FakeContainer()
+    containers = type("Containers", (), {"get": lambda _self, _id: container})()
+    client_type = type("Client", (), {"containers": containers})
+    monkeypatch.setattr(service, "docker_client", lambda: client_type())
+    health_results = iter([False, True])
+    response_type = type(
+        "Response",
+        (),
+        {"is_success": property(lambda _self: next(health_results))},
+    )
+    monkeypatch.setattr(deployment_service.httpx, "get", lambda *_args, **_kwargs: response_type())
+    monkeypatch.setattr(deployment_service.time, "sleep", lambda _seconds: None)
+
+    class Context:
+        def update(self, **_kwargs):
+            return None
+
+        def check_control(self):
+            return None
+
+    result = service.action_handler(
+        Context(),
+        {"deployment_id": deployment_id, "action": "start"},
+    )
+
+    assert container.starts == 1
+    assert result["health"] == "healthy"
+    with database.session_factory() as db:
+        updated = db.get(Deployment, deployment_id)
+        assert updated.status == "running"
+        assert updated.health == "healthy"
 
