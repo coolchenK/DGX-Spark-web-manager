@@ -15,7 +15,9 @@ function jsonResponse(body: unknown, status = 200) {
 
 
 test('shows login when the admin session is missing', async () => {
-  vi.spyOn(globalThis, 'fetch').mockImplementation(() => jsonResponse({ detail: 'Not authenticated' }, 401))
+  vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+    jsonResponse({ authenticated: false, user: null, csrf_token: null }),
+  )
 
   render(<App />)
 
@@ -28,8 +30,8 @@ test('shows login when the admin session is missing', async () => {
 test('opens the real dashboard after login and can switch theme', async () => {
   const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
     const url = String(input)
-    if (url.endsWith('/api/auth/me')) {
-      return jsonResponse({ detail: 'Not authenticated' }, 401)
+    if (url.endsWith('/api/auth/session')) {
+      return jsonResponse({ authenticated: false, user: null, csrf_token: null })
     }
     if (url.endsWith('/api/auth/login') && init?.method === 'POST') {
       return jsonResponse({ user: { username: 'admin', role: 'admin' }, csrf_token: 'csrf-test' })

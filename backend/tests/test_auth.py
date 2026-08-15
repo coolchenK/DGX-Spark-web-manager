@@ -1,3 +1,26 @@
+def test_session_status_is_public_and_restores_authenticated_user(client):
+    anonymous = client.get("/api/auth/session")
+    assert anonymous.status_code == 200
+    assert anonymous.json() == {
+        "authenticated": False,
+        "user": None,
+        "csrf_token": None,
+    }
+
+    login = client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "Test-password-1234"},
+    )
+    restored = client.get("/api/auth/session")
+
+    assert restored.status_code == 200
+    assert restored.json() == {
+        "authenticated": True,
+        "user": {"username": "admin", "role": "admin"},
+        "csrf_token": login.json()["csrf_token"],
+    }
+
+
 def test_login_sets_secure_session_and_returns_current_user(client):
     rejected = client.post(
         "/api/auth/login",
@@ -45,4 +68,3 @@ def test_api_key_is_returned_once_and_can_be_revoked(authenticated_client):
     revoked = authenticated_client.delete(f"/api/keys/{body['id']}")
     assert revoked.status_code == 204
     assert authenticated_client.get("/api/keys").json()[0]["revoked_at"] is not None
-

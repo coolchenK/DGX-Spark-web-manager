@@ -23,22 +23,31 @@ const TasksPage = lazy(() => import('./pages/TasksPage').then((module) => ({ def
 const AuditPage = lazy(() => import('./pages/AuditPage').then((module) => ({ default: module.AuditPage })))
 const SettingsPage = lazy(() => import('./pages/SettingsPage').then((module) => ({ default: module.SettingsPage })))
 
+interface SessionStatus {
+  authenticated: boolean
+  user: User | null
+  csrf_token: string | null
+}
+
 
 function AuthenticatedApp() {
   const user = useAuthStore((state) => state.user)
   const setSession = useAuthStore((state) => state.setSession)
   const clearSession = useAuthStore((state) => state.clearSession)
   const session = useQuery({
-    queryKey: ['auth', 'me'],
-    queryFn: () => api.get<User>('/api/auth/me'),
+    queryKey: ['auth', 'session'],
+    queryFn: () => api.get<SessionStatus>('/api/auth/session'),
     enabled: !user,
     retry: false,
   })
 
   useEffect(() => {
-    if (session.data) setSession(session.data, useAuthStore.getState().csrfToken)
-    if (session.error && 'status' in session.error && session.error.status === 401) clearSession()
-  }, [session.data, session.error, setSession, clearSession])
+    if (session.data?.authenticated && session.data.user) {
+      setSession(session.data.user, session.data.csrf_token ?? '')
+    } else if (session.data && !session.data.authenticated) {
+      clearSession()
+    }
+  }, [session.data, setSession, clearSession])
 
   if (!user && session.isLoading) {
     return (

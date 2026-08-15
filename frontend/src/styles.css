@@ -42,7 +42,7 @@ button, input, textarea, select { letter-spacing: 0; }
 .app-sider nav { flex: 1; padding-top: 10px; overflow-y: auto; }
 .app-sider .ant-menu, .ant-drawer .ant-menu { border-inline-end: 0 !important; background: transparent; }
 .brand-lockup { height: var(--header-height); display: flex; align-items: center; gap: 10px; padding: 0 16px; min-width: 0; }
-.brand-mark { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 6px; flex: 0 0 auto; background: var(--color-primary); color: white; font-size: 11px; font-weight: 800; }
+.brand-mark { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 6px; flex: 0 0 auto; background: var(--color-primary); color: white; font-size: 11px; font-weight: 800; line-height: 1; }
 .brand-mark-large { width: 42px; height: 42px; font-size: 14px; }
 .brand-copy { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
 .brand-copy strong { color: var(--color-ink); font-size: 14px; }

@@ -81,6 +81,22 @@ def me(admin: Admin) -> dict[str, str]:
     return {"username": str(admin["username"]), "role": str(admin["role"])}
 
 
+@router.get("/api/auth/session")
+def session_status(request: Request) -> dict:
+    token = request.cookies.get("dgx_session")
+    payload = request.app.state.session_manager.load(token) if token else None
+    if not payload or payload.get("role") != "admin":
+        return {"authenticated": False, "user": None, "csrf_token": None}
+    return {
+        "authenticated": True,
+        "user": {
+            "username": str(payload["username"]),
+            "role": str(payload["role"]),
+        },
+        "csrf_token": str(payload["csrf"]),
+    }
+
+
 @router.post("/api/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(response: Response, _: CsrfAdmin) -> None:
     response.delete_cookie("dgx_session", path="/")
