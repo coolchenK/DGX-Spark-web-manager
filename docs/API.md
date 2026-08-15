@@ -31,6 +31,7 @@ Authorization: Bearer dgx_...
 | POST | `/api/huggingface/downloads` | Create persistent download task |
 | POST | `/api/deployments/preview` | Validate and preview deployment |
 | POST | `/api/deployments` | Create deployment task |
+| PATCH | `/api/deployments/{id}` | Replace a managed deployment from a validated spec |
 | POST | `/api/deployments/{id}/{start|stop|restart|delete}` | Lifecycle task |
 | GET | `/api/deployments/{id}/logs` | Sanitized container log tail |
 | GET | `/api/tasks` | Persistent task history |

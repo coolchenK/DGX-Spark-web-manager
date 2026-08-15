@@ -1,6 +1,7 @@
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
+from sqlalchemy import or_, select
 
 from app.api.tasks import serialize_task
 from app.audit import record_audit
@@ -34,6 +35,19 @@ def create_deployment(
         request.app.state.deployment_service.preview(spec)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    conflict = db.scalar(
+        select(Deployment).where(
+            or_(Deployment.name == spec.name, Deployment.api_model_name == spec.api_model_name)
+        )
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A deployment already uses this name or API model name; "
+                "edit or clone it instead"
+            ),
+        )
     task = request.app.state.task_engine.create_task(
         db,
         task_type="deployment.create",
@@ -47,6 +61,53 @@ def create_deployment(
         action="deployment.create",
         resource_type="task",
         resource_id=task.id,
+        details={"name": spec.name, "runtime": spec.runtime, "port": spec.port},
+    )
+    db.commit()
+    return serialize_task(task)
+
+
+@router.patch("/{deployment_id}", status_code=status.HTTP_202_ACCEPTED)
+def update_deployment(
+    deployment_id: str,
+    spec: DeploymentSpec,
+    request: Request,
+    db: DbSession,
+    admin: CsrfAdmin,
+) -> dict[str, Any]:
+    deployment = db.get(Deployment, deployment_id)
+    if not deployment:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    if not deployment.managed:
+        raise HTTPException(status_code=409, detail="Discovered containers cannot be edited")
+    try:
+        request.app.state.deployment_service.preview(spec)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    conflict = db.scalar(
+        select(Deployment).where(
+            Deployment.id != deployment_id,
+            or_(Deployment.name == spec.name, Deployment.api_model_name == spec.api_model_name),
+        )
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Another deployment already uses this name or API model name",
+        )
+    task = request.app.state.task_engine.create_task(
+        db,
+        task_type="deployment.update",
+        title=f"更新部署 {deployment.name}",
+        input_json={"deployment_id": deployment_id, "spec": spec.model_dump()},
+        idempotency_key=f"deployment:{deployment_id}:update",
+    )
+    record_audit(
+        db,
+        actor=str(admin["username"]),
+        action="deployment.update",
+        resource_type="deployment",
+        resource_id=deployment_id,
         details={"name": spec.name, "runtime": spec.runtime, "port": spec.port},
     )
     db.commit()

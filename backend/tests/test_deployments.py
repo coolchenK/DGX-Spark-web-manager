@@ -79,6 +79,7 @@ def test_deployment_preview_preserves_shared_gateway_route(tmp_path):
     assert preview["compatibility"]["architectures"] == ["Qwen2ForCausalLM"]
     assert preview["estimated_disk_bytes"] > 0
     assert preview["estimated_memory_bytes"] >= preview["estimated_disk_bytes"]
+    assert preview["spec"] == spec.model_dump()
     assert preview["operations"][-1] == "Probe /v1/models and register the gateway route"
     assert "client.chat.completions.create" in preview["api_example"]
 
@@ -92,6 +93,81 @@ def test_deployment_preview_preserves_shared_gateway_route(tmp_path):
             image="vllm/vllm-openai:v0.27.1",
             port=8101,
         )
+
+
+def test_runtime_adapter_exposes_lifecycle_contract(tmp_path):
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path,))
+
+    for method in (
+        "start",
+        "stop",
+        "restart",
+        "health_check",
+        "logs",
+        "metrics",
+        "uninstall",
+    ):
+        assert callable(getattr(adapter, method, None)), method
+
+
+def test_vllm_command_includes_batch_and_quantization_settings(tmp_path):
+    model_path = tmp_path / "models" / "qwen"
+    model_path.mkdir(parents=True)
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
+    spec = DeploymentSpec(
+        name="Qwen",
+        model_path=str(model_path),
+        api_model_name="qwen",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        max_batched_tokens=4096,
+        quantization="fp8",
+    )
+
+    command = adapter.command(spec)
+
+    assert command[command.index("--max-num-batched-tokens") + 1] == "4096"
+    assert command[command.index("--quantization") + 1] == "fp8"
+
+
+def test_update_endpoint_queues_managed_deployment_change(authenticated_client, tmp_path):
+    model_path = tmp_path / "models" / "qwen"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text('{"architectures":["Qwen2ForCausalLM"]}')
+    (model_path / "model.safetensors").write_bytes(b"weights")
+    with authenticated_client.app.state.database.session_factory() as db:
+        deployment = Deployment(
+            name="managed",
+            runtime="vllm",
+            container_id="container-id",
+            container_name="dgx-managed",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="managed",
+            status="running",
+            health="healthy",
+            managed=True,
+            image="vllm/vllm-openai:v0.27.1",
+            port=8100,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+
+    response = authenticated_client.patch(
+        f"/api/deployments/{deployment_id}",
+        json={
+            "name": "managed",
+            "model_path": str(model_path),
+            "api_model_name": "managed",
+            "runtime": "vllm",
+            "image": "vllm/vllm-openai:v0.27.1",
+            "port": 8100,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["type"] == "deployment.update"
 
 
 def test_container_model_path_maps_to_the_configured_host_root(tmp_path):
@@ -290,7 +366,9 @@ def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
         db.commit()
         deployment_id = deployment.id
     service = deployment_service.DeploymentService(
-        adapters={},
+        adapters={
+            "vllm": VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path,))
+        },
         session_factory=database.session_factory,
         model_roots=(tmp_path,),
         startup_timeout_seconds=4,
@@ -334,4 +412,110 @@ def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
         updated = db.get(Deployment, deployment_id)
         assert updated.status == "running"
         assert updated.health == "healthy"
+
+
+def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, monkeypatch):
+    model_root = tmp_path / "models"
+    model_path = model_root / "qwen"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text('{"architectures":["Qwen2ForCausalLM"]}')
+    (model_path / "model.safetensors").write_bytes(b"weights")
+    database = Database(f"sqlite:///{tmp_path / 'update.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        deployment = Deployment(
+            name="managed",
+            runtime="vllm",
+            container_id="old-container",
+            container_name="dgx-managed",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="managed",
+            status="running",
+            health="healthy",
+            managed=True,
+            image="vllm:test",
+            port=8100,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(model_root,))
+    service = deployment_service.DeploymentService(
+        adapters={"vllm": adapter},
+        session_factory=database.session_factory,
+        model_roots=(model_root,),
+    )
+
+    class FakeContainer:
+        def __init__(self, container_id, name):
+            self.id = container_id
+            self.name = name
+            self.status = "running"
+            self.removed = False
+
+        def reload(self):
+            return None
+
+        def stop(self, **_kwargs):
+            self.status = "exited"
+
+        def start(self):
+            self.status = "running"
+
+        def rename(self, name):
+            self.name = name
+
+        def remove(self, **_kwargs):
+            self.removed = True
+
+        def logs(self, **_kwargs):
+            return b"ready"
+
+    old = FakeContainer("old-container", "dgx-managed")
+    new = FakeContainer("new-container", "dgx-managed")
+
+    class FakeContainers:
+        def get(self, identifier):
+            assert identifier == "old-container"
+            return old
+
+        def run(self, _image, **_kwargs):
+            return new
+
+    client_type = type("Client", (), {"containers": FakeContainers()})
+    monkeypatch.setattr(service, "docker_client", lambda: client_type())
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+
+    class Context:
+        def update(self, **_kwargs):
+            return None
+
+        def check_control(self):
+            return None
+
+    result = service.update_handler(
+        Context(),
+        {
+            "deployment_id": deployment_id,
+            "spec": DeploymentSpec(
+                name="managed",
+                model_path=str(model_path),
+                api_model_name="managed",
+                route_alias="managed-route",
+                runtime="vllm",
+                image="vllm:test",
+                port=8100,
+                context_length=8192,
+            ).model_dump(),
+        },
+    )
+
+    assert result["deployment_id"] == deployment_id
+    assert old.removed is True
+    with database.session_factory() as db:
+        updated = db.get(Deployment, deployment_id)
+        assert updated.container_id == "new-container"
+        assert updated.config["spec"]["context_length"] == 8192
+        assert updated.config["route_alias"] == "managed-route"
 

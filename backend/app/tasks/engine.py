@@ -62,10 +62,13 @@ class TaskContext:
                 return
             if progress is not None:
                 task.progress = max(0, min(100, progress))
-            if completed_bytes is not None:
-                task.completed_bytes = max(0, completed_bytes)
             if total_bytes is not None:
                 task.total_bytes = max(0, total_bytes)
+            if completed_bytes is not None:
+                completed = max(0, completed_bytes)
+                if task.total_bytes is not None:
+                    completed = min(completed, task.total_bytes)
+                task.completed_bytes = completed
             if message:
                 task.log = f"{task.log}{message.rstrip()}\n"[-100_000:]
             db.commit()

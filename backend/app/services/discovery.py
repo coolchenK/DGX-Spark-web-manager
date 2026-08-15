@@ -195,6 +195,14 @@ def infer_model_metadata(model_path: Path, name: str) -> dict[str, Any]:
     }
 
 
+def merge_deployment_config(
+    saved: dict[str, Any], observed: dict[str, Any], *, managed: bool
+) -> dict[str, Any]:
+    if not managed:
+        return observed
+    return {**saved, **{key: value for key, value in observed.items() if value is not None}}
+
+
 class DiscoveryService:
     def __init__(self, model_roots: tuple[Path, ...]):
         self.model_roots = model_roots
@@ -245,6 +253,9 @@ class DiscoveryService:
                     api_model_name=candidate["api_model_name"],
                 )
                 db.add(existing)
+            candidate["config"] = merge_deployment_config(
+                existing.config or {}, candidate["config"], managed=candidate["managed"]
+            )
             for key in (
                 "container_id",
                 "container_name",

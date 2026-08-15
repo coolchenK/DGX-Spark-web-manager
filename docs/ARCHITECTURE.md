@@ -26,8 +26,8 @@ The manager container does not replace or wrap inference containers. Runtime ada
 | `system` | Host/GPU resource collection with explicit unsupported values |
 | `discovery` | Idempotent Docker and model-cache inventory |
 | `tasks` | Durable single-host queue, progress, pause/resume/cancel, restart recovery |
-| `runtime` | SGLang and vLLM command validation and preview |
-| `deployments` | Container creation, health wait, lifecycle, logs, rollback |
+| `runtime` | SGLang/vLLM environment and model checks, configuration, lifecycle, health, logs, metrics, uninstall, and OpenAI capabilities |
+| `deployments` | Idempotent container creation, health wait, update/clone, lifecycle, logs, and rollback |
 | `gateway` | OpenAI model routing, JSON/SSE proxying, usage metrics |
 | `providers` | Encrypted external OpenAI-compatible API configuration and testing |
 | `diagnostics` | Real-context prompt construction and structured plan validation |
@@ -49,6 +49,12 @@ An interrupted `running` task returns to `queued` during startup and appends a r
 ## Trust Boundaries
 
 The browser can request only typed REST operations. It cannot submit Docker commands or runtime argument arrays. The backend validates model paths, images, ports, context sizes, memory ratios, and runtime-specific flags before creating a task.
+
+Deployment edits use a health-gated replacement. The old container is stopped and renamed, the
+replacement is created from the validated spec, and the existing database record is updated only
+after `/v1/models` responds. A failed replacement is removed and the old container name/state is
+restored. Discovery merges live container observations into manager-owned configuration instead of
+discarding the saved spec.
 
 AI providers receive a bounded snapshot of real system values and tail logs after secret redaction. Returned JSON is reduced to known fields. Unknown operations remain visible with `executable=false`; the executor never evaluates text or invokes a shell.
 

@@ -22,6 +22,10 @@ class VllmAdapter(RuntimeAdapter):
             "--max-num-seqs",
             str(spec.max_concurrency),
         ]
+        if spec.max_batched_tokens is not None:
+            command.extend(["--max-num-batched-tokens", str(spec.max_batched_tokens)])
+        if spec.quantization and spec.quantization != "auto":
+            command.extend(["--quantization", spec.quantization])
         if spec.trust_remote_code:
             command.append("--trust-remote-code")
         return command

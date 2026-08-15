@@ -151,3 +151,25 @@ def test_directory_size_does_not_double_count_linked_blobs(tmp_path):
     os.link(blob, snapshot / "model.safetensors")
 
     assert discovery.directory_size(repository) == 7
+
+
+def test_managed_discovery_preserves_saved_deployment_spec():
+    merge = getattr(discovery, "merge_deployment_config", None)
+    assert callable(merge)
+
+    saved = {
+        "spec": {"context_length": 4096, "memory_fraction": 0.25},
+        "route_alias": "saved-route",
+        "estimated_memory_bytes": 123,
+    }
+    observed = {
+        "command": ["--max-model-len", "4096"],
+        "model_path": "/models/qwen",
+        "route_alias": "saved-route",
+    }
+
+    assert merge(saved, observed, managed=True) == {
+        **saved,
+        "command": observed["command"],
+        "model_path": observed["model_path"],
+    }

@@ -81,6 +81,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     task_engine.register("model.download", download_and_discover)
     task_engine.register("deployment.create", deployment_service.create_handler)
+    task_engine.register("deployment.update", deployment_service.update_handler)
     task_engine.register("deployment.action", deployment_service.action_handler)
     task_engine.register("operation.execute", operation_executor.handler)
 

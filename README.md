@@ -13,6 +13,8 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Read-only discovery of existing Docker inference services and Hugging Face caches.
 - Persistent Hugging Face search/download tasks with pause, resume, cancellation, and restart recovery.
 - Validated SGLang and vLLM deployment adapters with image and argument allowlists.
+- Deployment preview, edit, clone, health-gated replacement, automatic rollback, and retained task history.
+- Context, concurrency, batch-token, memory, quantization, route alias, and remote-code controls.
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
 - Hashed gateway API keys, encrypted provider/Hugging Face secrets, administrator sessions, CSRF protection, and audit history.
 - Third-party OpenAI-compatible providers for diagnosis. AI plans require human approval and can only invoke enumerated operations.

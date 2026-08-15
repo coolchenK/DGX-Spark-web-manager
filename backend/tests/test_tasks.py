@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.api import tasks as task_api
 from app.models import TaskRecord
-from app.tasks.engine import TaskEngine, transition_task
+from app.tasks.engine import TaskContext, TaskEngine, transition_task
 from sqlalchemy import select
 
 
@@ -111,3 +111,20 @@ def test_transfer_stats_report_speed_and_remaining_time():
         "speed_bytes_per_second": 100.0,
         "eta_seconds": 10,
     }
+
+
+def test_task_progress_bytes_are_capped_at_known_total(settings):
+    from app.db import Database
+
+    database = Database(settings.database_url)
+    database.create_schema()
+    with database.session_factory() as db:
+        task = TaskRecord(type="model.download", title="Download", total_bytes=100)
+        db.add(task)
+        db.commit()
+        task_id = task.id
+
+    TaskContext(database.session_factory, task_id).update(completed_bytes=129)
+
+    with database.session_factory() as db:
+        assert db.get(TaskRecord, task_id).completed_bytes == 100

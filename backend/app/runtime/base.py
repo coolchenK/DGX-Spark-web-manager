@@ -5,8 +5,9 @@ import platform
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+import httpx
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -22,6 +23,8 @@ class DeploymentSpec(BaseModel):
     context_length: int = Field(default=32768, ge=1024, le=1_048_576)
     memory_fraction: float = Field(default=0.8, ge=0.05, le=0.98)
     max_concurrency: int = Field(default=8, ge=1, le=1024)
+    max_batched_tokens: int | None = Field(default=None, ge=1024, le=1_048_576)
+    quantization: Literal["auto", "awq", "gptq", "fp8", "bitsandbytes", "marlin"] | None = None
     trust_remote_code: bool = False
 
     @field_validator("api_model_name", "route_alias")
@@ -132,12 +135,62 @@ class RuntimeAdapter(ABC):
     def openai_capabilities(self) -> list[str]:
         return ["chat", "completion"]
 
+    def start(self, container: Any) -> None:
+        container.start()
+
+    def stop(self, container: Any, *, timeout: int = 30) -> None:
+        container.stop(timeout=timeout)
+
+    def restart(self, container: Any, *, timeout: int = 30) -> None:
+        container.restart(timeout=timeout)
+
+    def health_check(self, endpoint: str, *, timeout: float = 3) -> bool:
+        try:
+            return httpx.get(f"{endpoint}/v1/models", timeout=timeout).is_success
+        except httpx.HTTPError:
+            return False
+
+    def logs(self, container: Any, *, tail: int = 500) -> str:
+        value = container.logs(tail=min(max(tail, 1), 5000), timestamps=True)
+        return value.decode("utf-8", errors="replace")[-500_000:]
+
+    def metrics(self, container: Any) -> dict[str, float | int | None]:
+        stats = container.stats(stream=False)
+        cpu_stats = stats.get("cpu_stats") or {}
+        previous = stats.get("precpu_stats") or {}
+        cpu_delta = (cpu_stats.get("cpu_usage") or {}).get("total_usage", 0) - (
+            (previous.get("cpu_usage") or {}).get("total_usage", 0)
+        )
+        system_delta = cpu_stats.get("system_cpu_usage", 0) - previous.get(
+            "system_cpu_usage", 0
+        )
+        online_cpus = cpu_stats.get("online_cpus") or len(
+            (cpu_stats.get("cpu_usage") or {}).get("percpu_usage") or []
+        )
+        cpu_percent = (
+            cpu_delta / system_delta * max(online_cpus, 1) * 100
+            if cpu_delta > 0 and system_delta > 0
+            else 0.0
+        )
+        memory_stats = stats.get("memory_stats") or {}
+        return {
+            "cpu_percent": round(cpu_percent, 2),
+            "memory_used_bytes": memory_stats.get("usage"),
+            "memory_limit_bytes": memory_stats.get("limit"),
+        }
+
+    def uninstall(self, container: Any) -> None:
+        if getattr(container, "status", None) == "running":
+            self.stop(container)
+        container.remove()
+
     def preview(self, spec: DeploymentSpec) -> dict[str, Any]:
         model_path = self.validate(spec)
         compatibility = self.check_model_compatibility(model_path)
         model_size = self.model_size(model_path)
         route_name = spec.route_alias or spec.api_model_name
         return {
+            "spec": spec.model_dump(),
             "container_name": deterministic_container_name(spec.name),
             "runtime": self.runtime,
             "image": spec.image,

@@ -25,6 +25,8 @@ class SGLangAdapter(RuntimeAdapter):
             "--max-running-requests",
             str(spec.max_concurrency),
         ]
+        if spec.quantization and spec.quantization != "auto":
+            command.extend(["--quantization", spec.quantization])
         if spec.trust_remote_code:
             command.append("--trust-remote-code")
         return command
