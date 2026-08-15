@@ -186,10 +186,18 @@ class DiscoveryService:
     def scan_models(self, db: Session) -> list[ModelAsset]:
         discovered: list[ModelAsset] = []
         for root in self.model_roots:
-            if not root.exists() or not root.is_dir():
+            try:
+                if not root.exists() or not root.is_dir():
+                    continue
+                children = list(root.iterdir())
+            except OSError:
                 continue
-            for child in root.iterdir():
-                if not child.is_dir() or child.name.startswith("."):
+            for child in children:
+                try:
+                    is_model_directory = child.is_dir() and not child.name.startswith(".")
+                except OSError:
+                    continue
+                if not is_model_directory:
                     continue
                 repository_id = parse_hf_cache_repository(child.name)
                 source = "huggingface" if repository_id else "local"

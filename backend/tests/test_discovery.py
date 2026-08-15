@@ -1,6 +1,7 @@
 import os
 
 from app.services.discovery import (
+    DiscoveryService,
     container_candidate,
     infer_runtime,
     parse_hf_cache_repository,
@@ -37,6 +38,21 @@ def test_resolve_hf_snapshot_uses_newest_snapshot_without_main_ref(tmp_path):
     os.utime(newer, (2, 2))
 
     assert resolve_hf_snapshot(repository) == newer
+
+
+def test_scan_models_skips_inaccessible_roots(settings):
+    class InaccessibleRoot:
+        def exists(self):
+            raise PermissionError("not readable")
+
+    from app.db import Database
+
+    database = Database(settings.database_url)
+    database.create_schema()
+    service = DiscoveryService((InaccessibleRoot(),))
+
+    with database.session_factory() as db:
+        assert service.scan_models(db) == []
 
 
 def test_infer_runtime_from_image_and_command():

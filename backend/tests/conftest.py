@@ -15,6 +15,11 @@ def settings(tmp_path):
     return Settings(
         database_url=f"sqlite:///{tmp_path / 'manager.db'}",
         data_dir=tmp_path,
+        model_roots=str(tmp_path / "models"),
+        hf_cache_dir=tmp_path / "hf-cache",
+        static_dir=tmp_path / "static",
+        host_os_release=tmp_path / "os-release",
+        auto_discovery=False,
         secret_key="test-secret-key-with-at-least-32-characters",
         admin_password="Test-password-1234",
         allowed_origins="http://testserver",
