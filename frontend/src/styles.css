@@ -115,6 +115,7 @@ button, input, textarea, select { letter-spacing: 0; }
 .search-idle h2 { margin: 14px 0 4px; color: var(--color-ink); font-size: 17px; }
 .search-idle p { margin: 0; }
 .hf-results .ant-list-item { padding-inline: 0; }
+.hf-model-details { margin-bottom: 18px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
 .form-grid .ant-input-number { width: 100%; }
 .gateway-summary, .diagnostic-composer, .settings-section { padding: 18px 20px; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 6px; }

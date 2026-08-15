@@ -162,6 +162,18 @@ export interface HuggingFaceModel {
   tags: string[]
 }
 
+export interface HuggingFaceModelInfo {
+  id: string
+  sha: string
+  pipeline_tag: string | null
+  private: boolean
+  gated: boolean
+  tags: string[]
+  siblings: Array<{ name: string; size: number | null }>
+  total_size: number
+  card_data: Record<string, unknown>
+}
+
 export interface ManagerSettings {
   huggingface: { token_configured: boolean; cache_dir: string }
   models: { roots: string[] }
