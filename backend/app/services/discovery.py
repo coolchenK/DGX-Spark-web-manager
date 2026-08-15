@@ -107,11 +107,17 @@ def container_candidate(attrs: dict[str, Any]) -> dict[str, Any] | None:
 
 def directory_size(path: Path) -> int:
     total = 0
+    seen: set[tuple[int, int]] = set()
     try:
         for entry in path.rglob("*"):
             if entry.is_file():
                 try:
-                    total += entry.stat().st_size
+                    stat = entry.stat()
+                    identity = (stat.st_dev, stat.st_ino)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    total += stat.st_size
                 except OSError:
                     continue
     except OSError:

@@ -96,16 +96,33 @@ def verify_snapshot_files(
     exclude: list[str],
 ) -> list[str]:
     expected = selected_file_names(files, include=include, exclude=exclude)
-    resolved_snapshot = snapshot.resolve()
     missing: list[str] = []
     for name in expected:
-        candidate = (snapshot / name).resolve()
-        if not candidate.is_relative_to(resolved_snapshot) or not candidate.is_file():
+        candidate = snapshot / name
+        resolved_candidate = candidate.resolve()
+        if (
+            not is_safe_snapshot_file(snapshot, candidate, resolved_candidate)
+            or not resolved_candidate.is_file()
+        ):
             missing.append(name)
     if missing:
         preview = ", ".join(missing[:10])
         raise RuntimeError(f"Downloaded snapshot failed integrity check; missing: {preview}")
     return expected
+
+
+def is_safe_snapshot_file(snapshot: Path, candidate: Path, resolved_target: Path) -> bool:
+    lexical_snapshot = Path(os.path.abspath(snapshot))
+    lexical_candidate = Path(os.path.abspath(candidate))
+    repository_root = (
+        snapshot.parent.parent.resolve()
+        if snapshot.parent.name == "snapshots"
+        else snapshot.resolve()
+    )
+    resolved_target = resolved_target.resolve()
+    return lexical_candidate.is_relative_to(
+        lexical_snapshot
+    ) and resolved_target.is_relative_to(repository_root)
 
 
 def huggingface_environment(cache_dir: Path, base_environment: dict[str, str]) -> dict[str, str]:

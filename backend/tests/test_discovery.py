@@ -139,3 +139,15 @@ def test_scan_uses_commit_as_revision_when_no_named_ref_exists(settings):
 
     assert model.commit_hash == "commit123"
     assert model.revision == "commit123"
+
+
+def test_directory_size_does_not_double_count_linked_blobs(tmp_path):
+    repository = tmp_path / "model"
+    blob = repository / "blobs" / "hash"
+    snapshot = repository / "snapshots" / "abc"
+    blob.parent.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob.write_bytes(b"weights")
+    os.link(blob, snapshot / "model.safetensors")
+
+    assert discovery.directory_size(repository) == 7

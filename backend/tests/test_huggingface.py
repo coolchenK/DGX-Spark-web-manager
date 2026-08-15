@@ -103,6 +103,23 @@ def test_snapshot_integrity_check_requires_every_selected_file(tmp_path):
         verify(snapshot, files, include=[], exclude=[])
 
 
+def test_snapshot_integrity_allows_hub_links_to_repository_blobs(tmp_path):
+    repository = tmp_path / "models--org--model"
+    snapshot = repository / "snapshots" / "abc"
+    blob = repository / "blobs" / "hash"
+    snapshot.mkdir(parents=True)
+    blob.parent.mkdir()
+    blob.write_bytes(b"weights")
+    is_safe = getattr(huggingface, "is_safe_snapshot_file", lambda *_args: False)
+
+    assert is_safe(
+        snapshot,
+        snapshot / "model.safetensors",
+        blob,
+    ) is True
+    assert is_safe(snapshot, snapshot / "../escape", tmp_path / "outside") is False
+
+
 def test_huggingface_cli_uses_writable_cache_home(tmp_path):
     cache = tmp_path / "hf-cache" / "hub"
     build_environment = getattr(
