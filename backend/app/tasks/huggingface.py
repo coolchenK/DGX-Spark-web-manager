@@ -10,7 +10,7 @@ from typing import Any
 
 from huggingface_hub import HfApi
 
-from app.services.discovery import directory_size
+from app.services.discovery import directory_size, resolve_hf_snapshot
 from app.tasks.engine import TaskCancelled, TaskContext, TaskPaused
 
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -35,6 +35,10 @@ def cache_repository_path(cache_dir: Path, repository_id: str) -> Path:
 class HuggingFaceService:
     def __init__(self, cache_dir: Path, token: str | None = None):
         self.cache_dir = cache_dir
+        self.token = token
+        self.api = HfApi(token=token)
+
+    def set_token(self, token: str | None) -> None:
         self.token = token
         self.api = HfApi(token=token)
 
@@ -134,12 +138,12 @@ class HuggingFaceService:
         if process.returncode != 0:
             raise RuntimeError(f"Hugging Face download exited with code {process.returncode}")
         completed = directory_size(target)
+        snapshot = resolve_hf_snapshot(target)
         context.update(progress=100, completed_bytes=completed, total_bytes=total_bytes)
         return {
             "repository_id": repository_id,
             "revision": revision,
             "commit_hash": info["sha"],
-            "local_path": str(target),
+            "local_path": str(snapshot),
             "size_bytes": completed,
         }
-

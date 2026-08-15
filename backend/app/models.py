@@ -105,6 +105,16 @@ class Provider(TimestampMixin, Base):
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class SecretSetting(Base):
+    __tablename__ = "secret_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    encrypted_value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class OperationPlan(TimestampMixin, Base):
     __tablename__ = "operation_plans"
 
@@ -159,4 +169,3 @@ class RequestMetric(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer)
     completion_tokens: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-

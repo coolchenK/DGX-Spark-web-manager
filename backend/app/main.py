@@ -1,9 +1,10 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app import models  # noqa: F401
@@ -14,12 +15,14 @@ from app.api.gateway import router as gateway_router
 from app.api.huggingface import router as huggingface_router
 from app.api.inventory import router as inventory_router
 from app.api.providers import router as providers_router
+from app.api.settings import router as settings_router
 from app.api.system import router as system_router
 from app.api.tasks import router as tasks_router
 from app.audit import router as audit_router
 from app.auth import router as auth_router
 from app.config import Settings
 from app.db import Database
+from app.models import SecretSetting
 from app.operations.executor import OperationExecutor
 from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
@@ -38,6 +41,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     database = Database(app_settings.database_url)
     task_engine = TaskEngine(database.session_factory)
     huggingface_service = HuggingFaceService(app_settings.hf_cache_dir, app_settings.hf_token)
+    discovery_service = DiscoveryService(app_settings.model_root_paths)
+    system_service = SystemService(
+        app_settings.data_dir, os_release_path=app_settings.host_os_release
+    )
     deployment_service = DeploymentService(
         adapters={
             "vllm": VllmAdapter(
@@ -55,15 +62,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     provider_service = ProviderService(SecretBox(app_settings.secret_key))
     diagnostic_service = DiagnosticService(
         provider_service,
-        SystemService(app_settings.data_dir),
+        system_service,
         deployment_service,
     )
     operation_executor = OperationExecutor(
         session_factory=database.session_factory,
         deployment_service=deployment_service,
-        discovery_service=DiscoveryService(app_settings.model_root_paths),
+        discovery_service=discovery_service,
     )
-    task_engine.register("model.download", huggingface_service.download_handler)
+
+    def download_and_discover(context, payload):
+        result = huggingface_service.download_handler(context, payload)
+        with database.session_factory() as db:
+            discovery_service.scan_models(db)
+        return result
+
+    task_engine.register("model.download", download_and_discover)
     task_engine.register("deployment.create", deployment_service.create_handler)
     task_engine.register("deployment.action", deployment_service.action_handler)
     task_engine.register("operation.execute", operation_executor.handler)
@@ -73,6 +87,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.create_schema()
         app.state.settings = app_settings
         app.state.database = database
+        with database.session_factory() as db:
+            stored_token = db.get(SecretSetting, "huggingface_token")
+            if stored_token:
+                huggingface_service.set_token(
+                    app.state.secret_box.decrypt(stored_token.encrypted_value)
+                )
+            if app_settings.auto_discovery:
+                app.state.discovery_service.scan_all(db)
         task_engine.start()
         yield
         task_engine.stop()
@@ -86,8 +108,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app_settings.secret_key, app_settings.session_ttl_seconds
     )
     app.state.secret_box = SecretBox(app_settings.secret_key)
-    app.state.system_service = SystemService(app_settings.data_dir)
-    app.state.discovery_service = DiscoveryService(app_settings.model_root_paths)
+    app.state.system_service = system_service
+    app.state.discovery_service = discovery_service
     app.state.huggingface_service = huggingface_service
     app.state.task_engine = task_engine
     app.state.deployment_service = deployment_service
@@ -126,6 +148,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(gateway_router)
     app.include_router(providers_router)
     app.include_router(diagnostics_router)
+    app.include_router(settings_router)
 
     @app.get("/api/health")
     def health(request: Request) -> dict[str, str]:
@@ -136,6 +159,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "service": app_settings.app_name,
             "database": "ok",
         }
+
+    static_dir = app_settings.static_dir.resolve()
+    if static_dir.is_dir() and (static_dir / "index.html").is_file():
+        assets_dir = static_dir / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+        @app.get("/{path:path}", include_in_schema=False)
+        def spa(path: str) -> FileResponse:
+            is_api_path = path in {"api", "v1"} or path.startswith(("api/", "v1/"))
+            if is_api_path:
+                raise HTTPException(status_code=404, detail="Not found")
+            candidate = (static_dir / path).resolve()
+            if candidate.is_relative_to(static_dir) and candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(static_dir / "index.html")
 
     return app
 

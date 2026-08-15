@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     model_roots: str = "/models,/root/.cache/huggingface/hub"
     hf_cache_dir: Path = Path("/root/.cache/huggingface/hub")
     hf_token: str | None = None
+    static_dir: Path = Path("frontend/dist")
+    host_os_release: Path = Path("/host/etc/os-release")
+    auto_discovery: bool = True
     allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     session_ttl_seconds: int = 43_200
     cookie_secure: bool = False

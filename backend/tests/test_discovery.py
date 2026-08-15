@@ -1,7 +1,10 @@
+import os
+
 from app.services.discovery import (
     container_candidate,
     infer_runtime,
     parse_hf_cache_repository,
+    resolve_hf_snapshot,
 )
 
 
@@ -13,6 +16,27 @@ def test_parse_hugging_face_cache_repository():
         == "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
     )
     assert parse_hf_cache_repository(".locks") is None
+
+
+def test_resolve_hf_snapshot_prefers_revision_reference(tmp_path):
+    repository = tmp_path / "models--org--model"
+    (repository / "refs").mkdir(parents=True)
+    (repository / "snapshots" / "abc123").mkdir(parents=True)
+    (repository / "refs" / "main").write_text("abc123\n", encoding="utf-8")
+
+    assert resolve_hf_snapshot(repository) == repository / "snapshots" / "abc123"
+
+
+def test_resolve_hf_snapshot_uses_newest_snapshot_without_main_ref(tmp_path):
+    repository = tmp_path / "models--org--model"
+    older = repository / "snapshots" / "older"
+    newer = repository / "snapshots" / "newer"
+    older.mkdir(parents=True)
+    newer.mkdir()
+    os.utime(older, (1, 1))
+    os.utime(newer, (2, 2))
+
+    assert resolve_hf_snapshot(repository) == newer
 
 
 def test_infer_runtime_from_image_and_command():

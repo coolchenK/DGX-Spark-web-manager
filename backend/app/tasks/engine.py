@@ -111,6 +111,9 @@ class TaskEngine:
             )
             if existing and existing.status not in TERMINAL_STATES:
                 return existing
+            if existing:
+                existing.idempotency_key = None
+                db.flush()
         task = TaskRecord(
             type=task_type,
             title=title,
@@ -232,4 +235,3 @@ class TaskEngine:
         else:
             raise ValueError(f"Task in {task.status} cannot be cancelled")
         db.commit()
-

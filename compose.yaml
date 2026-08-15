@@ -1,0 +1,36 @@
+services:
+  manager:
+    image: dgx-spark-web-manager:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dgx-spark-web-manager
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    user: "${PUID:-1000}:${PGID:-1000}"
+    group_add:
+      - "${DOCKER_GID:-988}"
+    gpus: all
+    environment:
+      DGX_DATABASE_URL: sqlite:////app/data/manager.db
+      DGX_DATA_DIR: /app/data
+      DGX_STATIC_DIR: /app/frontend/dist
+      DGX_SECRET_KEY: ${DGX_SECRET_KEY:?Set DGX_SECRET_KEY in .env}
+      DGX_ADMIN_USERNAME: ${DGX_ADMIN_USERNAME:-admin}
+      DGX_ADMIN_PASSWORD: ${DGX_ADMIN_PASSWORD:?Set DGX_ADMIN_PASSWORD in .env}
+      DGX_COOKIE_SECURE: ${DGX_COOKIE_SECURE:-false}
+      DGX_ALLOWED_ORIGINS: ${DGX_ALLOWED_ORIGINS:-http://localhost:3000}
+      DGX_MODEL_ROOTS: /models,/hf-cache/hub
+      DGX_HF_CACHE_DIR: /hf-cache/hub
+      DGX_AUTO_DISCOVERY: "true"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HF_HOME_HOST:?Set HF_HOME_HOST in .env}:/hf-cache
+      - ${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env}:/models
+      - /etc/os-release:/host/etc/os-release:ro
+    security_opt:
+      - no-new-privileges:true

@@ -1,4 +1,4 @@
-from app.services.system import parse_nvidia_smi
+from app.services.system import SystemService, parse_nvidia_smi, read_os_name
 
 
 def test_parse_nvidia_smi_preserves_unsupported_unified_memory():
@@ -16,6 +16,24 @@ def test_parse_nvidia_smi_preserves_unsupported_unified_memory():
             "utilization_percent": 0.0,
         }
     ]
+
+
+def test_read_os_name_from_host_os_release(tmp_path):
+    os_release = tmp_path / "os-release"
+    os_release.write_text(
+        'NAME="Ubuntu"\nPRETTY_NAME="Ubuntu 24.04.4 LTS"\n', encoding="utf-8"
+    )
+
+    assert read_os_name(os_release) == "Ubuntu 24.04.4 LTS"
+
+
+def test_system_service_prefers_host_os_release(tmp_path, monkeypatch):
+    os_release = tmp_path / "os-release"
+    os_release.write_text('PRETTY_NAME="Ubuntu 24.04.4 LTS"\n', encoding="utf-8")
+    service = SystemService(tmp_path, os_release_path=os_release)
+    monkeypatch.setattr(service, "_gpu_snapshot", lambda: [])
+
+    assert service.snapshot()["os"] == "Ubuntu 24.04.4 LTS"
 
 
 def test_system_endpoint_uses_real_service_contract(authenticated_client, monkeypatch):
@@ -40,4 +58,3 @@ def test_system_endpoint_uses_real_service_contract(authenticated_client, monkey
 
     assert response.status_code == 200
     assert response.json() == expected
-

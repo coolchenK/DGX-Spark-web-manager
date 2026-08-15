@@ -20,6 +20,24 @@ def parse_hf_cache_repository(directory_name: str) -> str | None:
     return "/".join(parts)
 
 
+def resolve_hf_snapshot(repository_path: Path) -> Path:
+    main_ref = repository_path / "refs" / "main"
+    try:
+        commit_hash = main_ref.read_text(encoding="utf-8").strip()
+    except OSError:
+        commit_hash = ""
+    referenced = repository_path / "snapshots" / commit_hash
+    if commit_hash and referenced.is_dir():
+        return referenced
+
+    snapshots = repository_path / "snapshots"
+    if snapshots.is_dir():
+        candidates = [path for path in snapshots.iterdir() if path.is_dir()]
+        if candidates:
+            return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    return repository_path
+
+
 def infer_runtime(image: str, command: list[str]) -> str | None:
     haystack = " ".join([image, *command]).lower()
     if "sglang" in haystack:
@@ -175,16 +193,28 @@ class DiscoveryService:
                     continue
                 repository_id = parse_hf_cache_repository(child.name)
                 source = "huggingface" if repository_id else "local"
-                existing = db.scalar(select(ModelAsset).where(ModelAsset.local_path == str(child)))
+                local_path = resolve_hf_snapshot(child) if repository_id else child
+                if repository_id:
+                    existing = db.scalar(
+                        select(ModelAsset).where(
+                            ModelAsset.source == "huggingface",
+                            ModelAsset.repository_id == repository_id,
+                        )
+                    )
+                else:
+                    existing = db.scalar(
+                        select(ModelAsset).where(ModelAsset.local_path == str(local_path))
+                    )
                 if existing is None:
                     existing = ModelAsset(
                         name=repository_id or child.name,
                         source=source,
                         repository_id=repository_id,
-                        local_path=str(child),
+                        local_path=str(local_path),
                         capabilities=["chat", "completion"],
                     )
                     db.add(existing)
+                existing.local_path = str(local_path)
                 existing.size_bytes = directory_size(child)
                 existing.status = "available"
                 discovered.append(existing)
@@ -200,4 +230,3 @@ class DiscoveryService:
             deployments = []
             error = str(exc)
         return {"models": len(models), "deployments": len(deployments), "docker_error": error}
-
