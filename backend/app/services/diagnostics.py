@@ -19,6 +19,35 @@ ALLOWED_OPERATIONS = {
 }
 
 
+def build_diagnostic_request(
+    *, model: str, prompt: str, actual_context: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+        "max_tokens": 768,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You diagnose a DGX Spark. Return concise JSON with summary, diagnosis, risk "
+                    "and steps. Each step may only use start_deployment, stop_deployment, "
+                    "restart_deployment, rescan_inventory, or explain_only. "
+                    "Never emit shell. Keep the entire response under 600 words."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"request": prompt, "observed_context": actual_context},
+                    ensure_ascii=True,
+                ),
+            },
+        ],
+    }
+
+
 def parse_diagnostic_content(content: str) -> dict[str, Any]:
     stripped = content.strip()
     if stripped.startswith("```"):
@@ -80,7 +109,7 @@ class DiagnosticService:
             logs = ""
             if deployment.container_id:
                 try:
-                    logs = redact_log(self.deployment_service.logs(deployment, tail=200))
+                    logs = redact_log(self.deployment_service.logs(deployment, tail=200))[-8000:]
                 except Exception as exc:
                     logs = f"Logs unavailable: {exc}"
             deployment_rows.append(
@@ -109,29 +138,11 @@ class DiagnosticService:
         response = httpx.post(
             f"{provider.base_url}/chat/completions",
             headers=self.provider_service.authorization_headers(provider),
-            json={
-                "model": provider.default_model,
-                "response_format": {"type": "json_object"},
-                "temperature": 0.1,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You diagnose a DGX Spark. Return JSON with summary, diagnosis, risk "
-                            "and steps. Each step may only use start_deployment, stop_deployment, "
-                            "restart_deployment, rescan_inventory, or explain_only. "
-                            "Never emit shell."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {"request": prompt, "observed_context": actual_context},
-                            ensure_ascii=True,
-                        ),
-                    },
-                ],
-            },
+            json=build_diagnostic_request(
+                model=provider.default_model,
+                prompt=prompt,
+                actual_context=actual_context,
+            ),
             timeout=provider.timeout_seconds,
             follow_redirects=False,
             trust_env=False,

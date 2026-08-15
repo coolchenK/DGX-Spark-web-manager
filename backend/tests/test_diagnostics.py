@@ -1,3 +1,4 @@
+from app.services import diagnostics
 from app.services.diagnostics import parse_diagnostic_content, sanitize_steps
 
 
@@ -26,6 +27,20 @@ def test_unknown_and_shell_operations_are_not_executable():
     assert steps[0]["executable"] is True
     assert steps[1]["executable"] is False
     assert "command" not in steps[1]
+
+
+def test_diagnostic_provider_request_limits_generated_output():
+    build = getattr(diagnostics, "build_diagnostic_request", None)
+    assert callable(build)
+
+    payload = build(
+        model="ops-model",
+        prompt="Inspect the service",
+        actual_context={"system": {}, "deployments": []},
+    )
+
+    assert payload["max_tokens"] == 768
+    assert payload["response_format"] == {"type": "json_object"}
 
 
 def test_plan_must_be_approved_before_execution(authenticated_client):
