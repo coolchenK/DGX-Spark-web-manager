@@ -1,3 +1,5 @@
+import json
+
 from app.services import diagnostics
 from app.services.diagnostics import parse_diagnostic_content, sanitize_steps
 
@@ -36,11 +38,16 @@ def test_diagnostic_provider_request_limits_generated_output():
     payload = build(
         model="ops-model",
         prompt="Inspect the service",
-        actual_context={"system": {}, "deployments": []},
+        actual_context={
+            "system": {},
+            "deployments": [{"id": "dep-1", "logs": "a" * 3000}],
+        },
     )
 
-    assert payload["max_tokens"] == 768
+    assert payload["max_tokens"] == 512
     assert payload["response_format"] == {"type": "json_object"}
+    user_payload = json.loads(payload["messages"][1]["content"])
+    assert user_payload["observed_context"]["deployments"][0]["logs"] == "a" * 2500
 
 
 def test_plan_must_be_approved_before_execution(authenticated_client):

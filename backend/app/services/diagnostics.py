@@ -22,11 +22,18 @@ ALLOWED_OPERATIONS = {
 def build_diagnostic_request(
     *, model: str, prompt: str, actual_context: dict[str, Any]
 ) -> dict[str, Any]:
+    bounded_context = {
+        **actual_context,
+        "deployments": [
+            {**deployment, "logs": str(deployment.get("logs") or "")[-2500:]}
+            for deployment in actual_context.get("deployments", [])
+        ],
+    }
     return {
         "model": model,
         "response_format": {"type": "json_object"},
         "temperature": 0.1,
-        "max_tokens": 768,
+        "max_tokens": 512,
         "messages": [
             {
                 "role": "system",
@@ -40,7 +47,7 @@ def build_diagnostic_request(
             {
                 "role": "user",
                 "content": json.dumps(
-                    {"request": prompt, "observed_context": actual_context},
+                    {"request": prompt, "observed_context": bounded_context},
                     ensure_ascii=True,
                 ),
             },
