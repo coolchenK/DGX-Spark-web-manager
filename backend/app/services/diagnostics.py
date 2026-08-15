@@ -78,7 +78,8 @@ def sanitize_steps(steps: Any, *, known_deployment_ids: set[str]) -> list[dict[s
         if isinstance(value, dict):
             step = value
         elif isinstance(value, str):
-            operation = value if value in ALLOWED_OPERATIONS else "explain_only"
+            normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+            operation = normalized if normalized in ALLOWED_OPERATIONS else "explain_only"
             step = {
                 "operation": operation,
                 "reason": value if operation == "explain_only" else "Provider compact step",

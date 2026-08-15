@@ -33,7 +33,7 @@ def test_unknown_and_shell_operations_are_not_executable():
 
 def test_compact_string_steps_are_safely_normalized():
     steps = sanitize_steps(
-        ["rescan_inventory", "run arbitrary shell"],
+        ["Rescan Inventory", "run arbitrary shell"],
         known_deployment_ids=set(),
     )
 
