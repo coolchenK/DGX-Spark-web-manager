@@ -1,4 +1,40 @@
-import type { Deployment, ModelAsset } from '../api/types'
+import type { Deployment, ModelAsset, RecommendationProvenance } from '../api/types'
+
+
+export interface GenerationDefaults {
+  temperature?: number
+  top_p?: number
+  top_k?: number
+  min_p?: number
+  repetition_penalty?: number
+  presence_penalty?: number
+  frequency_penalty?: number
+  max_tokens?: number
+  stop?: string | string[]
+}
+
+export type QuantizationMethod =
+  | 'auto'
+  | 'awq'
+  | 'gptq'
+  | 'fp8'
+  | 'bitsandbytes'
+  | 'marlin'
+  | 'gguf'
+  | 'modelopt'
+  | 'modelopt_fp4'
+  | 'nvfp4_online'
+  | 'compressed-tensors'
+
+export interface SpeculativeSettings {
+  draft_model_id: string
+  method: 'draft_model' | 'eagle' | 'eagle3' | 'mtp'
+  num_speculative_tokens?: number
+  num_steps?: number
+  eagle_top_k?: number
+  num_draft_tokens?: number
+  manual_review_acknowledged: boolean
+}
 
 
 export interface DeploymentFormValues {
@@ -14,8 +50,12 @@ export interface DeploymentFormValues {
   memory_fraction: number
   max_concurrency: number
   max_batched_tokens?: number
-  quantization?: 'auto' | 'awq' | 'gptq' | 'fp8' | 'bitsandbytes' | 'marlin'
+  quantization?: QuantizationMethod
   trust_remote_code: boolean
+  generation_defaults: GenerationDefaults
+  speculative?: SpeculativeSettings | null
+  recommendation?: RecommendationProvenance | null
+  resource_warning_acknowledged: boolean
 }
 
 
@@ -72,11 +112,22 @@ export function deploymentToFormValues(
     quantization: saved.quantization
       ?? commandValue(command, '--quantization') as DeploymentFormValues['quantization'],
     trust_remote_code: saved.trust_remote_code ?? command.includes('--trust-remote-code'),
+    generation_defaults: { ...(saved.generation_defaults ?? {}) },
+    speculative: saved.speculative ? { ...saved.speculative } : null,
+    recommendation: saved.recommendation ? { ...saved.recommendation } : null,
+    resource_warning_acknowledged: saved.resource_warning_acknowledged ?? false,
   }
   if (mode === 'clone') {
     values.name = `${values.name}-copy`
     values.api_model_name = `${values.api_model_name}-copy`
     values.port = Math.min(values.port + 1, 65535)
+    values.resource_warning_acknowledged = false
+    if (values.speculative) {
+      values.speculative = {
+        ...values.speculative,
+        manual_review_acknowledged: false,
+      }
+    }
   }
   return values
 }

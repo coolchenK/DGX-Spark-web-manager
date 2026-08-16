@@ -189,3 +189,90 @@ export interface ManagerSettings {
   models: { roots: string[] }
   runtimes: { vllm: string[]; sglang: string[] }
 }
+
+export type RecommendationSource =
+  | 'model_card'
+  | 'local_config'
+  | 'runtime_default'
+  | 'device_rule'
+  | 'ai'
+
+export type RecommendationConfidence = 'high' | 'medium' | 'low'
+
+export interface RecommendedValue<T = unknown> {
+  value: T
+  source: RecommendationSource
+  confidence: RecommendationConfidence
+  reason: string
+  warning: string | null
+}
+
+export interface ResourceSnapshot {
+  total_bytes: number
+  available_bytes: number
+  reserved_bytes: number
+}
+
+export interface ResourceEstimate {
+  total_bytes: number
+  available_bytes: number
+  reserved_bytes: number
+  weight_bytes: number
+  draft_weight_bytes: number
+  kv_cache_bytes: number
+  runtime_overhead_bytes: number
+  required_bytes: number
+  decision: 'ok' | 'warning' | 'blocked'
+  confidence: 'high' | 'low'
+  reasons: string[]
+}
+
+export interface DraftCandidate {
+  model_id: string
+  name: string
+  repository_id: string | null
+  method: 'draft_model' | 'eagle' | 'eagle3' | 'mtp' | null
+  status: 'compatible' | 'review' | 'incompatible'
+  reasons: string[]
+  size_bytes: number
+  estimated_total_bytes: number | null
+}
+
+export interface RuntimeCapabilities {
+  runtime: 'vllm' | 'sglang'
+  image: string
+  image_digest: string
+  source: 'probe' | 'manifest'
+  generation_defaults: string[]
+  quantization_methods: string[]
+  quantization_mapping: Record<string, string>
+  speculative_methods: string[]
+  method_mapping: Record<string, string>
+  speculative_transport: 'json' | 'flags' | 'none'
+  warnings: string[]
+}
+
+export interface DeploymentRecommendation {
+  status: 'complete' | 'partial' | 'unavailable'
+  generated_at: string
+  model_id: string
+  runtime: 'vllm' | 'sglang'
+  image_digest: string | null
+  evidence_hash: string | null
+  fields: Record<string, RecommendedValue>
+  generation_defaults: Record<string, RecommendedValue>
+  resource_snapshot: Partial<ResourceSnapshot>
+  resource_estimate: Partial<ResourceEstimate>
+  runtime_capabilities: Partial<RuntimeCapabilities>
+  draft_candidates: DraftCandidate[]
+  warnings: string[]
+}
+
+export interface RecommendationProvenance {
+  generated_at: string
+  evidence_hash: string
+  provider_id: string | null
+  resource_snapshot: ResourceSnapshot
+  modified_fields: string[]
+  sources: Record<string, RecommendationSource>
+}

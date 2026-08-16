@@ -27,6 +27,32 @@ const deployment: Deployment = {
       max_batched_tokens: 4096,
       quantization: 'fp8',
       trust_remote_code: true,
+      generation_defaults: {
+        temperature: 0.6,
+        top_p: 0.95,
+        stop: ['END'],
+      },
+      speculative: {
+        draft_model_id: 'draft-1',
+        method: 'eagle3',
+        num_steps: 2,
+        eagle_top_k: 4,
+        num_draft_tokens: 16,
+        manual_review_acknowledged: true,
+      },
+      recommendation: {
+        generated_at: '2026-08-16T00:00:00Z',
+        evidence_hash: 'a'.repeat(64),
+        provider_id: 'provider-1',
+        resource_snapshot: {
+          total_bytes: 1000,
+          available_bytes: 800,
+          reserved_bytes: 200,
+        },
+        modified_fields: ['generation_defaults.temperature'],
+        sources: { 'generation_defaults.temperature': 'model_card' },
+      },
+      resource_warning_acknowledged: true,
     },
   },
   capabilities: ['chat', 'completion'],
@@ -53,6 +79,17 @@ describe('deploymentToFormValues', () => {
       max_batched_tokens: 4096,
       quantization: 'fp8',
       trust_remote_code: true,
+      generation_defaults: {
+        temperature: 0.6,
+        top_p: 0.95,
+        stop: ['END'],
+      },
+      speculative: {
+        draft_model_id: 'draft-1',
+        method: 'eagle3',
+        manual_review_acknowledged: true,
+      },
+      resource_warning_acknowledged: true,
     })
   })
 
@@ -62,6 +99,20 @@ describe('deploymentToFormValues', () => {
       api_model_name: 'qwen-instance-a-copy',
       route_alias: 'qwen-production',
       port: 8101,
+      speculative: {
+        draft_model_id: 'draft-1',
+        method: 'eagle3',
+        manual_review_acknowledged: false,
+      },
+      resource_warning_acknowledged: false,
+    })
+  })
+
+  it('restores saved recommendation provenance when editing', () => {
+    expect(deploymentToFormValues(deployment, model, 'edit').recommendation).toMatchObject({
+      provider_id: 'provider-1',
+      modified_fields: ['generation_defaults.temperature'],
+      sources: { 'generation_defaults.temperature': 'model_card' },
     })
   })
 })
