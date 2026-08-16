@@ -715,6 +715,7 @@ export function DeploymentsPage() {
   const discoveredUninstallPending = action.isPending
     && action.variables?.actionName === 'delete'
     && !action.variables.deployment.managed
+    && action.variables.deployment.id === uninstallTarget?.id
 
   const handleRetryAI = async () => {
     const requestedTupleKey = recommendation.activeTupleKey
@@ -1184,7 +1185,7 @@ export function DeploymentsPage() {
         title={`卸载服务 ${uninstallTarget?.name ?? ''}`}
         open={Boolean(uninstallTarget)}
         onCancel={() => {
-          if (!discoveredUninstallPending) closeDiscoveredUninstall()
+          if (!discoveredUninstallPending) closeDiscoveredUninstall(uninstallTarget?.id)
         }}
         onOk={() => uninstallTarget && action.mutate({
           deployment: uninstallTarget,

@@ -686,7 +686,7 @@ describe('DeploymentsPage lifecycle actions', () => {
     }
     const pending = deferred<TaskRecord>()
     const successMessageSpy = vi.spyOn(message, 'success')
-    const { user, postSpy } = renderDeploymentsPage({
+    const { user, postSpy, invalidateSpy } = renderDeploymentsPage({
       deployments: [discoveredDeployment, secondDiscovered],
     })
     postSpy.mockImplementationOnce(() => pending.promise)
@@ -701,11 +701,20 @@ describe('DeploymentsPage lifecycle actions', () => {
     await user.click(within(firstDialog).getByRole('button', { name: '确认卸载' }))
     await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(1))
 
-    await user.keyboard('{Escape}')
+    fireEvent.keyDown(firstDialog, { keyCode: 27 })
     expect(screen.getByRole('dialog', { name: '卸载服务 discovered-production' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '卸载服务 second-discovery' }))
-    const secondDialog = screen.getByRole('dialog', { name: '卸载服务 second-discovery' })
+    let secondDialog = screen.getByRole('dialog', { name: '卸载服务 second-discovery' })
     expect(within(secondDialog).getByLabelText('输入容器名称确认')).toHaveValue('')
+    expect(within(secondDialog).getByRole('button', { name: /取\s*消/ })).toBeEnabled()
+    expect(within(secondDialog).getByRole('button', { name: 'Close' })).toBeEnabled()
+    expect(within(secondDialog).getByText('确认卸载').closest('button'))
+      .not.toHaveClass('ant-btn-loading')
+
+    fireEvent.keyDown(secondDialog, { keyCode: 27 })
+    await waitFor(() => expect(secondDialog).toHaveClass('ant-zoom-leave'))
+    fireEvent.click(screen.getByRole('button', { name: '卸载服务 second-discovery' }))
+    secondDialog = screen.getByRole('dialog', { name: '卸载服务 second-discovery' })
 
     pending.resolve(task)
 
@@ -714,6 +723,9 @@ describe('DeploymentsPage lifecycle actions', () => {
     expect(screen.getByRole('dialog', { name: '卸载服务 second-discovery' })).toBeInTheDocument()
     expect(within(secondDialog).getByLabelText('输入容器名称确认')).toHaveValue('')
     expect(successMessageSpy).toHaveBeenCalledWith('卸载服务任务已创建')
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['deployments'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['gateway-stats'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['tasks'] })
   })
 
   it('ignores a late uninstall error after another discovered service is opened', async () => {
@@ -741,6 +753,10 @@ describe('DeploymentsPage lifecycle actions', () => {
     await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(1))
     fireEvent.click(screen.getByRole('button', { name: '卸载服务 second-discovery' }))
     const secondDialog = screen.getByRole('dialog', { name: '卸载服务 second-discovery' })
+    expect(within(secondDialog).getByRole('button', { name: /取\s*消/ })).toBeEnabled()
+    expect(within(secondDialog).getByRole('button', { name: 'Close' })).toBeEnabled()
+    expect(within(secondDialog).getByText('确认卸载').closest('button'))
+      .not.toHaveClass('ant-btn-loading')
 
     pending.reject(new Error('container removal failed'))
 
