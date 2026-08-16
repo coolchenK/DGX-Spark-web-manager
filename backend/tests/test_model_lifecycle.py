@@ -539,9 +539,18 @@ def test_delete_huggingface_runs_validated_dry_run_before_yes(database, tmp_path
             for child in sorted(repository_root.rglob("*"), reverse=True):
                 child.unlink() if child.is_file() else child.rmdir()
             repository_root.rmdir()
-            payload = {"repos_deleted": 1, "revisions_deleted": 1, "freed": 6}
+            payload = {
+                "repos_deleted": 1,
+                "revisions_deleted": 1,
+                "freed": "7.0",
+            }
         else:
-            payload = {"dry_run": True, "repos": 1, "revisions": 1, "size": 6}
+            payload = {
+                "dry_run": True,
+                "repos": 1,
+                "revisions": 1,
+                "size": "7.0",
+            }
         return SimpleNamespace(stdout=json.dumps(payload))
 
     service = _deletion_service(database, tmp_path, command_runner=runner)
@@ -562,6 +571,28 @@ def test_delete_huggingface_runs_validated_dry_run_before_yes(database, tmp_path
     ]
     assert result["estimated_bytes"] == len(b"cached")
     assert _model_status(database) is None
+
+
+@pytest.mark.parametrize(
+    ("validator", "payload"),
+    [
+        (
+            lambda payload: ModelLifecycleService._validate_hf_preview(
+                payload, "model/org/model"
+            ),
+            {"dry_run": True, "repos": 1, "revisions": 1.5},
+        ),
+        (
+            ModelLifecycleService._validate_hf_result,
+            {"repos_deleted": 1, "revisions_deleted": 1.5},
+        ),
+    ],
+)
+def test_huggingface_revision_counts_must_be_nonnegative_integers(
+    validator, payload
+):
+    with pytest.raises(RuntimeError, match="invalid"):
+        validator(payload)
 
 
 def test_huggingface_mismatched_dry_run_stops_before_delete(database, tmp_path):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import shutil
 import stat
@@ -199,11 +198,10 @@ class ModelLifecycleService:
         return payload
 
     @staticmethod
-    def _is_non_negative_number(value: Any) -> bool:
+    def _is_non_negative_int(value: Any) -> bool:
         return (
-            isinstance(value, (int, float))
+            isinstance(value, int)
             and not isinstance(value, bool)
-            and math.isfinite(value)
             and value >= 0
         )
 
@@ -269,9 +267,9 @@ class ModelLifecycleService:
             or not isinstance(repos, int)
             or isinstance(repos, bool)
             or repos != 1
-            or any(
-                key in payload and not cls._is_non_negative_number(payload[key])
-                for key in ("revisions", "size")
+            or (
+                "revisions" in payload
+                and not cls._is_non_negative_int(payload["revisions"])
             )
         ):
             raise RuntimeError("Hugging Face cache preview schema was invalid")
@@ -290,9 +288,9 @@ class ModelLifecycleService:
             not isinstance(repos_deleted, int)
             or isinstance(repos_deleted, bool)
             or repos_deleted != 1
-            or any(
-                key in payload and not cls._is_non_negative_number(payload[key])
-                for key in ("revisions_deleted", "freed")
+            or (
+                "revisions_deleted" in payload
+                and not cls._is_non_negative_int(payload["revisions_deleted"])
             )
         ):
             raise RuntimeError("Hugging Face cache deletion result was invalid")
