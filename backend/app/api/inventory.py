@@ -1,13 +1,20 @@
+from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from app.api.tasks import serialize_task
 from app.audit import record_audit
 from app.dependencies import Admin, CsrfAdmin, DbSession
 from app.models import Deployment, ModelAsset
 
 router = APIRouter(prefix="/api", tags=["inventory"])
+
+
+class ModelDeleteRequest(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=255)
 
 
 @router.get("/models")
@@ -34,6 +41,63 @@ def list_models(db: DbSession, _: Admin) -> list[dict[str, Any]]:
         }
         for item in items
     ]
+
+
+@router.delete("/models/{model_id}", status_code=status.HTTP_202_ACCEPTED)
+def delete_model(
+    model_id: str,
+    payload: ModelDeleteRequest,
+    request: Request,
+    db: DbSession,
+    admin: CsrfAdmin,
+) -> dict[str, Any]:
+    asset = db.get(ModelAsset, model_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    if payload.confirmation != asset.name:
+        raise HTTPException(
+            status_code=422,
+            detail="Confirmation does not match model name",
+        )
+
+    references = request.app.state.model_lifecycle_service.references(db, model_id)
+    if references:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "model_in_use",
+                "references": [asdict(reference) for reference in references],
+            },
+        )
+    if asset.status == "deleting":
+        raise HTTPException(
+            status_code=409,
+            detail="Model deletion is already in progress",
+        )
+
+    source = asset.source
+    repository_id = asset.repository_id
+    task = request.app.state.task_engine.create_task(
+        db,
+        task_type="model.delete",
+        title=f"删除模型 {asset.name}",
+        input_json={"model_id": model_id},
+        idempotency_key=f"model:{model_id}:delete",
+    )
+    record_audit(
+        db,
+        actor=str(admin["username"]),
+        action="model.delete.create",
+        resource_type="model",
+        resource_id=model_id,
+        details={
+            "task_id": task.id,
+            "source": source,
+            "repository_id": repository_id,
+        },
+    )
+    db.commit()
+    return serialize_task(task)
 
 
 @router.get("/deployments")

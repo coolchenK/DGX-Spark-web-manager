@@ -32,6 +32,7 @@ Authorization: Bearer dgx_...
 | GET | `/api/health` | Service and database liveness |
 | GET | `/api/system` | Current host and GPU snapshot |
 | GET | `/api/models` | Registered model assets |
+| DELETE | `/api/models/{id}` | Create a permanent model deletion task |
 | GET | `/api/deployments` | Discovered and managed deployments |
 | POST | `/api/discovery/scan` | Re-scan Docker and model roots |
 | GET | `/api/huggingface/search?query=` | Search Hub models |
@@ -56,6 +57,42 @@ Authorization: Bearer dgx_...
 | GET | `/api/audit` | Audit history |
 | GET | `/api/settings` | Non-secret manager configuration |
 | PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
+
+### Permanent model deletion
+
+`DELETE /api/models/{id}` requires an administrator session and CSRF token. The request body must
+confirm the model's exact registered name:
+
+```json
+{"confirmation":"Qwen Model"}
+```
+
+An accepted request returns `202` with the persistent `model.delete` task. Deletion runs
+asynchronously and permanently removes the model directory or Hugging Face cache repository before
+removing its inventory record. Models marked `unavailable` can be submitted to clear stale history,
+and a `delete_failed` model can be submitted again. A model already marked `deleting` returns `409`.
+
+Deletion is blocked with `409` and `code: model_in_use` while any deployment references the model as
+its base model, Draft Model, or through a legacy model path. The response identifies every blocking
+deployment:
+
+```json
+{
+  "detail": {
+    "code": "model_in_use",
+    "references": [
+      {
+        "deployment_id": "deployment-id",
+        "deployment_name": "qwen-production",
+        "usage": "base"
+      }
+    ]
+  }
+}
+```
+
+A missing model returns `404`. A confirmation that does not exactly match the registered name
+returns `422`. Repeating an accepted request while its task is non-terminal returns the same task.
 
 ### Hugging Face Spark compatibility
 

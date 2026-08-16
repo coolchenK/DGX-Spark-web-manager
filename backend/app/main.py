@@ -35,6 +35,7 @@ from app.services.diagnostics import DiagnosticService
 from app.services.discovery import DiscoveryService
 from app.services.draft_models import DraftCompatibilityService
 from app.services.model_evidence import ModelEvidenceLoader
+from app.services.model_lifecycle import ModelLifecycleService
 from app.services.providers import ProviderService
 from app.services.resource_estimator import ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilityService
@@ -89,6 +90,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     task_engine = TaskEngine(database.session_factory)
     huggingface_service = HuggingFaceService(app_settings.hf_cache_dir, app_settings.hf_token)
     discovery_service = DiscoveryService(app_settings.model_root_paths)
+    model_lifecycle_service = ModelLifecycleService(
+        model_roots=app_settings.model_root_paths,
+        hf_cache_dir=app_settings.hf_cache_dir,
+        session_factory=database.session_factory,
+        discovery_service=discovery_service,
+    )
     system_service = SystemService(
         app_settings.data_dir, os_release_path=app_settings.host_os_release
     )
@@ -157,6 +164,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return result
 
     task_engine.register("model.download", download_and_discover)
+    task_engine.register("model.delete", model_lifecycle_service.delete_handler)
     task_engine.register("deployment.create", deployment_service.create_handler)
     task_engine.register("deployment.update", deployment_service.update_handler)
     task_engine.register("deployment.action", deployment_service.action_handler)
@@ -200,6 +208,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.secret_box = SecretBox(app_settings.secret_key)
     app.state.system_service = system_service
     app.state.discovery_service = discovery_service
+    app.state.model_lifecycle_service = model_lifecycle_service
     app.state.huggingface_service = huggingface_service
     app.state.task_engine = task_engine
     app.state.deployment_service = deployment_service

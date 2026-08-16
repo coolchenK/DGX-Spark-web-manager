@@ -10,7 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 from app.db import Database
-from app.models import Deployment, ModelAsset
+from app.main import create_app
+from app.models import AuditEvent, Deployment, ModelAsset, TaskRecord
 from app.services.model_lifecycle import (
     ModelInUseError,
     ModelLifecycleService,
@@ -18,6 +19,7 @@ from app.services.model_lifecycle import (
     _resolved,
 )
 from app.tasks.engine import TaskCancelled, TaskPaused
+from sqlalchemy import select
 
 
 @pytest.fixture
@@ -86,6 +88,8 @@ def _add_asset(
     database,
     path: Path,
     *,
+    model_id: str = "target",
+    name: str = "target",
     source: str = "local",
     repository_id: str | None = None,
     status: str = "available",
@@ -94,8 +98,8 @@ def _add_asset(
     with database.session_factory() as db:
         db.add(
             ModelAsset(
-                id="target",
-                name="target",
+                id=model_id,
+                name=name,
                 source=source,
                 repository_id=repository_id,
                 local_path=str(path),
@@ -105,6 +109,20 @@ def _add_asset(
             )
         )
         db.commit()
+
+
+@pytest.fixture
+def stopped_task_client(authenticated_client):
+    authenticated_client.app.state.task_engine.stop()
+    return authenticated_client
+
+
+def _delete_model(client, model_id: str, confirmation: str):
+    return client.request(
+        "DELETE",
+        f"/api/models/{model_id}",
+        json={"confirmation": confirmation},
+    )
 
 
 def _model_status(database, model_id: str = "target") -> str | None:
@@ -1261,3 +1279,238 @@ def test_delete_handler_rejects_already_deleting_asset(database, tmp_path):
 
     assert target.exists()
     assert _model_status(database) == "deleting"
+
+
+def test_delete_model_requires_login_and_csrf(client, tmp_path):
+    client.app.state.task_engine.stop()
+    _add_asset(client.app.state.database, tmp_path / "models" / "target")
+
+    anonymous = _delete_model(client, "target", "target")
+    assert anonymous.status_code == 401
+    assert anonymous.json()["detail"] == "Not authenticated"
+
+    login = client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "Test-password-1234"},
+    )
+    assert login.status_code == 200
+
+    missing_csrf = _delete_model(client, "target", "target")
+    assert missing_csrf.status_code == 403
+    assert missing_csrf.json()["detail"] == "CSRF token is missing or invalid"
+
+
+@pytest.mark.parametrize("confirmation", ["", "x" * 256])
+def test_delete_model_validates_confirmation_length(
+    stopped_task_client, tmp_path, confirmation
+):
+    _add_asset(
+        stopped_task_client.app.state.database,
+        tmp_path / "models" / "target",
+    )
+
+    response = _delete_model(stopped_task_client, "target", confirmation)
+
+    assert response.status_code == 422
+
+
+def test_delete_model_returns_not_found_without_task_or_audit(stopped_task_client):
+    response = _delete_model(stopped_task_client, "missing", "missing")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Model not found"
+    with stopped_task_client.app.state.database.session_factory() as db:
+        assert list(db.scalars(select(TaskRecord))) == []
+        assert list(
+            db.scalars(
+                select(AuditEvent).where(AuditEvent.action == "model.delete.create")
+            )
+        ) == []
+
+
+def test_delete_model_rejects_confirmation_mismatch_without_task_or_audit(
+    stopped_task_client, tmp_path
+):
+    _add_asset(
+        stopped_task_client.app.state.database,
+        tmp_path / "models" / "target",
+        name="Exact Model Name",
+    )
+
+    response = _delete_model(stopped_task_client, "target", "exact model name")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Confirmation does not match model name"
+    with stopped_task_client.app.state.database.session_factory() as db:
+        assert list(db.scalars(select(TaskRecord))) == []
+        assert list(
+            db.scalars(
+                select(AuditEvent).where(AuditEvent.action == "model.delete.create")
+            )
+        ) == []
+
+
+def test_delete_model_reports_all_references_without_task_or_audit(
+    stopped_task_client, tmp_path
+):
+    database = stopped_task_client.app.state.database
+    target_path = tmp_path / "models" / "target"
+    _add_asset(database, target_path, name="Referenced Model")
+    with database.session_factory() as db:
+        db.add_all(
+            [
+                _deployment(
+                    deployment_id="base-id",
+                    name="a-base",
+                    model_id="target",
+                ),
+                _deployment(
+                    deployment_id="draft-id",
+                    name="b-draft",
+                    config={"speculative": {"draft_model_id": "target"}},
+                ),
+                _deployment(
+                    deployment_id="legacy-id",
+                    name="c-legacy",
+                    config={"model_path": str(target_path)},
+                ),
+            ]
+        )
+        db.commit()
+
+    response = _delete_model(stopped_task_client, "target", "Referenced Model")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "model_in_use",
+        "references": [
+            {
+                "deployment_id": "base-id",
+                "deployment_name": "a-base",
+                "usage": "base",
+            },
+            {
+                "deployment_id": "draft-id",
+                "deployment_name": "b-draft",
+                "usage": "draft",
+            },
+            {
+                "deployment_id": "legacy-id",
+                "deployment_name": "c-legacy",
+                "usage": "legacy_path",
+            },
+        ],
+    }
+    with database.session_factory() as db:
+        assert list(db.scalars(select(TaskRecord))) == []
+        assert list(
+            db.scalars(
+                select(AuditEvent).where(AuditEvent.action == "model.delete.create")
+            )
+        ) == []
+
+
+def test_delete_model_creates_bounded_audited_task(stopped_task_client, tmp_path):
+    database = stopped_task_client.app.state.database
+    secret_path = tmp_path / "models" / "private-model-path"
+    _add_asset(
+        database,
+        secret_path,
+        model_id="model-1",
+        name="Qwen Model",
+        source="huggingface",
+        repository_id="org/qwen-model",
+        status="unavailable",
+    )
+
+    response = _delete_model(stopped_task_client, "model-1", "Qwen Model")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["type"] == "model.delete"
+    assert body["status"] == "queued"
+    assert body["title"] == "删除模型 Qwen Model"
+    with database.session_factory() as db:
+        task = db.get(TaskRecord, body["id"])
+        assert task is not None
+        assert task.input_json == {"model_id": "model-1"}
+        assert task.idempotency_key == "model:model-1:delete"
+        audit = db.scalar(
+            select(AuditEvent).where(AuditEvent.action == "model.delete.create")
+        )
+        assert audit is not None
+        assert audit.actor == "admin"
+        assert audit.resource_type == "model"
+        assert audit.resource_id == "model-1"
+        assert audit.details == {
+            "task_id": task.id,
+            "source": "huggingface",
+            "repository_id": "org/qwen-model",
+        }
+        serialized_audit = json.dumps(audit.details)
+        assert str(secret_path) not in serialized_audit
+        assert "confirmation" not in serialized_audit
+        assert "token" not in serialized_audit
+
+
+def test_delete_model_is_idempotent_while_task_is_non_terminal(
+    stopped_task_client, tmp_path
+):
+    database = stopped_task_client.app.state.database
+    _add_asset(database, tmp_path / "models" / "target", name="Target Model")
+
+    first = _delete_model(stopped_task_client, "target", "Target Model")
+    second = _delete_model(stopped_task_client, "target", "Target Model")
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()["id"] == first.json()["id"]
+    with database.session_factory() as db:
+        assert len(list(db.scalars(select(TaskRecord)))) == 1
+
+
+def test_delete_model_rejects_asset_already_deleting(stopped_task_client, tmp_path):
+    database = stopped_task_client.app.state.database
+    _add_asset(
+        database,
+        tmp_path / "models" / "target",
+        name="Target Model",
+        status="deleting",
+    )
+
+    response = _delete_model(stopped_task_client, "target", "Target Model")
+
+    assert response.status_code == 409
+    assert "deletion" in response.json()["detail"].lower()
+    with database.session_factory() as db:
+        assert list(db.scalars(select(TaskRecord))) == []
+        assert list(
+            db.scalars(
+                select(AuditEvent).where(AuditEvent.action == "model.delete.create")
+            )
+        ) == []
+
+
+def test_delete_model_allows_retry_after_delete_failure(stopped_task_client, tmp_path):
+    database = stopped_task_client.app.state.database
+    _add_asset(
+        database,
+        tmp_path / "models" / "target",
+        name="Target Model",
+        status="delete_failed",
+    )
+
+    response = _delete_model(stopped_task_client, "target", "Target Model")
+
+    assert response.status_code == 202
+    assert response.json()["type"] == "model.delete"
+
+
+def test_create_app_registers_model_delete_handler(settings):
+    app = create_app(settings)
+
+    handler = app.state.task_engine.handlers["model.delete"]
+    assert handler.__self__ is app.state.model_lifecycle_service
+    assert handler.__func__ is app.state.model_lifecycle_service.delete_handler.__func__
+    assert app.state.model_lifecycle_service.session_factory is app.state.database.session_factory
+    assert app.state.model_lifecycle_service.discovery_service is app.state.discovery_service
