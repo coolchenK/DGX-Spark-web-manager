@@ -84,6 +84,12 @@ QUANTIZATION_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REPOSITORY_ID = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
 )
+HUGGINGFACE_CACHE_REPOSITORY = re.compile(
+    r"^models--[A-Za-z0-9][A-Za-z0-9._-]*(?:--[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+)
+HUGGINGFACE_BLOB_LINK = re.compile(
+    r"^\.\./\.\./blobs/(?P<digest>[A-Fa-f0-9]{40}(?:[A-Fa-f0-9]{24})?)$"
+)
 
 
 def _reject_json_constant(_value: str) -> None:
@@ -109,6 +115,149 @@ class ModelEvidence(BaseModel):
 
 
 Fence = namedtuple("Fence", "language body start end closed newline")
+
+
+def _parse_huggingface_blob_link_target(target: str) -> str | None:
+    match = HUGGINGFACE_BLOB_LINK.fullmatch(target)
+    return match.group("digest") if match is not None else None
+
+
+def _huggingface_snapshot_repository(model_root: Path) -> Path | None:
+    try:
+        resolved_root = model_root.resolve(strict=True)
+    except OSError:
+        return None
+    snapshots = resolved_root.parent
+    repository = snapshots.parent
+    if (
+        snapshots.name != "snapshots"
+        or not resolved_root.name
+        or HUGGINGFACE_CACHE_REPOSITORY.fullmatch(repository.name) is None
+    ):
+        return None
+    return repository
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _is_windows_reparse_point(value: os.stat_result) -> bool:
+    attributes = getattr(value, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+@contextmanager
+def _open_posix_huggingface_blob(
+    model_root: Path,
+    root_fd: int,
+    filename: str,
+    link_stat: os.stat_result,
+) -> Iterator[Any]:
+    repository = _huggingface_snapshot_repository(model_root)
+    if repository is None:
+        raise ValueError("model evidence symlink is outside a Hugging Face snapshot")
+    link_target = os.readlink(filename, dir_fd=root_fd)
+    digest = _parse_huggingface_blob_link_target(link_target)
+    if digest is None:
+        raise ValueError("model evidence symlink target is not a Hugging Face blob")
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    directory_fds: list[int] = []
+    blob_fd: int | None = None
+    try:
+        repository_fd = os.open(repository, directory_flags)
+        directory_fds.append(repository_fd)
+        snapshots_fd = os.open("snapshots", directory_flags, dir_fd=repository_fd)
+        directory_fds.append(snapshots_fd)
+        revision_fd = os.open(model_root.name, directory_flags, dir_fd=snapshots_fd)
+        directory_fds.append(revision_fd)
+        if _stat_identity(os.fstat(root_fd)) != _stat_identity(os.fstat(revision_fd)):
+            raise ValueError("model evidence snapshot changed while opening")
+
+        blobs_fd = os.open("blobs", directory_flags, dir_fd=repository_fd)
+        directory_fds.append(blobs_fd)
+        blob_fd = os.open(digest, file_flags, dir_fd=blobs_fd)
+        if not stat.S_ISREG(os.fstat(blob_fd).st_mode):
+            raise ValueError("model evidence blob is not regular")
+        link_after = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISLNK(link_after.st_mode)
+            or _stat_identity(link_stat) != _stat_identity(link_after)
+            or os.readlink(filename, dir_fd=root_fd) != link_target
+        ):
+            raise ValueError("model evidence symlink changed while opening")
+        with os.fdopen(blob_fd, "rb") as stream:
+            blob_fd = None
+            yield stream
+    finally:
+        if blob_fd is not None:
+            os.close(blob_fd)
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def _windows_link_target(target: str) -> str:
+    return target.replace("\\", "/")
+
+
+@contextmanager
+def _open_windows_huggingface_blob(
+    model_root: Path,
+    candidate: Path,
+    link_stat: os.stat_result,
+) -> Iterator[Any]:
+    repository = _huggingface_snapshot_repository(model_root)
+    if repository is None:
+        raise ValueError("model evidence symlink is outside a Hugging Face snapshot")
+    raw_target = os.readlink(candidate)
+    digest = _parse_huggingface_blob_link_target(_windows_link_target(raw_target))
+    if digest is None:
+        raise ValueError("model evidence symlink target is not a Hugging Face blob")
+
+    blobs = repository / "blobs"
+    blobs_before = os.stat(blobs, follow_symlinks=False)
+    if not stat.S_ISDIR(blobs_before.st_mode) or _is_windows_reparse_point(blobs_before):
+        raise ValueError("Hugging Face blob directory is not a regular directory")
+    blob = blobs / digest
+    blob_before = os.stat(blob, follow_symlinks=False)
+    if not stat.S_ISREG(blob_before.st_mode) or _is_windows_reparse_point(blob_before):
+        raise ValueError("model evidence blob is not regular")
+
+    with blob.open("rb") as stream:
+        opened_stat = os.fstat(stream.fileno())
+        blob_after = os.stat(blob, follow_symlinks=False)
+        blobs_after = os.stat(blobs, follow_symlinks=False)
+        link_after = os.stat(candidate, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or not stat.S_ISREG(blob_after.st_mode)
+            or not stat.S_ISDIR(blobs_after.st_mode)
+            or not stat.S_ISLNK(link_after.st_mode)
+            or _is_windows_reparse_point(blob_after)
+            or _is_windows_reparse_point(blobs_after)
+            or _stat_identity(blob_before) != _stat_identity(opened_stat)
+            or _stat_identity(blob_after) != _stat_identity(opened_stat)
+            or _stat_identity(blobs_before) != _stat_identity(blobs_after)
+            or _stat_identity(link_stat) != _stat_identity(link_after)
+            or os.readlink(candidate) != raw_target
+        ):
+            raise ValueError("model evidence blob changed while opening")
+        resolved_blob = blob.resolve(strict=True)
+        if resolved_blob != blob.absolute():
+            raise ValueError("model evidence blob is a symlink")
+        yield stream
 
 
 def iter_fences(card_text: str) -> Iterator[Fence]:
@@ -158,12 +307,25 @@ def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
             raise ValueError("model root is not a directory")
         file_fd: int | None = None
         try:
+            file_stat = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+            if stat.S_ISLNK(file_stat.st_mode):
+                with _open_posix_huggingface_blob(
+                    model_root, root_fd, filename, file_stat
+                ) as stream:
+                    yield stream
+                return
             file_fd = os.open(
                 filename,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=root_fd,
             )
-            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            opened_stat = os.fstat(file_fd)
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or _stat_identity(file_stat) != _stat_identity(opened_stat)
+            ):
                 raise ValueError("model evidence file is not regular")
             with os.fdopen(file_fd, "rb") as stream:
                 file_fd = None
@@ -175,10 +337,19 @@ def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
         return
 
     candidate = model_root / filename
-    if candidate.is_symlink():
-        raise ValueError("model evidence file is a symlink")
+    if model_root.is_symlink():
+        raise ValueError("model root is a symlink")
+    file_stat = os.stat(candidate, follow_symlinks=False)
+    if stat.S_ISLNK(file_stat.st_mode):
+        with _open_windows_huggingface_blob(model_root, candidate, file_stat) as stream:
+            yield stream
+        return
     with candidate.open("rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        opened_stat = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _stat_identity(file_stat) != _stat_identity(opened_stat)
+        ):
             raise ValueError("model evidence file is not regular")
         resolved = candidate.resolve(strict=True)
         if not resolved.is_relative_to(model_root):

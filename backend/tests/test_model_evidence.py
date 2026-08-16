@@ -1,9 +1,40 @@
 import json
 import time
+from pathlib import Path
 
 import pytest
 from app.services import model_evidence
 from app.services.model_evidence import ModelEvidenceLoader, tokenizer_fingerprint
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    resolved_target = target if target.is_absolute() else link.parent / target
+    try:
+        link.symlink_to(target, target_is_directory=resolved_target.is_dir())
+    except OSError:
+        pytest.skip("Symlinks are unavailable on this platform")
+
+
+def _hub_snapshot(tmp_path: Path) -> tuple[Path, Path]:
+    repository = tmp_path / "hub" / "models--org--model"
+    snapshot = repository / "snapshots" / "revision"
+    (repository / "blobs").mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    return repository, snapshot
+
+
+def _linked_hub_blob(
+    repository: Path,
+    snapshot: Path,
+    filename: str,
+    digest: str,
+    data: bytes,
+) -> None:
+    (repository / "blobs" / digest).write_bytes(data)
+    _symlink_or_skip(
+        snapshot / filename,
+        Path("..") / ".." / "blobs" / digest,
+    )
 
 
 def test_model_evidence_loads_structured_files_and_allowlisted_card_values(tmp_path):
@@ -85,6 +116,172 @@ def test_posix_model_root_open_rejects_root_symlink(tmp_path):
     with pytest.raises((OSError, ValueError)):
         with model_evidence._open_model_file(link, "config.json"):
             pass
+
+
+def test_huggingface_snapshot_blob_links_are_read_as_model_evidence(tmp_path):
+    repository, snapshot = _hub_snapshot(tmp_path)
+    _linked_hub_blob(
+        repository,
+        snapshot,
+        "config.json",
+        "a" * 40,
+        b'{"max_position_embeddings":32768,"hidden_size":4096}',
+    )
+    _linked_hub_blob(
+        repository,
+        snapshot,
+        "generation_config.json",
+        "b" * 64,
+        b'{"temperature":0.4,"top_p":0.9}',
+    )
+    _linked_hub_blob(
+        repository,
+        snapshot,
+        "README.md",
+        "c" * 40,
+        b"```bash\nvllm serve org/model --max-model-len 16384\n```\n",
+    )
+    _linked_hub_blob(
+        repository,
+        snapshot,
+        "tokenizer.json",
+        "d" * 64,
+        b'{"version":"1.0"}',
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(snapshot)
+
+    assert evidence.config == {
+        "max_position_embeddings": 32768,
+        "hidden_size": 4096,
+    }
+    assert evidence.local_generation_values == {"temperature": 0.4, "top_p": 0.9}
+    assert evidence.card_deployment_values == {"context_length": 16384}
+    assert evidence.tokenizer_fingerprint is not None
+    assert evidence.warnings == []
+
+
+def test_huggingface_blob_link_parser_accepts_only_canonical_posix_targets():
+    sha1 = "a" * 40
+    sha256 = "A1" * 32
+
+    assert model_evidence._parse_huggingface_blob_link_target(f"../../blobs/{sha1}") == sha1
+    assert model_evidence._parse_huggingface_blob_link_target(f"../../blobs/{sha256}") == sha256
+    assert model_evidence._parse_huggingface_blob_link_target(f"/blobs/{sha1}") is None
+    assert model_evidence._parse_huggingface_blob_link_target(f"../../blobs/{sha1}/file") is None
+    assert model_evidence._parse_huggingface_blob_link_target("../../blobs/not-a-hash") is None
+    assert model_evidence._parse_huggingface_blob_link_target(f"../blobs/{sha1}") is None
+
+
+@pytest.mark.parametrize(
+    "target_factory",
+    [
+        pytest.param(lambda repository, digest: repository / "blobs" / digest, id="absolute"),
+        pytest.param(
+            lambda _repository, _digest: Path("..") / ".." / "blobs" / "not-a-hash",
+            id="non-hash",
+        ),
+        pytest.param(lambda _repository, digest: Path("..") / "blobs" / digest, id="one-parent"),
+        pytest.param(
+            lambda _repository, digest: Path("..") / ".." / "other" / digest,
+            id="wrong-directory",
+        ),
+        pytest.param(
+            lambda _repository, digest: Path("..") / ".." / "blobs" / digest / "config.json",
+            id="extra-level",
+        ),
+    ],
+)
+def test_huggingface_snapshot_rejects_noncanonical_blob_link_targets(
+    tmp_path, target_factory
+):
+    repository, snapshot = _hub_snapshot(tmp_path)
+    digest = "a" * 40
+    (repository / "blobs" / digest).write_text('{"hidden_size":4096}', encoding="utf-8")
+    _symlink_or_skip(snapshot / "config.json", target_factory(repository, digest))
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(snapshot)
+
+    assert evidence.config == {}
+    assert evidence.warnings == ["config.json is not a safe regular file"]
+
+
+@pytest.mark.parametrize(
+    ("repository_name", "snapshot_directory"),
+    [
+        ("datasets--org--model", "snapshots"),
+        ("models--org--model", "revisions"),
+    ],
+)
+def test_huggingface_blob_links_require_the_exact_model_snapshot_hierarchy(
+    tmp_path, repository_name, snapshot_directory
+):
+    repository = tmp_path / "hub" / repository_name
+    snapshot = repository / snapshot_directory / "revision"
+    digest = "a" * 40
+    (repository / "blobs").mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    (repository / "blobs" / digest).write_text('{"hidden_size":4096}', encoding="utf-8")
+    _symlink_or_skip(
+        snapshot / "config.json",
+        Path("..") / ".." / "blobs" / digest,
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(snapshot)
+
+    assert evidence.config == {}
+    assert evidence.warnings == ["config.json is not a safe regular file"]
+
+
+def test_huggingface_snapshot_rejects_a_symlinked_blob_directory(tmp_path):
+    repository, snapshot = _hub_snapshot(tmp_path)
+    (repository / "blobs").rmdir()
+    outside_blobs = tmp_path / "outside-blobs"
+    outside_blobs.mkdir()
+    digest = "a" * 40
+    (outside_blobs / digest).write_text('{"hidden_size":4096}', encoding="utf-8")
+    _symlink_or_skip(repository / "blobs", outside_blobs)
+    _symlink_or_skip(
+        snapshot / "config.json",
+        Path("..") / ".." / "blobs" / digest,
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(snapshot)
+
+    assert evidence.config == {}
+    assert evidence.warnings == ["config.json is not a safe regular file"]
+
+
+def test_huggingface_snapshot_rejects_a_symlinked_blob_file(tmp_path):
+    repository, snapshot = _hub_snapshot(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"hidden_size":4096}', encoding="utf-8")
+    digest = "a" * 40
+    _symlink_or_skip(repository / "blobs" / digest, outside)
+    _symlink_or_skip(
+        snapshot / "config.json",
+        Path("..") / ".." / "blobs" / digest,
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(snapshot)
+
+    assert evidence.config == {}
+    assert evidence.warnings == ["config.json is not a safe regular file"]
+
+
+def test_huggingface_snapshot_rejects_a_blob_directory_as_file_content(tmp_path):
+    repository, snapshot = _hub_snapshot(tmp_path)
+    digest = "a" * 40
+    (repository / "blobs" / digest).mkdir()
+    _symlink_or_skip(
+        snapshot / "config.json",
+        Path("..") / ".." / "blobs" / digest,
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(snapshot)
+
+    assert evidence.config == {}
+    assert evidence.warnings == ["config.json is not a safe regular file"]
 
 
 def test_missing_shell_value_does_not_consume_following_option_or_leak_it(tmp_path):
