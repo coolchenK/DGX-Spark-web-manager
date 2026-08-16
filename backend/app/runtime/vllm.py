@@ -1,4 +1,11 @@
-from app.runtime.base import DeploymentSpec, RuntimeAdapter
+import json
+
+from app.runtime.base import (
+    DeploymentSpec,
+    RuntimeAdapter,
+    require_draft_container_path,
+    require_speculative_runtime_method,
+)
 
 
 class VllmAdapter(RuntimeAdapter):
@@ -28,5 +35,25 @@ class VllmAdapter(RuntimeAdapter):
             command.extend(["--quantization", spec.quantization])
         if spec.trust_remote_code:
             command.append("--trust-remote-code")
+        if spec.speculative is not None:
+            runtime_method = require_speculative_runtime_method(spec)
+            if runtime_method != spec.speculative.method:
+                raise ValueError(
+                    "resolved runtime method does not match speculative method"
+                )
+            payload: dict[str, str | int] = {
+                "method": runtime_method,
+                "model": require_draft_container_path(spec),
+            }
+            if spec.speculative.num_speculative_tokens is not None:
+                payload["num_speculative_tokens"] = (
+                    spec.speculative.num_speculative_tokens
+                )
+            command.extend(
+                [
+                    "--speculative-config",
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                ]
+            )
         return command
 

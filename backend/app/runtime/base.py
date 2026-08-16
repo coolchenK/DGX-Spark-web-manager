@@ -5,7 +5,7 @@ import platform
 import re
 from abc import ABC, abstractmethod
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import httpx
@@ -138,6 +138,31 @@ class ResolvedDeploymentSpec(DeploymentSpec):
 
     def public_dump(self) -> dict[str, Any]:
         return self.model_dump(mode="json", include=set(DeploymentSpec.model_fields))
+
+
+def require_draft_container_path(spec: ResolvedDeploymentSpec) -> str:
+    if spec.speculative is None:
+        return ""
+    path = getattr(spec, "draft_container_model_path", None)
+    if (
+        not isinstance(path, str)
+        or not path
+        or not PurePosixPath(path).is_absolute()
+        or "\x00" in path
+    ):
+        raise ValueError("resolved draft container path is required")
+    return path
+
+
+def require_speculative_runtime_method(spec: ResolvedDeploymentSpec) -> str:
+    if spec.speculative is None:
+        return ""
+    method = getattr(spec, "speculative_runtime_method", None)
+    if not isinstance(method, str) or not method:
+        raise ValueError("resolved speculative runtime method is required")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", method):
+        raise ValueError("resolved speculative runtime method is invalid")
+    return method
 
 
 def deterministic_container_name(name: str) -> str:

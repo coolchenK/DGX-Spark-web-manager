@@ -442,11 +442,309 @@ def test_vllm_command_includes_batch_and_quantization_settings(tmp_path):
     assert command[command.index("--quantization") + 1] == "fp8"
 
 
+def resolved_speculative_spec(
+    tmp_path,
+    *,
+    runtime="vllm",
+    method="draft_model",
+    runtime_method="draft_model",
+    draft_container_path="/draft-models/draft",
+    **speculative_settings,
+):
+    model_path = tmp_path / "models" / "qwen"
+    model_path.mkdir(parents=True, exist_ok=True)
+    image = f"{runtime}:test"
+    return ResolvedDeploymentSpec(
+        name="Qwen",
+        model_path=str(model_path),
+        api_model_name="qwen",
+        runtime=runtime,
+        image=image,
+        port=8100,
+        speculative={
+            "draft_model_id": "org/qwen-draft",
+            "method": method,
+            **speculative_settings,
+        },
+        resolved_draft_model_path=str(tmp_path / "models" / "qwen-draft"),
+        draft_container_model_path=draft_container_path,
+        speculative_runtime_method=runtime_method,
+    )
+
+
+def test_vllm_command_uses_canonical_speculative_json(tmp_path):
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
+    spec = resolved_speculative_spec(tmp_path, num_speculative_tokens=5)
+
+    command = adapter.command(spec)
+
+    index = command.index("--speculative-config")
+    assert command[index + 1] == (
+        '{"method":"draft_model","model":"/draft-models/draft",'
+        '"num_speculative_tokens":5}'
+    )
+
+
+def test_vllm_speculative_json_keeps_path_content_in_one_argument(tmp_path):
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
+    draft_path = "/draft models/--trust-remote-code"
+    spec = resolved_speculative_spec(tmp_path, draft_container_path=draft_path)
+
+    command = adapter.command(spec)
+    payload = command[command.index("--speculative-config") + 1]
+
+    assert json.loads(payload)["model"] == draft_path
+    assert "--trust-remote-code" not in command
+    assert command.count("--speculative-config") == 1
+
+
+def test_sglang_command_adds_only_base_speculative_flags_without_tuning(tmp_path):
+    adapter = SGLangAdapter(
+        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = resolved_speculative_spec(
+        tmp_path,
+        runtime="sglang",
+        method="eagle3",
+        runtime_method="EAGLE3",
+        draft_container_path="/models/draft",
+    )
+
+    command = adapter.command(spec)
+
+    assert command[-4:] == [
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--speculative-draft-model-path",
+        "/models/draft",
+    ]
+    assert "--speculative-num-steps" not in command
+    assert "--speculative-eagle-topk" not in command
+    assert "--speculative-num-draft-tokens" not in command
+
+
+def test_sglang_command_adds_complete_grouped_speculative_tuning(tmp_path):
+    adapter = SGLangAdapter(
+        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = resolved_speculative_spec(
+        tmp_path,
+        runtime="sglang",
+        method="eagle3",
+        runtime_method="EAGLE3",
+        draft_container_path="/models/draft",
+        num_steps=2,
+        eagle_top_k=4,
+        num_draft_tokens=16,
+    )
+
+    assert adapter.command(spec)[-10:] == [
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--speculative-draft-model-path",
+        "/models/draft",
+        "--speculative-num-steps",
+        "2",
+        "--speculative-eagle-topk",
+        "4",
+        "--speculative-num-draft-tokens",
+        "16",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("method", "runtime_method"),
+    [
+        ("draft_model", "STANDALONE"),
+        ("eagle", "EAGLE"),
+        ("eagle3", "EAGLE3"),
+        ("mtp", "NEXTN"),
+    ],
+)
+def test_sglang_command_accepts_only_trusted_method_mappings(
+    tmp_path, method, runtime_method
+):
+    adapter = SGLangAdapter(
+        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = resolved_speculative_spec(
+        tmp_path,
+        runtime="sglang",
+        method=method,
+        runtime_method=runtime_method,
+    )
+
+    command = adapter.command(spec)
+
+    assert command[command.index("--speculative-algorithm") + 1] == runtime_method
+
+
+@pytest.mark.parametrize(
+    ("runtime", "field", "message"),
+    [
+        ("vllm", "draft_container_model_path", "resolved draft container path is required"),
+        ("vllm", "speculative_runtime_method", "resolved speculative runtime method is required"),
+        ("sglang", "draft_container_model_path", "resolved draft container path is required"),
+        ("sglang", "speculative_runtime_method", "resolved speculative runtime method is required"),
+    ],
+)
+def test_speculative_commands_require_resolved_internal_fields(
+    tmp_path, runtime, field, message
+):
+    adapter_type = VllmAdapter if runtime == "vllm" else SGLangAdapter
+    adapter = adapter_type(
+        allowed_images={f"{runtime}:test"}, model_roots=(tmp_path / "models",)
+    )
+    runtime_method = "draft_model" if runtime == "vllm" else "STANDALONE"
+    spec = resolved_speculative_spec(
+        tmp_path, runtime=runtime, runtime_method=runtime_method
+    ).model_copy(update={field: None})
+
+    with pytest.raises(ValueError, match=message):
+        adapter.command(spec)
+
+
+@pytest.mark.parametrize("draft_path", ["", "relative/draft", "--draft-model"])
+def test_speculative_commands_reject_non_absolute_draft_container_paths(
+    tmp_path, draft_path
+):
+    adapter = VllmAdapter(
+        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = resolved_speculative_spec(tmp_path, draft_container_path=draft_path)
+
+    with pytest.raises(ValueError, match="resolved draft container path is required"):
+        adapter.command(spec)
+
+
+def test_public_speculative_spec_cannot_build_a_runtime_command(tmp_path):
+    model_path = tmp_path / "models" / "qwen"
+    model_path.mkdir(parents=True)
+    adapter = VllmAdapter(
+        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = DeploymentSpec(
+        name="Qwen",
+        model_path=str(model_path),
+        api_model_name="qwen",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        speculative={"draft_model_id": "org/draft", "method": "draft_model"},
+    )
+
+    with pytest.raises(
+        ValueError, match="resolved speculative runtime method is required"
+    ):
+        adapter.command(spec)
+
+
+@pytest.mark.parametrize(
+    ("runtime", "method", "runtime_method"),
+    [
+        ("vllm", "draft_model", "eagle"),
+        ("vllm", "draft_model", "arbitrary_option"),
+        ("sglang", "draft_model", "EAGLE"),
+        ("sglang", "mtp", "UNTRUSTED"),
+    ],
+)
+def test_speculative_commands_reject_mismatched_or_unsupported_mappings(
+    tmp_path, runtime, method, runtime_method
+):
+    adapter_type = VllmAdapter if runtime == "vllm" else SGLangAdapter
+    adapter = adapter_type(
+        allowed_images={f"{runtime}:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = resolved_speculative_spec(
+        tmp_path,
+        runtime=runtime,
+        method=method,
+        runtime_method=runtime_method,
+    )
+
+    with pytest.raises(ValueError, match="does not match speculative method"):
+        adapter.command(spec)
+
+
+def test_sglang_command_rejects_unmapped_num_speculative_tokens(tmp_path):
+    adapter = SGLangAdapter(
+        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = resolved_speculative_spec(
+        tmp_path,
+        runtime="sglang",
+        runtime_method="STANDALONE",
+        num_speculative_tokens=5,
+    )
+
+    with pytest.raises(ValueError, match="num_speculative_tokens is not supported by SGLang"):
+        adapter.command(spec)
+
+
+def test_runtime_commands_without_speculative_config_remain_unchanged(tmp_path):
+    model_path = tmp_path / "models" / "qwen"
+    model_path.mkdir(parents=True)
+    recommendation = valid_recommendation_payload()
+    recommendation["provider_id"] = None
+    common = {
+        "name": "Qwen",
+        "model_path": str(model_path),
+        "api_model_name": "qwen",
+        "port": 8100,
+        "generation_defaults": {"temperature": 0.2, "max_tokens": 256},
+        "recommendation": recommendation,
+    }
+
+    vllm = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
+    vllm_spec = DeploymentSpec(runtime="vllm", image="vllm:test", **common)
+    assert vllm.command(vllm_spec) == [
+        "--model",
+        "/models/qwen",
+        "--served-model-name",
+        "qwen",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--max-model-len",
+        "32768",
+        "--gpu-memory-utilization",
+        "0.8",
+        "--max-num-seqs",
+        "8",
+    ]
+
+    sglang = SGLangAdapter(
+        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
+    )
+    sglang_spec = DeploymentSpec(runtime="sglang", image="sglang:test", **common)
+    assert sglang.command(sglang_spec) == [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        "/models/qwen",
+        "--served-model-name",
+        "qwen",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--context-length",
+        "32768",
+        "--mem-fraction-static",
+        "0.8",
+        "--max-running-requests",
+        "8",
+    ]
+
+
 def test_create_endpoint_persists_json_safe_recommendation(authenticated_client, tmp_path):
     payload = valid_spec_payload(tmp_path)
     Path(payload["model_path"]).mkdir(parents=True)
     payload["model_id"] = None
     payload["image"] = "vllm/vllm-openai:v0.27.1"
+    payload["speculative"] = None
     payload["recommendation"] = valid_recommendation_payload()
 
     response = authenticated_client.post("/api/deployments", json=payload)
