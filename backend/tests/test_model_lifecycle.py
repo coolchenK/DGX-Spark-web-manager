@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
+import subprocess
 from dataclasses import FrozenInstanceError
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from app.db import Database
 from app.models import Deployment, ModelAsset
-from app.services.model_lifecycle import ModelLifecycleService, ModelReference, _resolved
+from app.services.model_lifecycle import (
+    ModelInUseError,
+    ModelLifecycleService,
+    ModelReference,
+    _resolved,
+)
 
 
 @pytest.fixture
@@ -32,6 +41,62 @@ def _asset(*, model_id: str = "target", local_path: str) -> ModelAsset:
         local_path=local_path,
         status="available",
     )
+
+
+class HandlerContext:
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+        self.checks = 0
+
+    def check_control(self):
+        self.checks += 1
+        if self.error is not None:
+            raise self.error
+
+
+def _deletion_service(
+    database,
+    tmp_path,
+    *,
+    command_runner=None,
+    discovery_service=None,
+) -> ModelLifecycleService:
+    return ModelLifecycleService(
+        model_roots=(tmp_path / "models",),
+        hf_cache_dir=tmp_path / "hf-cache",
+        session_factory=database.session_factory,
+        command_runner=command_runner,
+        discovery_service=discovery_service,
+    )
+
+
+def _add_asset(
+    database,
+    path: Path,
+    *,
+    source: str = "local",
+    repository_id: str | None = None,
+    status: str = "available",
+):
+    with database.session_factory() as db:
+        db.add(
+            ModelAsset(
+                id="target",
+                name="target",
+                source=source,
+                repository_id=repository_id,
+                local_path=str(path),
+                status=status,
+                size_bytes=123,
+            )
+        )
+        db.commit()
+
+
+def _model_status(database, model_id: str = "target") -> str | None:
+    with database.session_factory() as db:
+        asset = db.get(ModelAsset, model_id)
+        return None if asset is None else asset.status
 
 
 def _deployment(
@@ -317,3 +382,329 @@ def test_references_ignore_malformed_persisted_path_structures(
         db.commit()
 
         assert service.references(db, "target") == []
+
+
+def test_validate_local_target_accepts_only_a_child_directory(tmp_path):
+    root = tmp_path / "models"
+    target = root / "target"
+    target.mkdir(parents=True)
+    service = ModelLifecycleService((root,), tmp_path / "hf-cache")
+
+    assert service.validate_local_target(target) == target.resolve()
+
+    with pytest.raises(ValueError, match="configured model root"):
+        service.validate_local_target(root)
+
+
+def test_validate_local_target_rejects_path_prefix_sibling(tmp_path):
+    root = tmp_path / "models"
+    sibling = tmp_path / "models-copy" / "target"
+    root.mkdir()
+    sibling.mkdir(parents=True)
+    service = ModelLifecycleService((root,), tmp_path / "hf-cache")
+
+    with pytest.raises(ValueError, match="configured model root"):
+        service.validate_local_target(sibling)
+
+
+@pytest.mark.parametrize("destination", ["inside", "outside"])
+def test_validate_local_target_rejects_symlinks(tmp_path, destination, monkeypatch):
+    root = tmp_path / "models"
+    root.mkdir()
+    real_target = (root / "real") if destination == "inside" else (tmp_path / "outside")
+    real_target.mkdir()
+    link = root / "link"
+    try:
+        link.symlink_to(real_target, target_is_directory=True)
+    except OSError:
+        link.mkdir()
+        original_is_symlink = Path.is_symlink
+        monkeypatch.setattr(
+            Path,
+            "is_symlink",
+            lambda self: self == link or original_is_symlink(self),
+        )
+    service = ModelLifecycleService((root,), tmp_path / "hf-cache")
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        service.validate_local_target(link)
+
+
+def test_delete_local_directory_and_database_record(database, tmp_path):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    (target / "weights.bin").write_bytes(b"weights")
+    _add_asset(database, target)
+    service = _deletion_service(database, tmp_path)
+
+    result = service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert not target.exists()
+    assert _model_status(database) is None
+    assert result["model_id"] == "target"
+    assert result["source"] == "local"
+    assert result["estimated_bytes"] == len(b"weights")
+    assert result["released_bytes"] >= 0
+    assert result["inventory_models"] == 0
+
+
+def test_delete_huggingface_runs_validated_dry_run_before_yes(database, tmp_path):
+    cache_dir = tmp_path / "hf-cache"
+    repository_root = cache_dir / "models--org--model"
+    snapshot = repository_root / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    (repository_root / "blob").write_bytes(b"cached")
+    _add_asset(
+        database,
+        snapshot,
+        source="huggingface",
+        repository_id="org/model",
+    )
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        if "--yes" in argv:
+            for child in sorted(repository_root.rglob("*"), reverse=True):
+                child.unlink() if child.is_file() else child.rmdir()
+            repository_root.rmdir()
+        return SimpleNamespace(stdout=json.dumps({"repos": [{"repo_id": "org/model"}]}))
+
+    service = _deletion_service(database, tmp_path, command_runner=runner)
+
+    result = service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    base = [
+        "hf",
+        "cache",
+        "rm",
+        "model/org/model",
+        "--cache-dir",
+        str(cache_dir),
+    ]
+    assert calls == [
+        [*base, "--dry-run", "--json"],
+        [*base, "--yes", "--json"],
+    ]
+    assert result["estimated_bytes"] == len(b"cached")
+    assert _model_status(database) is None
+
+
+def test_huggingface_mismatched_dry_run_stops_before_delete(database, tmp_path):
+    repository_root = tmp_path / "hf-cache" / "models--org--model"
+    snapshot = repository_root / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    _add_asset(
+        database,
+        snapshot,
+        source="huggingface",
+        repository_id="org/model",
+    )
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return SimpleNamespace(stdout='{"repos":[{"repo_id":"org/other"}]}')
+
+    service = _deletion_service(database, tmp_path, command_runner=runner)
+
+    with pytest.raises(RuntimeError, match="preview did not identify"):
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert len(calls) == 1
+    assert "--dry-run" in calls[0]
+    assert repository_root.exists()
+    assert _model_status(database) == "delete_failed"
+
+
+@pytest.mark.parametrize(
+    ("runner", "message"),
+    [
+        (
+            lambda _argv: (_ for _ in ()).throw(
+                subprocess.CalledProcessError(1, ["hf"], output="secret", stderr="token")
+            ),
+            "Hugging Face cache command failed",
+        ),
+        (
+            lambda _argv: SimpleNamespace(
+                returncode=1,
+                stdout='{"repo_id":"org/model"}',
+                stderr="token",
+            ),
+            "Hugging Face cache command failed",
+        ),
+        (
+            lambda _argv: (_ for _ in ()).throw(FileNotFoundError("hf")),
+            "Hugging Face cache command failed",
+        ),
+        (
+            lambda argv: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(argv, timeout=120)
+            ),
+            "Hugging Face cache command failed",
+        ),
+        (lambda _argv: SimpleNamespace(stdout="not-json"), "invalid JSON"),
+    ],
+)
+def test_huggingface_command_failure_preserves_record_and_marks_failed(
+    database, tmp_path, runner, message
+):
+    repository_root = tmp_path / "hf-cache" / "models--org--model"
+    snapshot = repository_root / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    _add_asset(
+        database,
+        snapshot,
+        source="huggingface",
+        repository_id="org/model",
+    )
+    service = _deletion_service(database, tmp_path, command_runner=runner)
+
+    with pytest.raises(RuntimeError, match=message) as caught:
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert "secret" not in str(caught.value)
+    assert "token" not in str(caught.value)
+    assert _model_status(database) == "delete_failed"
+
+
+@pytest.mark.parametrize("source", ["local", "huggingface"])
+def test_unavailable_missing_asset_only_removes_database_record(
+    database, tmp_path, source
+):
+    repository_id = "org/model" if source == "huggingface" else None
+    missing = tmp_path / "missing"
+    _add_asset(
+        database,
+        missing,
+        source=source,
+        repository_id=repository_id,
+        status="unavailable",
+    )
+    calls = []
+    service = _deletion_service(
+        database,
+        tmp_path,
+        command_runner=lambda argv: calls.append(argv),
+    )
+
+    result = service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert calls == []
+    assert _model_status(database) is None
+    assert result["estimated_bytes"] == 0
+
+
+def test_delete_rechecks_references_at_execution_time(database, tmp_path):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target)
+    with database.session_factory() as db:
+        db.add(_deployment(deployment_id="live", name="live", model_id="target"))
+        db.commit()
+    service = _deletion_service(database, tmp_path)
+
+    with pytest.raises(ModelInUseError) as caught:
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert caught.value.references == [ModelReference("live", "live", "base")]
+    assert target.exists()
+    assert _model_status(database) == "available"
+
+
+def test_cancellation_is_checked_before_local_destructive_action(database, tmp_path):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target)
+    service = _deletion_service(database, tmp_path)
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        service.delete_handler(
+            HandlerContext(RuntimeError("cancelled")), {"model_id": "target"}
+        )
+
+    assert target.exists()
+    assert _model_status(database) == "delete_failed"
+
+
+def test_local_delete_failure_marks_record_delete_failed(database, tmp_path, monkeypatch):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target)
+    service = _deletion_service(database, tmp_path)
+
+    def fail_delete(_path):
+        raise OSError("private filesystem detail")
+
+    monkeypatch.setattr("app.services.model_lifecycle.shutil.rmtree", fail_delete)
+    with pytest.raises(RuntimeError, match="Local model deletion failed") as caught:
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert "private filesystem detail" not in str(caught.value)
+    assert _model_status(database) == "delete_failed"
+
+
+def test_successful_delete_scans_inventory_in_new_session(database, tmp_path):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target)
+
+    class Discovery:
+        def __init__(self):
+            self.sessions = []
+
+        def scan_models(self, db):
+            self.sessions.append(db)
+            return [object(), object()]
+
+    discovery = Discovery()
+    service = _deletion_service(database, tmp_path, discovery_service=discovery)
+
+    result = service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert result["inventory_models"] == 2
+    assert len(discovery.sessions) == 1
+    assert _model_status(database) is None
+
+
+def test_discovery_failure_preserves_record_as_delete_failed(database, tmp_path):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target)
+
+    class Discovery:
+        def scan_models(self, _db):
+            raise RuntimeError("scan failed")
+
+    service = _deletion_service(database, tmp_path, discovery_service=Discovery())
+
+    with pytest.raises(RuntimeError, match="scan failed"):
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert _model_status(database) == "delete_failed"
+
+
+def test_delete_handler_requires_session_factory(service):
+    with pytest.raises(RuntimeError, match="session_factory is required"):
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+
+def test_delete_handler_missing_model_uses_bounded_error(database, tmp_path):
+    service = _deletion_service(database, tmp_path)
+
+    with pytest.raises(ValueError, match="^Model was not found$"):
+        service.delete_handler(HandlerContext(), {"model_id": "missing"})
+
+
+def test_delete_handler_rejects_already_deleting_asset(database, tmp_path):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target, status="deleting")
+    service = _deletion_service(database, tmp_path)
+
+    with pytest.raises(ValueError, match="already being deleted"):
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert target.exists()
+    assert _model_status(database) == "deleting"
