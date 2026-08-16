@@ -57,6 +57,36 @@ def test_model_card_commands_never_return_unknown_flags_or_values(tmp_path):
     assert "rm-all" not in dumped
 
 
+def test_sanitized_shell_fence_preserves_following_newline(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "README.md").write_text(
+        "before\n```bash\nvllm serve x --max-model-len 4096\n```\nend\n",
+        encoding="utf-8",
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+    assert evidence.card_text.endswith('```\nend\n')
+
+
+def test_posix_model_root_open_rejects_root_symlink(tmp_path):
+    if model_evidence.os.name != "posix":
+        pytest.skip("POSIX O_NOFOLLOW is unavailable on this platform")
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    (actual / "config.json").write_text("{}", encoding="utf-8")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(actual, target_is_directory=True)
+    except OSError:
+        pytest.skip("Directory symlinks are unavailable on this platform")
+
+    with pytest.raises((OSError, ValueError)):
+        with model_evidence._open_model_file(link, "config.json"):
+            pass
+
+
 def test_missing_shell_value_does_not_consume_following_option_or_leak_it(tmp_path):
     model = tmp_path / "model"
     model.mkdir()

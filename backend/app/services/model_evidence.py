@@ -108,7 +108,7 @@ class ModelEvidence(BaseModel):
     warnings: list[str]
 
 
-Fence = namedtuple("Fence", "language body start end closed")
+Fence = namedtuple("Fence", "language body start end closed newline")
 
 
 def iter_fences(card_text: str) -> Iterator[Fence]:
@@ -134,18 +134,28 @@ def iter_fences(card_text: str) -> Iterator[Fence]:
                 offset += len(line)
                 index += 1
                 closed = True
+                newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
                 break
             body_parts.append(line)
             offset += len(line)
             index += 1
-        yield Fence(language, "".join(body_parts), start, offset, closed)
+        if not closed:
+            newline = ""
+        yield Fence(language, "".join(body_parts), start, offset, closed, newline)
 
 
 @contextmanager
 def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
     if os.name == "posix":
-        root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        root_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         root_fd = os.open(model_root, root_flags)
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            os.close(root_fd)
+            raise ValueError("model root is not a directory")
         file_fd: int | None = None
         try:
             file_fd = os.open(
@@ -173,6 +183,13 @@ def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
         resolved = candidate.resolve(strict=True)
         if not resolved.is_relative_to(model_root):
             raise ValueError("model evidence file escapes model directory")
+        opened_stat = os.fstat(stream.fileno())
+        resolved_stat = os.stat(resolved, follow_symlinks=True)
+        if (opened_stat.st_dev, opened_stat.st_ino) != (
+            resolved_stat.st_dev,
+            resolved_stat.st_ino,
+        ):
+            raise ValueError("model evidence file changed while opening")
         yield stream
 
 
@@ -359,7 +376,7 @@ def _sanitize_shell_fences(card_text: str) -> str:
             values = {}
         safe_lines = [f"{key}={json.dumps(value)}" for key, value in sorted(values.items())]
         body = "\n".join(safe_lines)
-        parts.append(f"```{fence.language}\n{body}\n```")
+        parts.append(f"```{fence.language}\n{body}\n```{fence.newline}")
         cursor = fence.end
     if not parts:
         return card_text
