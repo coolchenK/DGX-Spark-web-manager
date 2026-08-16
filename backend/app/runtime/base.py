@@ -4,14 +4,105 @@ import json
 import platform
 import re
 from abc import ABC, abstractmethod
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+RecommendationSource = Literal[
+    "model_card", "local_config", "runtime_default", "device_rule", "ai"
+]
+
+QuantizationMethod = Literal[
+    "auto",
+    "awq",
+    "gptq",
+    "fp8",
+    "bitsandbytes",
+    "marlin",
+    "gguf",
+    "modelopt",
+    "modelopt_fp4",
+    "nvfp4_online",
+    "compressed-tensors",
+]
+
+
+class GenerationDefaults(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    top_k: int | None = Field(default=None, ge=0, le=1_000_000)
+    min_p: float | None = Field(default=None, ge=0, le=1)
+    repetition_penalty: float | None = Field(default=None, gt=0, le=2)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    max_tokens: int | None = Field(default=None, ge=1, le=1_048_576)
+    stop: str | list[str] | None = None
+
+    @field_validator("stop")
+    @classmethod
+    def validate_stop(cls, value: str | list[str] | None):
+        values = [value] if isinstance(value, str) else value or []
+        if len(values) > 16 or any(not item or len(item) > 500 for item in values):
+            raise ValueError(
+                "stop must contain 1-16 non-empty strings of at most 500 characters"
+            )
+        return value
+
+
+class SpeculativeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draft_model_id: str = Field(min_length=1, max_length=64)
+    method: Literal["draft_model", "eagle", "eagle3", "mtp"]
+    num_speculative_tokens: int | None = Field(default=None, ge=1, le=64)
+    num_steps: int | None = Field(default=None, ge=1, le=32)
+    eagle_top_k: int | None = Field(default=None, ge=1, le=32)
+    num_draft_tokens: int | None = Field(default=None, ge=1, le=256)
+    manual_review_acknowledged: bool = False
+
+    @model_validator(mode="after")
+    def validate_tuning_group(self):
+        values = (self.num_steps, self.eagle_top_k, self.num_draft_tokens)
+        if any(value is not None for value in values) and not all(
+            value is not None for value in values
+        ):
+            raise ValueError("set num_steps, eagle_top_k and num_draft_tokens together")
+        return self
+
+
+class ResourceSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_bytes: int = Field(ge=0)
+    available_bytes: int = Field(ge=0)
+    reserved_bytes: int = Field(ge=0)
+
+
+class RecommendationProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    generated_at: datetime
+    evidence_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    provider_id: str | None = Field(default=None, max_length=64)
+    resource_snapshot: ResourceSnapshot
+    modified_fields: list[str] = Field(default_factory=list, max_length=64)
+    sources: dict[str, RecommendationSource] = Field(default_factory=dict)
 
 
 class DeploymentSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=120)
     model_id: str | None = None
     model_path: str
@@ -24,8 +115,11 @@ class DeploymentSpec(BaseModel):
     memory_fraction: float = Field(default=0.8, ge=0.05, le=0.98)
     max_concurrency: int = Field(default=8, ge=1, le=1024)
     max_batched_tokens: int | None = Field(default=None, ge=1024, le=1_048_576)
-    quantization: Literal["auto", "awq", "gptq", "fp8", "bitsandbytes", "marlin"] | None = None
+    quantization: QuantizationMethod | None = None
     trust_remote_code: bool = False
+    generation_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
+    speculative: SpeculativeConfig | None = None
+    recommendation: RecommendationProvenance | None = None
 
     @field_validator("api_model_name", "route_alias")
     @classmethod
@@ -35,6 +129,15 @@ class DeploymentSpec(BaseModel):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", value):
             raise ValueError("API model name contains unsupported characters")
         return value
+
+
+class ResolvedDeploymentSpec(DeploymentSpec):
+    resolved_draft_model_path: str | None = None
+    draft_container_model_path: str | None = None
+    speculative_runtime_method: str | None = None
+
+    def public_dump(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in DeploymentSpec.model_fields}
 
 
 def deterministic_container_name(name: str) -> str:

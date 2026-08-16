@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import docker
@@ -9,6 +10,135 @@ from app.runtime.base import DeploymentSpec, deterministic_container_name, valid
 from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
 from app.services import deployments as deployment_service
+
+
+def valid_spec_payload(tmp_path):
+    return {
+        "name": "Qwen Local",
+        "model_id": "org/qwen-model",
+        "model_path": str(tmp_path / "models" / "qwen"),
+        "api_model_name": "qwen-local",
+        "runtime": "vllm",
+        "image": "vllm:test",
+        "port": 8100,
+        "quantization": "modelopt_fp4",
+        "generation_defaults": {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 50,
+            "min_p": 0.05,
+            "repetition_penalty": 1.1,
+            "presence_penalty": 0.2,
+            "frequency_penalty": -0.1,
+            "max_tokens": 2048,
+            "stop": ["</s>", "<|end|>"],
+        },
+        "speculative": {
+            "draft_model_id": "org/qwen-draft",
+            "method": "eagle3",
+            "num_speculative_tokens": 8,
+            "num_steps": 2,
+            "eagle_top_k": 4,
+            "num_draft_tokens": 16,
+            "manual_review_acknowledged": True,
+        },
+        "recommendation": {
+            "generated_at": datetime(2026, 8, 16, tzinfo=UTC),
+            "evidence_hash": "a" * 64,
+            "provider_id": "provider-1",
+            "resource_snapshot": {
+                "total_bytes": 1_000,
+                "available_bytes": 800,
+                "reserved_bytes": 200,
+            },
+            "modified_fields": ["generation_defaults.temperature", "quantization"],
+            "sources": {
+                "generation_defaults.temperature": "model_card",
+                "quantization": "local_config",
+                "context_length": "runtime_default",
+                "memory_fraction": "device_rule",
+                "generation_defaults.max_tokens": "ai",
+            },
+        },
+    }
+
+
+def test_deployment_spec_serializes_recommendation_settings(tmp_path):
+    spec = DeploymentSpec.model_validate(valid_spec_payload(tmp_path))
+
+    dumped = spec.model_dump(mode="json")
+
+    assert dumped["quantization"] == "modelopt_fp4"
+    assert dumped["generation_defaults"]["stop"] == ["</s>", "<|end|>"]
+    assert dumped["speculative"]["method"] == "eagle3"
+    assert dumped["speculative"]["num_draft_tokens"] == 16
+    assert dumped["recommendation"]["generated_at"] == "2026-08-16T00:00:00Z"
+    assert dumped["recommendation"]["sources"]["memory_fraction"] == "device_rule"
+
+
+@pytest.mark.parametrize(
+    "tuning",
+    [
+        {"num_steps": 2},
+        {"eagle_top_k": 4},
+        {"num_draft_tokens": 16},
+        {"num_steps": 2, "eagle_top_k": 4},
+        {"num_steps": 2, "num_draft_tokens": 16},
+        {"eagle_top_k": 4, "num_draft_tokens": 16},
+    ],
+)
+def test_speculative_eagle_tuning_fields_must_be_set_together(tmp_path, tuning):
+    payload = valid_spec_payload(tmp_path)
+    payload["quantization"] = "fp8"
+    payload["speculative"] = {
+        "draft_model_id": "org/qwen-draft",
+        "method": "eagle",
+        **tuning,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="set num_steps, eagle_top_k and num_draft_tokens together",
+    ):
+        DeploymentSpec.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("resolved_draft_model_path", "/models/qwen-draft"),
+        ("speculative_runtime_method", "eagle"),
+    ],
+)
+def test_public_deployment_spec_rejects_internal_resolution_fields(
+    tmp_path, field, value
+):
+    payload = valid_spec_payload(tmp_path)
+    payload["quantization"] = "fp8"
+    payload[field] = value
+
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        DeploymentSpec.model_validate(payload)
+
+
+def test_resolved_deployment_spec_public_dump_excludes_internal_fields(tmp_path):
+    from app.runtime.base import ResolvedDeploymentSpec
+
+    resolved = ResolvedDeploymentSpec.model_validate(
+        {
+            **valid_spec_payload(tmp_path),
+            "resolved_draft_model_path": str(tmp_path / "models" / "qwen-draft"),
+            "draft_container_model_path": "/models/qwen-draft",
+            "speculative_runtime_method": "eagle",
+        }
+    )
+
+    public = resolved.public_dump()
+
+    assert set(public) == set(DeploymentSpec.model_fields)
+    assert "resolved_draft_model_path" not in public
+    assert "draft_container_model_path" not in public
+    assert "speculative_runtime_method" not in public
 
 
 def test_container_name_is_deterministic_and_safe():
