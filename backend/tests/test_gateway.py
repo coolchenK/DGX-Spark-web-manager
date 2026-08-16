@@ -380,13 +380,18 @@ def test_gateway_ignores_defaults_without_a_valid_capability_snapshot(client):
 
 
 @respx.mock
-def test_gateway_skips_one_invalid_saved_default_without_dropping_valid_fields(client):
+def test_gateway_strictly_skips_coercible_defaults_without_dropping_valid_fields(client):
     key = _create_gateway_key(client)
     _seed_deployment(
         client,
         config=_generation_config(
-            {"temperature": "hot", "top_p": 0.8},
-            ["temperature", "top_p"],
+            {
+                "temperature": True,
+                "top_p": "0.7",
+                "max_tokens": True,
+                "min_p": 0.05,
+            },
+            ["temperature", "top_p", "max_tokens", "min_p"],
         ),
     )
     route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
@@ -402,4 +407,44 @@ def test_gateway_skips_one_invalid_saved_default_without_dropping_valid_fields(c
     assert response.status_code == 200
     forwarded = json.loads(route.calls[0].request.content)
     assert "temperature" not in forwarded
-    assert forwarded["top_p"] == 0.8
+    assert "top_p" not in forwarded
+    assert "max_tokens" not in forwarded
+    assert forwarded["min_p"] == 0.05
+    with client.app.state.database.session_factory() as db:
+        event = db.scalar(
+            select(AuditEvent).where(AuditEvent.action == "gateway.defaults.apply")
+        )
+    assert event is not None
+    assert event.details["applied_fields"] == ["min_p"]
+
+
+@respx.mock
+def test_gateway_does_not_audit_when_all_saved_defaults_fail_strict_validation(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config=_generation_config(
+            {"temperature": True, "top_p": "0.7", "max_tokens": True},
+            ["temperature", "top_p", "max_tokens"],
+        ),
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": []},
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert "temperature" not in forwarded
+    assert "top_p" not in forwarded
+    assert "max_tokens" not in forwarded
+    with client.app.state.database.session_factory() as db:
+        event = db.scalar(
+            select(AuditEvent).where(AuditEvent.action == "gateway.defaults.apply")
+        )
+    assert event is None

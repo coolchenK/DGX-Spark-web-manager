@@ -132,9 +132,9 @@ def deployment_generation_settings(
         if key not in defaults:
             continue
         try:
-            parsed = GenerationDefaults.model_validate({key: defaults[key]}).model_dump(
-                mode="json", exclude_none=True
-            )
+            parsed = GenerationDefaults.model_validate(
+                {key: defaults[key]}, strict=True
+            ).model_dump(mode="json", exclude_none=True)
         except (TypeError, ValueError):
             continue
         if key in parsed:
