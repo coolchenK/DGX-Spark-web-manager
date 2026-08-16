@@ -6,11 +6,17 @@ import math
 import struct
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
 from host_agent.dgx_ops_agent import protocol as protocol_module
+from host_agent.dgx_ops_agent.policy import (
+    READ_ONLY_ACTIONS,
+    PolicyError,
+    validate_action,
+)
 from host_agent.dgx_ops_agent.protocol import (
     MAX_FRAME_SIZE,
     PROTOCOL_VERSION,
@@ -40,6 +46,263 @@ def _signed_request(**changes):
     )
     request.update(changes)
     return sign_message(request, SECRET)
+
+
+VALID_APPROVAL = {
+    "plan_id": "plan-1",
+    "step_id": "step-1",
+    "approved_by": "admin",
+    "approved_at": "2026-08-17T00:00:00Z",
+}
+
+READ_ACTION_CASES = {
+    "host.memory": (
+        {},
+        ("/usr/bin/free", "--bytes"),
+        10,
+    ),
+    "host.disk": (
+        {},
+        (
+            "/usr/bin/df",
+            "--block-size=1",
+            "--output=source,target,size,used,avail,pcent",
+        ),
+        10,
+    ),
+    "host.gpu": (
+        {},
+        (
+            "/usr/bin/nvidia-smi",
+            "--query-gpu=name,driver_version,temperature.gpu,power.draw,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ),
+        15,
+    ),
+    "host.ports": ({}, ("/usr/bin/ss", "-lntupH"), 10),
+    "host.processes": (
+        {},
+        (
+            "/usr/bin/ps",
+            "-eo",
+            "pid,ppid,user,stat,%cpu,%mem,etimes,comm",
+            "--sort=-%cpu",
+        ),
+        10,
+    ),
+    "docker.list": (
+        {},
+        ("/usr/bin/docker", "container", "list", "--all", "--no-trunc"),
+        15,
+    ),
+    "docker.inspect": (
+        {"container": "web-1"},
+        ("/usr/bin/docker", "inspect", "web-1"),
+        15,
+    ),
+    "docker.logs": (
+        {"container": "a" * 64, "tail": 250},
+        ("/usr/bin/docker", "logs", "--tail", "250", "a" * 64),
+        15,
+    ),
+    "docker.stats": (
+        {"container": "web_1"},
+        ("/usr/bin/docker", "stats", "--no-stream", "web_1"),
+        15,
+    ),
+    "systemd.status": (
+        {"service": "docker.service"},
+        ("/usr/bin/systemctl", "--no-pager", "--full", "status", "docker.service"),
+        15,
+    ),
+    "systemd.journal": (
+        {"service": "docker.service", "tail": 500},
+        (
+            "/usr/bin/journalctl",
+            "--no-pager",
+            "--output=short-iso",
+            "--unit",
+            "docker.service",
+            "--lines",
+            "500",
+        ),
+        15,
+    ),
+}
+
+
+@pytest.mark.parametrize("action", READ_ACTION_CASES)
+def test_policy_read_only_actions_bind_fixed_argv_without_approval(action):
+    parameters, expected_argv, expected_timeout = READ_ACTION_CASES[action]
+
+    validated = validate_action(action, parameters, approval=None)
+
+    assert READ_ONLY_ACTIONS == frozenset(READ_ACTION_CASES)
+    assert validated.action == action
+    assert validated.argv == expected_argv
+    assert validated.cwd is None
+    assert validated.timeout == expected_timeout
+    assert validated.read_only is True
+    assert validated.approval is None
+    assert validated.argv[0].startswith("/")
+
+
+@pytest.mark.parametrize("action", READ_ACTION_CASES)
+def test_policy_read_only_actions_reject_unknown_parameter_keys(action):
+    parameters = dict(READ_ACTION_CASES[action][0], unexpected="value")
+
+    with pytest.raises(PolicyError, match="parameters"):
+        validate_action(action, parameters, approval=None)
+
+
+@pytest.mark.parametrize(
+    ("action", "parameters"),
+    [
+        ("docker.inspect", {"container": "-x"}),
+        ("docker.inspect", {"container": "../container"}),
+        ("docker.inspect", {"container": "web;id"}),
+        ("docker.inspect", {"container": "web name"}),
+        ("docker.inspect", {"container": "a" * 129}),
+        ("docker.logs", {"container": "web", "tail": 0}),
+        ("docker.logs", {"container": "web", "tail": 5001}),
+        ("docker.logs", {"container": "web", "tail": True}),
+        ("docker.logs", {"container": "web", "tail": "10"}),
+        ("systemd.status", {"service": "-user.service"}),
+        ("systemd.status", {"service": "../user.service"}),
+        ("systemd.status", {"service": "user/service"}),
+        ("systemd.status", {"service": "user.service;id"}),
+        ("systemd.status", {"service": "a" * 257}),
+        ("systemd.journal", {"service": "docker.service", "tail": False}),
+    ],
+)
+def test_policy_rejects_unsafe_selectors_and_invalid_tail(action, parameters):
+    with pytest.raises(PolicyError, match="parameters"):
+        validate_action(action, parameters, approval=None)
+
+
+@pytest.mark.parametrize(
+    ("action", "parameters"),
+    [
+        ("docker.inspect", {}),
+        ("docker.inspect", {"container": 123}),
+        ("docker.logs", {"container": "web"}),
+        ("docker.stats", {"container": None}),
+        ("systemd.status", {}),
+        ("systemd.journal", {"service": "docker.service"}),
+    ],
+)
+def test_policy_read_tools_enforce_exact_required_types(action, parameters):
+    with pytest.raises(PolicyError, match="parameters"):
+        validate_action(action, parameters, approval=None)
+
+
+def test_policy_shell_requires_complete_approval_and_binds_bash_argv():
+    parameters = {"command": "printf ok", "cwd": "/var/tmp", "timeout": 30}
+
+    with pytest.raises(PolicyError, match="approval"):
+        validate_action("shell.execute", parameters, approval=None)
+
+    validated = validate_action("shell.execute", parameters, approval=VALID_APPROVAL)
+
+    assert validated.action == "shell.execute"
+    assert validated.argv == ("/bin/bash", "-lc", "printf ok")
+    assert validated.cwd == "/var/tmp"
+    assert validated.timeout == 30
+    assert validated.read_only is False
+    assert validated.approval is not None
+    assert validated.approval.plan_id == "plan-1"
+    assert validated.approval.step_id == "step-1"
+    assert validated.approval.approved_by == "admin"
+    assert validated.approval.approved_at == "2026-08-17T00:00:00Z"
+
+
+def test_policy_shell_defaults_timeout_but_still_requires_approval():
+    parameters = {"command": "id", "cwd": "/"}
+
+    with pytest.raises(PolicyError, match="approval"):
+        validate_action("shell.execute", parameters, approval=None)
+
+    validated = validate_action("shell.execute", parameters, approval=VALID_APPROVAL)
+
+    assert validated.timeout == 30
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"command": "", "cwd": "/", "timeout": 30},
+        {"command": 1, "cwd": "/", "timeout": 30},
+        {"command": "x\x00id", "cwd": "/", "timeout": 30},
+        {"command": "x" * 16_385, "cwd": "/", "timeout": 30},
+        {"command": "id", "cwd": "relative", "timeout": 30},
+        {"command": "id", "cwd": "/tmp/../var", "timeout": 30},
+        {"command": "id", "cwd": "/tmp\x00/var", "timeout": 30},
+        {"command": "id", "cwd": "/", "timeout": True},
+        {"command": "id", "cwd": "/", "timeout": 0},
+        {"command": "id", "cwd": "/", "timeout": 3601},
+        {"command": "id", "cwd": "/", "timeout": 30, "env": {}},
+        {"command": "id", "cwd": "/", "timeout": 30, "unexpected": True},
+    ],
+)
+def test_policy_shell_parameters_have_exact_bounded_schema(parameters):
+    with pytest.raises(PolicyError, match="parameters") as exc_info:
+        validate_action("shell.execute", parameters, approval=VALID_APPROVAL)
+
+    assert "x" * 100 not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "approval",
+    [
+        {},
+        {**VALID_APPROVAL, "unexpected": "value"},
+        {key: value for key, value in VALID_APPROVAL.items() if key != "step_id"},
+        {**VALID_APPROVAL, "plan_id": ""},
+        {**VALID_APPROVAL, "step_id": 1},
+        {**VALID_APPROVAL, "approved_by": "a" * 129},
+        {**VALID_APPROVAL, "approved_at": "2026-08-17T00:00:00+00:00"},
+        {**VALID_APPROVAL, "approved_at": "2026-08-17T08:00:00+08:00"},
+        {**VALID_APPROVAL, "approved_at": "not-a-date"},
+    ],
+)
+def test_policy_shell_approval_has_exact_bounded_utc_schema(approval):
+    with pytest.raises(PolicyError, match="approval"):
+        validate_action(
+            "shell.execute",
+            {"command": "id", "cwd": "/", "timeout": 30},
+            approval=approval,
+        )
+
+
+def test_policy_fails_closed_without_echoing_action_or_command_secrets():
+    secret = "TOKEN=very-secret-value"
+
+    with pytest.raises(PolicyError, match="^unknown action$") as action_error:
+        validate_action(f"unknown.{secret}", {}, approval=None)
+    with pytest.raises(PolicyError, match="parameters") as parameter_error:
+        validate_action(
+            "shell.execute",
+            {"command": secret + "\x00", "cwd": "/", "timeout": 30},
+            approval=VALID_APPROVAL,
+        )
+
+    assert secret not in str(action_error.value)
+    assert secret not in str(parameter_error.value)
+
+
+def test_policy_validated_action_and_approval_are_immutable():
+    validated = validate_action(
+        "shell.execute",
+        {"command": "id", "cwd": "/", "timeout": 30},
+        approval=VALID_APPROVAL,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        validated.timeout = 60
+    with pytest.raises(FrozenInstanceError):
+        validated.approval.approved_by = "other"
+    with pytest.raises(TypeError):
+        validated.argv[0] = "/tmp/bash"
 
 
 def test_canonical_json_is_stable_ascii_and_excludes_signature():
