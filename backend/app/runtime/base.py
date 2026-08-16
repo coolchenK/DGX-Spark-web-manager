@@ -137,7 +137,7 @@ class ResolvedDeploymentSpec(DeploymentSpec):
     speculative_runtime_method: str | None = None
 
     def public_dump(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in DeploymentSpec.model_fields}
+        return self.model_dump(mode="json", include=set(DeploymentSpec.model_fields))
 
 
 def deterministic_container_name(name: str) -> str:
@@ -293,7 +293,7 @@ class RuntimeAdapter(ABC):
         model_size = self.model_size(model_path)
         route_name = spec.route_alias or spec.api_model_name
         return {
-            "spec": spec.model_dump(),
+            "spec": spec.model_dump(mode="json"),
             "container_name": deterministic_container_name(spec.name),
             "runtime": self.runtime,
             "image": spec.image,

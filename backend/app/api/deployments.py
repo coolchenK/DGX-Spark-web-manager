@@ -52,7 +52,7 @@ def create_deployment(
         db,
         task_type="deployment.create",
         title=f"部署 {spec.name}",
-        input_json=spec.model_dump(),
+        input_json=spec.model_dump(mode="json"),
         idempotency_key=f"deployment:create:{spec.api_model_name}",
     )
     record_audit(
@@ -99,7 +99,7 @@ def update_deployment(
         db,
         task_type="deployment.update",
         title=f"更新部署 {deployment.name}",
-        input_json={"deployment_id": deployment_id, "spec": spec.model_dump()},
+        input_json={"deployment_id": deployment_id, "spec": spec.model_dump(mode="json")},
         idempotency_key=f"deployment:{deployment_id}:update",
     )
     record_audit(

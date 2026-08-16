@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -5,8 +6,17 @@ import docker
 import pytest
 from app.config import Settings
 from app.db import Database
-from app.models import Deployment
-from app.runtime.base import DeploymentSpec, deterministic_container_name, validate_model_path
+from app.models import Deployment, TaskRecord
+from app.runtime.base import (
+    DeploymentSpec,
+    GenerationDefaults,
+    RecommendationProvenance,
+    ResolvedDeploymentSpec,
+    ResourceSnapshot,
+    SpeculativeConfig,
+    deterministic_container_name,
+    validate_model_path,
+)
 from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
 from app.services import deployments as deployment_service
@@ -63,6 +73,21 @@ def valid_spec_payload(tmp_path):
     }
 
 
+def valid_recommendation_payload():
+    return {
+        "generated_at": "2026-08-16T00:00:00Z",
+        "evidence_hash": "a" * 64,
+        "provider_id": "provider-1",
+        "resource_snapshot": {
+            "total_bytes": 1_000,
+            "available_bytes": 800,
+            "reserved_bytes": 200,
+        },
+        "modified_fields": ["generation_defaults.temperature"],
+        "sources": {"generation_defaults.temperature": "model_card"},
+    }
+
+
 def test_deployment_spec_serializes_recommendation_settings(tmp_path):
     spec = DeploymentSpec.model_validate(valid_spec_payload(tmp_path))
 
@@ -74,6 +99,107 @@ def test_deployment_spec_serializes_recommendation_settings(tmp_path):
     assert dumped["speculative"]["num_draft_tokens"] == 16
     assert dumped["recommendation"]["generated_at"] == "2026-08-16T00:00:00Z"
     assert dumped["recommendation"]["sources"]["memory_fraction"] == "device_rule"
+
+
+@pytest.mark.parametrize(
+    ("field", "lower", "upper", "below", "above"),
+    [
+        ("temperature", 0, 2, -0.01, 2.01),
+        ("top_p", 0.01, 1, 0, 1.01),
+        ("top_k", 0, 1_000_000, -1, 1_000_001),
+        ("min_p", 0, 1, -0.01, 1.01),
+        ("repetition_penalty", 0.01, 2, 0, 2.01),
+        ("presence_penalty", -2, 2, -2.01, 2.01),
+        ("frequency_penalty", -2, 2, -2.01, 2.01),
+        ("max_tokens", 1, 1_048_576, 0, 1_048_577),
+    ],
+)
+def test_generation_defaults_enforces_numeric_boundaries(
+    field, lower, upper, below, above
+):
+    assert getattr(GenerationDefaults.model_validate({field: lower}), field) == lower
+    assert getattr(GenerationDefaults.model_validate({field: upper}), field) == upper
+
+    for invalid in (below, above):
+        with pytest.raises(ValueError):
+            GenerationDefaults.model_validate({field: invalid})
+
+
+@pytest.mark.parametrize(
+    "stop",
+    [[], "x", "x" * 500, ["stop"] * 16],
+)
+def test_generation_defaults_accepts_valid_stop_boundaries(stop):
+    assert GenerationDefaults(stop=stop).stop == stop
+
+
+@pytest.mark.parametrize(
+    "stop",
+    ["", "x" * 501, [""], ["stop"] * 17],
+)
+def test_generation_defaults_rejects_invalid_stop_boundaries(stop):
+    with pytest.raises(ValueError, match="stop must contain"):
+        GenerationDefaults(stop=stop)
+
+
+@pytest.mark.parametrize(
+    ("field", "lower", "upper", "below", "above"),
+    [
+        ("num_speculative_tokens", 1, 64, 0, 65),
+        ("num_steps", 1, 32, 0, 33),
+        ("eagle_top_k", 1, 32, 0, 33),
+        ("num_draft_tokens", 1, 256, 0, 257),
+    ],
+)
+def test_speculative_config_enforces_numeric_boundaries(
+    field, lower, upper, below, above
+):
+    def payload(value):
+        settings = {
+            "draft_model_id": "draft-id",
+            "method": "eagle",
+            field: value,
+        }
+        if field in {"num_steps", "eagle_top_k", "num_draft_tokens"}:
+            settings.update(
+                {
+                    "num_steps": 1,
+                    "eagle_top_k": 1,
+                    "num_draft_tokens": 1,
+                    field: value,
+                }
+            )
+        return settings
+
+    assert getattr(SpeculativeConfig.model_validate(payload(lower)), field) == lower
+    assert getattr(SpeculativeConfig.model_validate(payload(upper)), field) == upper
+
+    for invalid in (below, above):
+        with pytest.raises(ValueError):
+            SpeculativeConfig.model_validate(payload(invalid))
+
+
+@pytest.mark.parametrize("draft_model_id", ["a", "a" * 64])
+def test_speculative_config_accepts_draft_model_id_boundaries(draft_model_id):
+    spec = SpeculativeConfig(draft_model_id=draft_model_id, method="draft_model")
+
+    assert spec.draft_model_id == draft_model_id
+
+
+@pytest.mark.parametrize("draft_model_id", ["", "a" * 65])
+def test_speculative_config_rejects_invalid_draft_model_id_lengths(draft_model_id):
+    with pytest.raises(ValueError):
+        SpeculativeConfig(draft_model_id=draft_model_id, method="draft_model")
+
+
+@pytest.mark.parametrize("method", ["draft_model", "eagle", "eagle3", "mtp"])
+def test_speculative_config_accepts_supported_methods(method):
+    assert SpeculativeConfig(draft_model_id="draft-id", method=method).method == method
+
+
+def test_speculative_config_rejects_unknown_method():
+    with pytest.raises(ValueError):
+        SpeculativeConfig(draft_model_id="draft-id", method="unknown")
 
 
 @pytest.mark.parametrize(
@@ -121,9 +247,9 @@ def test_public_deployment_spec_rejects_internal_resolution_fields(
         DeploymentSpec.model_validate(payload)
 
 
-def test_resolved_deployment_spec_public_dump_excludes_internal_fields(tmp_path):
-    from app.runtime.base import ResolvedDeploymentSpec
-
+def test_resolved_deployment_spec_public_dump_is_json_safe_and_excludes_internal_fields(
+    tmp_path,
+):
     resolved = ResolvedDeploymentSpec.model_validate(
         {
             **valid_spec_payload(tmp_path),
@@ -135,10 +261,63 @@ def test_resolved_deployment_spec_public_dump_excludes_internal_fields(tmp_path)
 
     public = resolved.public_dump()
 
+    assert json.loads(json.dumps(public)) == public
+    assert public["recommendation"]["generated_at"] == "2026-08-16T00:00:00Z"
     assert set(public) == set(DeploymentSpec.model_fields)
     assert "resolved_draft_model_path" not in public
     assert "draft_container_model_path" not in public
     assert "speculative_runtime_method" not in public
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["total_bytes", "available_bytes", "reserved_bytes"],
+)
+def test_resource_snapshot_enforces_nonnegative_boundaries(field):
+    payload = {"total_bytes": 0, "available_bytes": 0, "reserved_bytes": 0}
+    assert getattr(ResourceSnapshot.model_validate(payload), field) == 0
+
+    payload[field] = -1
+    with pytest.raises(ValueError):
+        ResourceSnapshot.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "evidence_hash",
+    ["a" * 63, "a" * 65, "A" * 64, "g" * 64],
+)
+def test_recommendation_provenance_rejects_invalid_evidence_hash(evidence_hash):
+    payload = valid_recommendation_payload()
+    payload["evidence_hash"] = evidence_hash
+
+    with pytest.raises(ValueError):
+        RecommendationProvenance.model_validate(payload)
+
+
+def test_recommendation_provenance_accepts_lowercase_sha256_hash():
+    provenance = RecommendationProvenance.model_validate(valid_recommendation_payload())
+
+    assert provenance.evidence_hash == "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("model_type", "payload"),
+    [
+        (GenerationDefaults, {"temperature": 0.7}),
+        (
+            SpeculativeConfig,
+            {"draft_model_id": "draft-id", "method": "draft_model"},
+        ),
+        (
+            ResourceSnapshot,
+            {"total_bytes": 1, "available_bytes": 1, "reserved_bytes": 0},
+        ),
+        (RecommendationProvenance, valid_recommendation_payload()),
+    ],
+)
+def test_nested_deployment_models_reject_extra_fields(model_type, payload):
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        model_type.model_validate({**payload, "unexpected": True})
 
 
 def test_container_name_is_deterministic_and_safe():
@@ -199,6 +378,7 @@ def test_deployment_preview_preserves_shared_gateway_route(tmp_path):
         runtime="vllm",
         image="vllm/vllm-openai:v0.27.1",
         port=8100,
+        recommendation=valid_recommendation_payload(),
     )
     (model_path / "config.json").write_text('{"architectures": ["Qwen2ForCausalLM"]}')
     (model_path / "model.safetensors").write_bytes(b"weights")
@@ -209,7 +389,8 @@ def test_deployment_preview_preserves_shared_gateway_route(tmp_path):
     assert preview["compatibility"]["architectures"] == ["Qwen2ForCausalLM"]
     assert preview["estimated_disk_bytes"] > 0
     assert preview["estimated_memory_bytes"] >= preview["estimated_disk_bytes"]
-    assert preview["spec"] == spec.model_dump()
+    assert preview["spec"] == spec.model_dump(mode="json")
+    json.dumps(preview)
     assert preview["operations"][-1] == "Probe /v1/models and register the gateway route"
     assert "client.chat.completions.create" in preview["api_example"]
 
@@ -261,6 +442,24 @@ def test_vllm_command_includes_batch_and_quantization_settings(tmp_path):
     assert command[command.index("--quantization") + 1] == "fp8"
 
 
+def test_create_endpoint_persists_json_safe_recommendation(authenticated_client, tmp_path):
+    payload = valid_spec_payload(tmp_path)
+    Path(payload["model_path"]).mkdir(parents=True)
+    payload["model_id"] = None
+    payload["image"] = "vllm/vllm-openai:v0.27.1"
+    payload["recommendation"] = valid_recommendation_payload()
+
+    response = authenticated_client.post("/api/deployments", json=payload)
+
+    assert response.status_code == 202
+    with authenticated_client.app.state.database.session_factory() as db:
+        task = db.get(TaskRecord, response.json()["id"])
+        assert task.input_json["recommendation"]["generated_at"] == (
+            "2026-08-16T00:00:00Z"
+        )
+        json.dumps(task.input_json)
+
+
 def test_update_endpoint_queues_managed_deployment_change(authenticated_client, tmp_path):
     model_path = tmp_path / "models" / "qwen"
     model_path.mkdir(parents=True)
@@ -293,11 +492,18 @@ def test_update_endpoint_queues_managed_deployment_change(authenticated_client, 
             "runtime": "vllm",
             "image": "vllm/vllm-openai:v0.27.1",
             "port": 8100,
+            "recommendation": valid_recommendation_payload(),
         },
     )
 
     assert response.status_code == 202
     assert response.json()["type"] == "deployment.update"
+    with authenticated_client.app.state.database.session_factory() as db:
+        task = db.get(TaskRecord, response.json()["id"])
+        assert task.input_json["spec"]["recommendation"]["generated_at"] == (
+            "2026-08-16T00:00:00Z"
+        )
+        json.dumps(task.input_json)
 
 
 def test_container_model_path_maps_to_the_configured_host_root(tmp_path):
