@@ -3,7 +3,10 @@ import hmac
 import io
 import json
 import math
+import os
 import struct
+import sys
+import time
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
@@ -15,6 +18,7 @@ from host_agent.dgx_ops_agent import protocol as protocol_module
 from host_agent.dgx_ops_agent.policy import (
     READ_ONLY_ACTIONS,
     PolicyError,
+    ValidatedAction,
     validate_action,
 )
 from host_agent.dgx_ops_agent.protocol import (
@@ -31,6 +35,8 @@ from host_agent.dgx_ops_agent.protocol import (
     verify_message,
     write_frame,
 )
+from host_agent.dgx_ops_agent.redaction import StreamingRedactor
+from host_agent.dgx_ops_agent.runner import SAFE_PATH, JobRunner
 
 SECRET = b"x" * 32
 REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -46,6 +52,28 @@ def _signed_request(**changes):
     )
     request.update(changes)
     return sign_message(request, SECRET)
+
+
+def _wait_for_terminal(runner, job_id, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = runner.get(job_id)
+        if job.status not in {"queued", "running"}:
+            return job
+        time.sleep(0.01)
+    raise AssertionError("job did not reach a terminal state")
+
+
+def _test_action(tmp_path, code, *, timeout=5, environment=()):
+    return ValidatedAction(
+        action="test.execute",
+        argv=(sys.executable, "-c", code),
+        cwd=str(tmp_path),
+        timeout=timeout,
+        read_only=True,
+        approval=None,
+        environment=environment,
+    )
 
 
 VALID_APPROVAL = {
@@ -1023,6 +1051,253 @@ def test_json_parsing_does_not_swallow_process_exceptions(monkeypatch, error_typ
 
     with pytest.raises(error_type):
         read_frame(io.BytesIO(frame))
+
+
+def test_streaming_redactor_holds_split_credentials_until_they_are_safe():
+    redactor = StreamingRedactor()
+    chunks = [
+        b"before Authorization: Bea",
+        b"rer bearer-secret ",
+        b"api_",
+        b"key='assignment-secret' hf_",
+        b"hub-secret dgx_agent-secret after",
+    ]
+
+    intermediate = [redactor.feed(chunk) for chunk in chunks]
+    output = b"".join([*intermediate, redactor.finish()]).decode("utf-8")
+
+    assert not any(b"bearer-secret" in chunk for chunk in intermediate)
+    assert "bearer-secret" not in output
+    assert "assignment-secret" not in output
+    assert "hf_hub-secret" not in output
+    assert "dgx_agent-secret" not in output
+    assert output.count("[REDACTED]") == 4
+    assert output.startswith("before Authorization: Bearer [REDACTED]")
+    assert output.endswith(" after")
+
+
+def test_streaming_redactor_handles_split_and_invalid_utf8_without_leaking():
+    encoded = "prefix 记 token=secret-value suffix".encode()
+    split = encoded.index("记".encode()) + 1
+    redactor = StreamingRedactor()
+
+    output = b"".join(
+        (
+            redactor.feed(encoded[:split]),
+            redactor.feed(encoded[split:] + b"\xff"),
+            redactor.finish(),
+        )
+    )
+
+    decoded = output.decode("utf-8")
+    assert "记" in decoded
+    assert "secret-value" not in decoded
+    assert "token=[REDACTED]" in decoded
+    assert "\ufffd" in decoded
+
+
+def test_runner_uses_clean_environment_devnull_and_merged_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("BASH_ENV", "inherited-bash")
+    monkeypatch.setenv("ENV", "inherited-env")
+    monkeypatch.setenv("LD_PRELOAD", "inherited-library")
+    monkeypatch.setenv("PYTHONPATH", "inherited-python")
+    monkeypatch.setenv("DGX_OPS_AGENT_SECRET", "inherited-secret")
+    code = (
+        "import json, os, sys; "
+        "sys.stderr.write('stderr\\n'); "
+        "print('stdin=' + repr(sys.stdin.read())); "
+        "print(json.dumps(dict(os.environ), sort_keys=True))"
+    )
+    runner = JobRunner(tmp_path)
+
+    job = runner.start(
+        _test_action(tmp_path, code, environment=(("LANG", "runner-test"),))
+    )
+    result = _wait_for_terminal(runner, job.id)
+
+    assert result.status == "succeeded"
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    assert lines[:2] == ["stderr", "stdin=''"]
+    environment = json.loads(lines[-1])
+    assert environment == {"LANG": "runner-test", "PATH": SAFE_PATH}
+    assert "inherited-secret" not in result.output
+
+
+def test_runner_redacts_before_bounding_output_and_tracks_byte_offsets(tmp_path):
+    raw_output = "A" * 200 + " password=runner-secret " + "记" * 8
+    runner = JobRunner(tmp_path, output_limit=64)
+
+    started = runner.start(_test_action(tmp_path, f"print({raw_output!r})"))
+    result = _wait_for_terminal(runner, started.id)
+
+    assert result.status == "succeeded"
+    assert "runner-secret" not in result.output
+    assert "[REDACTED]" in result.output
+    assert len(result.output.encode("utf-8")) <= 64
+    assert result.output.encode("utf-8").decode("utf-8") == result.output
+    assert result.output_offset > len(result.output.encode("utf-8"))
+    assert result.truncated_before == (
+        result.output_offset - len(result.output.encode("utf-8"))
+    )
+
+    retained = runner.get(started.id, offset=result.truncated_before)
+    exhausted = runner.get(started.id, offset=result.output_offset)
+    truncated = runner.get(started.id, offset=0)
+    assert retained.output == result.output
+    assert retained.truncated_before == result.truncated_before
+    assert exhausted.output == ""
+    assert exhausted.truncated_before == result.output_offset
+    assert truncated.output == result.output
+    assert truncated.truncated_before == result.truncated_before
+
+
+def test_runner_accepts_explicit_argv_without_shell_interpretation(tmp_path):
+    marker = tmp_path / "must-not-exist"
+    argument = f"literal;touch {marker}"
+    runner = JobRunner(tmp_path)
+
+    job = runner.start(
+        [sys.executable, "-c", "import sys; print(sys.argv[1])", argument],
+        cwd=tmp_path,
+        timeout=5,
+    )
+    result = _wait_for_terminal(runner, job.id)
+
+    assert result.status == "succeeded"
+    assert result.output.strip() == argument
+    assert not marker.exists()
+
+
+def test_runner_times_out_quickly_and_sets_one_terminal_state(tmp_path):
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+    job = runner.start(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        cwd=tmp_path,
+        timeout=0.1,
+    )
+
+    result = _wait_for_terminal(runner, job.id)
+    time.sleep(0.05)
+
+    assert result.status == "timed_out"
+    assert runner.get(job.id).status == "timed_out"
+    assert result.started is not None
+    assert result.finished is not None
+    assert result.finished >= result.started
+
+
+def test_cancel_is_idempotent_and_terminates_a_running_job(tmp_path):
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+    job = runner.start(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        cwd=tmp_path,
+        timeout=5,
+    )
+
+    first = runner.cancel(job.id)
+    second = runner.cancel(job.id)
+    result = _wait_for_terminal(runner, job.id)
+
+    assert first.id == second.id == job.id
+    assert result.status == "cancelled"
+    assert runner.cancel(job.id).status == "cancelled"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+def test_cancel_terminates_the_entire_posix_process_group(tmp_path):
+    child_pid = tmp_path / "child.pid"
+    child_code = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(10)"
+    )
+    code = (
+        "import pathlib, subprocess, sys, time; "
+        f"p=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(p.pid)); "
+        "time.sleep(10)"
+    )
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+    job = runner.start([sys.executable, "-c", code], cwd=tmp_path, timeout=5)
+    deadline = time.monotonic() + 2
+    while not child_pid.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    pid = int(child_pid.read_text())
+
+    runner.cancel(job.id)
+    assert _wait_for_terminal(runner, job.id).status == "cancelled"
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists() and stat.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("child process group member survived cancellation")
+
+
+def test_runner_metadata_is_atomic_redacted_and_recovers_interrupted_jobs(tmp_path):
+    runner = JobRunner(tmp_path)
+    command_secret = "token=metadata-command-secret"
+    job = runner.start(
+        _test_action(
+            tmp_path,
+            f"print({command_secret!r})",
+            environment=(("LANG", "metadata-env-secret"),),
+        )
+    )
+    result = _wait_for_terminal(runner, job.id)
+    metadata_path = tmp_path / f"{job.id}.json"
+    metadata = metadata_path.read_text(encoding="utf-8")
+
+    assert result.status == "succeeded"
+    assert "metadata-command-secret" not in metadata
+    assert "metadata-env-secret" not in metadata
+    assert not list(tmp_path.glob("*.tmp"))
+
+    saved = json.loads(metadata)
+    saved["status"] = "running"
+    saved["finished"] = None
+    metadata_path.write_text(json.dumps(saved), encoding="utf-8")
+    recovered = JobRunner(tmp_path).get(job.id)
+    assert recovered.status == "failed"
+    assert recovered.exit_code is None
+    assert recovered.finished is not None
+    assert "interrupted" in recovered.error
+
+
+def test_runner_rejects_invalid_limits_offsets_environment_and_job_ids(tmp_path):
+    with pytest.raises(ValueError, match="output_limit"):
+        JobRunner(tmp_path, output_limit=0)
+    with pytest.raises(ValueError, match="output_limit"):
+        JobRunner(tmp_path, output_limit=20_000_000)
+
+    runner = JobRunner(tmp_path)
+    with pytest.raises(ValueError, match="environment"):
+        runner.start(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            timeout=1,
+            environment={"PYTHONPATH": "unsafe"},
+        )
+    with pytest.raises(KeyError, match="job not found"):
+        runner.get("../metadata")
+    with pytest.raises(KeyError, match="job not found"):
+        runner.cancel("../metadata")
+
+    result = _wait_for_terminal(
+        runner,
+        runner.start([sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout=1).id,
+    )
+    with pytest.raises(ValueError, match="offset"):
+        runner.get(result.id, offset=-1)
+    with pytest.raises(ValueError, match="offset"):
+        runner.get(result.id, offset=result.output_offset + 1)
 
 
 def test_ci_lints_backend_and_host_agent():

@@ -1,0 +1,601 @@
+"""Thread-safe bounded subprocess jobs for the host operations agent."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import threading
+import time
+import uuid
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .policy import ValidatedAction
+from .redaction import StreamingRedactor, redact_text
+
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+DEFAULT_OUTPUT_LIMIT = 64 * 1024
+MAX_OUTPUT_LIMIT = 16 * 1024 * 1024
+MAX_ERROR_BYTES = 512
+MAX_ARGUMENTS = 256
+MAX_ARGUMENT_BYTES = 64 * 1024
+TERMINAL_STATUSES = frozenset(
+    {"succeeded", "failed", "timed_out", "cancelled"}
+)
+_STATUSES = frozenset({"queued", "running", *TERMINAL_STATUSES})
+_ALLOWED_ENVIRONMENT = frozenset(
+    {
+        "COLORTERM",
+        "DEBIAN_FRONTEND",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PIP_DISABLE_PIP_VERSION_CHECK",
+        "TERM",
+        "TZ",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Job:
+    """Immutable public snapshot of a job."""
+
+    id: str
+    status: str
+    output: str
+    output_offset: int
+    truncated_before: int
+    exit_code: int | None
+    started: float | None
+    finished: float | None
+    error: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "job_id": self.id,
+            "status": self.status,
+            "output": self.output,
+            "output_offset": self.output_offset,
+            "truncated_before": self.truncated_before,
+            "exit_code": self.exit_code,
+            "started": self.started,
+            "finished": self.finished,
+            "error": self.error,
+        }
+
+
+@dataclass(slots=True)
+class _JobState:
+    id: str
+    status: str = "queued"
+    output: bytearray = field(default_factory=bytearray)
+    output_offset: int = 0
+    truncated_before: int = 0
+    exit_code: int | None = None
+    started: float | None = None
+    finished: float | None = None
+    error: str | None = None
+    process: subprocess.Popen[bytes] | None = None
+    cancel_requested: threading.Event = field(default_factory=threading.Event)
+
+
+class JobRunner:
+    """Run policy-bound commands and retain only bounded redacted output."""
+
+    def __init__(
+        self,
+        job_dir: str | os.PathLike[str],
+        *,
+        output_limit: int = DEFAULT_OUTPUT_LIMIT,
+        termination_grace: float = 5.0,
+    ) -> None:
+        if (
+            type(output_limit) is not int
+            or not 1 <= output_limit <= MAX_OUTPUT_LIMIT
+        ):
+            raise ValueError("invalid output_limit")
+        if (
+            isinstance(termination_grace, bool)
+            or not isinstance(termination_grace, (int, float))
+            or not 0 <= termination_grace <= 5
+        ):
+            raise ValueError("invalid termination_grace")
+        self.job_dir = Path(job_dir)
+        self.job_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            self.job_dir.chmod(0o700)
+        except OSError:
+            pass
+        self.output_limit = output_limit
+        self.termination_grace = float(termination_grace)
+        self._lock = threading.RLock()
+        self._jobs: dict[str, _JobState] = {}
+        self._load_jobs()
+
+    def start(
+        self,
+        invocation: ValidatedAction | Sequence[str],
+        *,
+        cwd: str | os.PathLike[str] | None = None,
+        timeout: int | float | None = None,
+        environment: Mapping[str, str] | Iterable[tuple[str, str]] = (),
+    ) -> Job:
+        """Queue a validated action or an explicit argv invocation."""
+
+        argv, resolved_cwd, resolved_timeout, resolved_environment = self._invocation(
+            invocation,
+            cwd=cwd,
+            timeout=timeout,
+            environment=environment,
+        )
+        job_id = str(uuid.uuid4())
+        state = _JobState(id=job_id)
+        with self._lock:
+            self._jobs[job_id] = state
+            try:
+                self._persist(state)
+            except Exception:
+                del self._jobs[job_id]
+                raise
+            snapshot = self._snapshot(state)
+
+        worker = threading.Thread(
+            target=self._run,
+            args=(state, argv, resolved_cwd, resolved_timeout, resolved_environment),
+            name=f"dgx-ops-job-{job_id}",
+            daemon=True,
+        )
+        worker.start()
+        return snapshot
+
+    def get(self, job_id: str, *, offset: int | None = None) -> Job:
+        """Return retained output at or after an absolute redacted byte offset."""
+
+        state = self._lookup(job_id)
+        with self._lock:
+            if offset is None:
+                requested = state.truncated_before
+            elif type(offset) is not int or not 0 <= offset <= state.output_offset:
+                raise ValueError("invalid offset")
+            else:
+                requested = max(offset, state.truncated_before)
+
+            index = requested - state.truncated_before
+            while index < len(state.output) and state.output[index] & 0xC0 == 0x80:
+                index += 1
+                requested += 1
+            output = bytes(state.output[index:]).decode("utf-8")
+            return self._snapshot(
+                state,
+                output=output,
+                truncated_before=requested,
+            )
+
+    def cancel(self, job_id: str) -> Job:
+        """Request cancellation once; repeated calls preserve the terminal result."""
+
+        state = self._lookup(job_id)
+        with self._lock:
+            if state.status in TERMINAL_STATUSES:
+                return self._snapshot(state)
+            process = state.process
+            if process is None or process.poll() is None:
+                state.cancel_requested.set()
+            return self._snapshot(state)
+
+    def _invocation(
+        self,
+        invocation: ValidatedAction | Sequence[str],
+        *,
+        cwd: str | os.PathLike[str] | None,
+        timeout: int | float | None,
+        environment: Mapping[str, str] | Iterable[tuple[str, str]],
+    ) -> tuple[tuple[str, ...], str | None, float, dict[str, str]]:
+        if isinstance(invocation, ValidatedAction):
+            if cwd is not None or timeout is not None or environment:
+                raise TypeError("validated action does not accept invocation overrides")
+            argv = invocation.argv
+            resolved_cwd = invocation.cwd
+            resolved_timeout: int | float = invocation.timeout
+            environment_items: Mapping[str, str] | Iterable[tuple[str, str]] = (
+                invocation.environment
+            )
+        else:
+            argv = self._validate_argv(invocation)
+            resolved_cwd = None if cwd is None else os.fspath(cwd)
+            resolved_timeout = timeout if timeout is not None else 30
+            environment_items = environment
+
+        argv = self._validate_argv(argv)
+        if (
+            isinstance(resolved_timeout, bool)
+            or not isinstance(resolved_timeout, (int, float))
+            or not 0 < resolved_timeout <= 3_600
+        ):
+            raise ValueError("invalid timeout")
+        if resolved_cwd is not None and (
+            not isinstance(resolved_cwd, str) or not resolved_cwd or "\x00" in resolved_cwd
+        ):
+            raise ValueError("invalid cwd")
+        return (
+            argv,
+            resolved_cwd,
+            float(resolved_timeout),
+            safe_environment(environment_items),
+        )
+
+    @staticmethod
+    def _validate_argv(invocation: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(invocation, (str, bytes)) or not isinstance(invocation, Sequence):
+            raise ValueError("invalid argv")
+        argv = tuple(invocation)
+        if not argv or len(argv) > MAX_ARGUMENTS:
+            raise ValueError("invalid argv")
+        if any(not isinstance(item, str) or not item or "\x00" in item for item in argv):
+            raise ValueError("invalid argv")
+        if sum(len(item.encode("utf-8")) for item in argv) > MAX_ARGUMENT_BYTES:
+            raise ValueError("invalid argv")
+        return argv
+
+    def _run(
+        self,
+        state: _JobState,
+        argv: tuple[str, ...],
+        cwd: str | None,
+        timeout: float,
+        environment: dict[str, str],
+    ) -> None:
+        with self._lock:
+            if state.cancel_requested.is_set():
+                self._finish(state, "cancelled", None)
+                return
+            state.status = "running"
+            state.started = time.time()
+            self._persist(state)
+
+        popen_options: dict[str, Any] = {
+            "cwd": cwd,
+            "env": environment,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": False,
+            "shell": False,
+        }
+        if os.name == "posix":
+            popen_options["start_new_session"] = True
+        try:
+            process = subprocess.Popen(argv, **popen_options)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            with self._lock:
+                self._finish(state, "failed", None, error=self._bounded_error(exc))
+            return
+
+        with self._lock:
+            state.process = process
+
+        redactor = StreamingRedactor()
+        reader_error: list[Exception] = []
+        reader = threading.Thread(
+            target=self._read_output,
+            args=(state, process, redactor, reader_error),
+            name=f"dgx-ops-output-{state.id}",
+            daemon=True,
+        )
+        reader.start()
+
+        deadline = time.monotonic() + timeout
+        outcome: str | None = None
+        while process.poll() is None:
+            if state.cancel_requested.wait(timeout=0.01):
+                outcome = "cancelled"
+                self._terminate(process)
+                break
+            if time.monotonic() >= deadline:
+                outcome = "timed_out"
+                self._terminate(process)
+                break
+        try:
+            exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
+        except subprocess.TimeoutExpired:
+            self._kill(process)
+            exit_code = process.wait()
+
+        reader.join(timeout=max(self.termination_grace, 1.0))
+        if reader.is_alive() and process.stdout is not None:
+            process.stdout.close()
+            reader.join(timeout=1.0)
+
+        if outcome is None:
+            outcome = "succeeded" if exit_code == 0 else "failed"
+        error = self._bounded_error(reader_error[0]) if reader_error else None
+        if error is not None and outcome == "succeeded":
+            outcome = "failed"
+        with self._lock:
+            self._finish(state, outcome, exit_code, error=error)
+
+    def _read_output(
+        self,
+        state: _JobState,
+        process: subprocess.Popen[bytes],
+        redactor: StreamingRedactor,
+        errors: list[Exception],
+    ) -> None:
+        assert process.stdout is not None
+        try:
+            while True:
+                chunk = process.stdout.read(4096)
+                if not chunk:
+                    break
+                self._append_output(state, redactor.feed(chunk))
+            self._append_output(state, redactor.finish())
+        except (OSError, ValueError, RuntimeError) as exc:
+            errors.append(exc)
+
+    def _append_output(self, state: _JobState, value: bytes) -> None:
+        if not value:
+            return
+        with self._lock:
+            state.output.extend(value)
+            state.output_offset += len(value)
+            remove = max(0, len(state.output) - self.output_limit)
+            while remove < len(state.output) and state.output[remove] & 0xC0 == 0x80:
+                remove += 1
+            if remove:
+                del state.output[:remove]
+            state.truncated_before = state.output_offset - len(state.output)
+            self._persist(state)
+
+    def _terminate(self, process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        deadline = time.monotonic() + self.termination_grace
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+
+        if os.name == "posix":
+            while self._process_group_exists(process.pid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if self._process_group_exists(process.pid):
+                self._kill(process)
+        elif process.poll() is None:
+            self._kill(process)
+
+    @staticmethod
+    def _kill(process: subprocess.Popen[bytes]) -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            elif process.poll() is None:
+                process.kill()
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def _process_group_exists(process_group: int) -> bool:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _finish(
+        self,
+        state: _JobState,
+        status: str,
+        exit_code: int | None,
+        *,
+        error: str | None = None,
+    ) -> None:
+        if state.status in TERMINAL_STATUSES:
+            return
+        state.status = status
+        state.exit_code = exit_code
+        state.finished = time.time()
+        state.error = error
+        state.process = None
+        self._persist(state)
+
+    def _lookup(self, job_id: str) -> _JobState:
+        if not _valid_job_id(job_id):
+            raise KeyError("job not found")
+        with self._lock:
+            try:
+                return self._jobs[job_id]
+            except KeyError:
+                raise KeyError("job not found") from None
+
+    def _snapshot(
+        self,
+        state: _JobState,
+        *,
+        output: str | None = None,
+        truncated_before: int | None = None,
+    ) -> Job:
+        return Job(
+            id=state.id,
+            status=state.status,
+            output=(
+                bytes(state.output).decode("utf-8") if output is None else output
+            ),
+            output_offset=state.output_offset,
+            truncated_before=(
+                state.truncated_before
+                if truncated_before is None
+                else truncated_before
+            ),
+            exit_code=state.exit_code,
+            started=state.started,
+            finished=state.finished,
+            error=state.error,
+        )
+
+    def _persist(self, state: _JobState) -> None:
+        metadata = self._snapshot(state).as_dict()
+        target = self.job_dir / f"{state.id}.json"
+        temporary = self.job_dir / f".{state.id}.{uuid.uuid4().hex}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, ensure_ascii=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _load_jobs(self) -> None:
+        for path in self.job_dir.glob("*.json"):
+            job_id = path.stem
+            if not _valid_job_id(job_id):
+                continue
+            try:
+                if path.stat().st_size > self.output_limit * 4 + 4096:
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+                state = self._state_from_metadata(job_id, data)
+            except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            self._jobs[job_id] = state
+            if state.status not in TERMINAL_STATUSES:
+                state.status = "failed"
+                state.exit_code = None
+                state.finished = time.time()
+                state.error = "interrupted by agent restart"
+                self._persist(state)
+
+    def _state_from_metadata(self, job_id: str, data: Any) -> _JobState:
+        if type(data) is not dict or data.get("job_id") != job_id:
+            raise ValueError("invalid job metadata")
+        status = data.get("status")
+        output = data.get("output")
+        output_offset = data.get("output_offset")
+        truncated_before = data.get("truncated_before")
+        if (
+            status not in _STATUSES
+            or not isinstance(output, str)
+            or type(output_offset) is not int
+            or type(truncated_before) is not int
+        ):
+            raise ValueError("invalid job metadata")
+        encoded = output.encode("utf-8")
+        if (
+            len(encoded) > self.output_limit
+            or truncated_before < 0
+            or output_offset != truncated_before + len(encoded)
+        ):
+            raise ValueError("invalid job metadata")
+
+        exit_code = data.get("exit_code")
+        started = data.get("started")
+        finished = data.get("finished")
+        error = data.get("error")
+        if exit_code is not None and type(exit_code) is not int:
+            raise ValueError("invalid job metadata")
+        if started is not None and not isinstance(started, (int, float)):
+            raise ValueError("invalid job metadata")
+        if finished is not None and not isinstance(finished, (int, float)):
+            raise ValueError("invalid job metadata")
+        if error is not None and (
+            not isinstance(error, str) or len(error.encode("utf-8")) > MAX_ERROR_BYTES
+        ):
+            raise ValueError("invalid job metadata")
+        return _JobState(
+            id=job_id,
+            status=status,
+            output=bytearray(encoded),
+            output_offset=output_offset,
+            truncated_before=truncated_before,
+            exit_code=exit_code,
+            started=None if started is None else float(started),
+            finished=None if finished is None else float(finished),
+            error=error,
+        )
+
+    @staticmethod
+    def _bounded_error(exc: Exception) -> str:
+        value = redact_text(f"{type(exc).__name__}: {exc}")
+        encoded = value.encode("utf-8")
+        if len(encoded) <= MAX_ERROR_BYTES:
+            return value
+        encoded = encoded[:MAX_ERROR_BYTES]
+        while encoded and encoded[-1] & 0xC0 == 0x80:
+            encoded = encoded[:-1]
+        return encoded.decode("utf-8", errors="ignore")
+
+
+def safe_environment(
+    environment: Mapping[str, str] | Iterable[tuple[str, str]],
+) -> dict[str, str]:
+    """Build a deterministic environment without inheriting process secrets."""
+
+    try:
+        items = environment.items() if isinstance(environment, Mapping) else environment
+        values = list(items)
+    except (TypeError, ValueError, AttributeError):
+        raise ValueError("invalid environment") from None
+    if len(values) > 16:
+        raise ValueError("invalid environment")
+    clean = {"PATH": SAFE_PATH}
+    for item in values:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("invalid environment")
+        key, value = item
+        if (
+            not isinstance(key, str)
+            or key not in _ALLOWED_ENVIRONMENT
+            or not isinstance(value, str)
+            or len(value) > 256
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
+        ):
+            raise ValueError("invalid environment")
+        clean[key] = value
+    return clean
+
+
+def _valid_job_id(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except (ValueError, AttributeError):
+        return False
+
+
+__all__ = [
+    "DEFAULT_OUTPUT_LIMIT",
+    "Job",
+    "JobRunner",
+    "MAX_OUTPUT_LIMIT",
+    "SAFE_PATH",
+    "TERMINAL_STATUSES",
+    "safe_environment",
+]
