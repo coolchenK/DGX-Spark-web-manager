@@ -3,15 +3,19 @@ import hmac
 import io
 import json
 import struct
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
+from host_agent.dgx_ops_agent import protocol as protocol_module
 from host_agent.dgx_ops_agent.protocol import (
     MAX_FRAME_SIZE,
     PROTOCOL_VERSION,
     NonceCache,
     ProtocolError,
+    _read_exact,
     canonical_bytes,
     encode_frame,
     new_request,
@@ -22,6 +26,7 @@ from host_agent.dgx_ops_agent.protocol import (
 )
 
 SECRET = b"x" * 32
+REPOSITORY_ROOT = Path(__file__).parents[2]
 
 
 def _signed_request(**changes):
@@ -213,6 +218,15 @@ def test_invalid_signature_does_not_consume_nonce():
     assert verify_message(valid, SECRET, now=1001, nonces=cache)["nonce"] == "nonce-1"
 
 
+@pytest.mark.parametrize("signature", ["\u8bb0", "\ud800", "0" * 63, "g" * 64])
+def test_malformed_signature_is_rejected_without_native_compare_errors(signature):
+    message = _signed_request()
+    message["signature"] = signature
+
+    with pytest.raises(ProtocolError, match="^invalid signature$"):
+        verify_message(message, SECRET, now=1001, nonces=NonceCache())
+
+
 def test_invalid_timestamp_cannot_bypass_validation_or_consume_nonce():
     cache = NonceCache()
     invalid = _signed_request(timestamp=True)
@@ -332,6 +346,60 @@ def test_frame_reader_handles_short_reads():
     assert read_frame(_ChunkedReader(frame)) == {"status": "ok"}
 
 
+class _SingleByteReader:
+    def __init__(self, length):
+        self.length = length
+        self.calls = 0
+        self.first_requested = None
+        self.last_requested = None
+
+    def read(self, size):
+        self.calls += 1
+        if self.first_requested is None:
+            self.first_requested = size
+        self.last_requested = size
+        if self.calls <= self.length:
+            return b"x"
+        return b""
+
+
+def test_read_exact_bounds_memory_for_one_byte_fragments():
+    reader = _SingleByteReader(MAX_FRAME_SIZE)
+
+    tracemalloc.start()
+    try:
+        result = _read_exact(reader, MAX_FRAME_SIZE)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result == b"x" * MAX_FRAME_SIZE
+    assert reader.calls == MAX_FRAME_SIZE
+    assert reader.first_requested == MAX_FRAME_SIZE
+    assert reader.last_requested == 1
+    assert peak < MAX_FRAME_SIZE * 8
+
+
+class _OverReturningReader:
+    def __init__(self):
+        self.calls = 0
+
+    def read(self, size):
+        self.calls += 1
+        if self.calls == 1:
+            return b"x" * (size + 1)
+        return b""
+
+
+def test_read_exact_rejects_reader_returning_more_than_requested():
+    reader = _OverReturningReader()
+
+    with pytest.raises(ProtocolError, match="frame read failed"):
+        _read_exact(reader, 4)
+
+    assert reader.calls == 1
+
+
 @pytest.mark.parametrize(
     "data",
     [
@@ -358,3 +426,96 @@ def test_frame_reader_rejects_non_object_or_invalid_json(body):
 
     with pytest.raises(ProtocolError, match="frame"):
         read_frame(io.BytesIO(frame))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"value":' + b"1" * 5000 + b"}",
+        b'{"x":' * 5000 + b"null" + b"}" * 5000,
+    ],
+    ids=["5000-digit-integer", "5000-level-object"],
+)
+def test_frame_reader_normalizes_excessive_json_complexity(body):
+    frame = struct.pack(">I", len(body)) + body
+
+    with pytest.raises(ProtocolError, match="^invalid frame JSON$") as exc_info:
+        read_frame(io.BytesIO(frame))
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"value":NaN}',
+        b'{"value":Infinity}',
+        b'{"value":-Infinity}',
+        b'{"value":1,"value":2}',
+        b'{"outer":{"value":1,"value":2}}',
+    ],
+)
+def test_frame_reader_rejects_nonstandard_constants_and_duplicate_keys(body):
+    frame = struct.pack(">I", len(body)) + body
+
+    with pytest.raises(ProtocolError, match="^invalid frame JSON$") as exc_info:
+        read_frame(io.BytesIO(frame))
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_outbound_json_rejects_nonstandard_constants(value):
+    with pytest.raises(ProtocolError, match="^invalid frame JSON$") as frame_error:
+        encode_frame({"value": value})
+    assert frame_error.value.__cause__ is None
+
+    with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
+        canonical_bytes({"value": value})
+    assert canonical_error.value.__cause__ is None
+
+
+def test_outbound_json_normalizes_excessive_nesting():
+    value = None
+    for _ in range(5000):
+        value = {"value": value}
+
+    with pytest.raises(ProtocolError, match="^invalid frame JSON$") as frame_error:
+        encode_frame(value)
+    assert frame_error.value.__cause__ is None
+
+    with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
+        canonical_bytes(value)
+    assert canonical_error.value.__cause__ is None
+
+
+@pytest.mark.parametrize("operation", [canonical_bytes, encode_frame])
+@pytest.mark.parametrize("error_type", [MemoryError, KeyboardInterrupt])
+def test_json_serialization_does_not_swallow_process_exceptions(
+    monkeypatch, operation, error_type
+):
+    def raise_error(*_args, **_kwargs):
+        raise error_type
+
+    monkeypatch.setattr(protocol_module.json, "dumps", raise_error)
+
+    with pytest.raises(error_type):
+        operation({})
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, KeyboardInterrupt])
+def test_json_parsing_does_not_swallow_process_exceptions(monkeypatch, error_type):
+    def raise_error(*_args, **_kwargs):
+        raise error_type
+
+    monkeypatch.setattr(protocol_module.json, "loads", raise_error)
+    frame = encode_frame({})
+
+    with pytest.raises(error_type):
+        read_frame(io.BytesIO(frame))
+
+
+def test_ci_lints_backend_and_host_agent():
+    workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ruff check backend host_agent" in workflow

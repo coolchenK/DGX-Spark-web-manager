@@ -22,7 +22,7 @@ jobs:
         env:
           DGX_SECRET_KEY: ci-secret-key-with-at-least-32-characters
           DGX_ADMIN_PASSWORD: CI-password-123456
-      - run: ruff check backend/app backend/tests
+      - run: ruff check backend host_agent
 
   frontend:
     runs-on: ubuntu-latest

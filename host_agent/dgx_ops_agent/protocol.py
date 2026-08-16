@@ -22,6 +22,8 @@ _MAX_NONCE_LENGTH = 256
 _MAX_TIMESTAMP = (1 << 63) - 1
 _MAX_AGE = 24 * 60 * 60
 _DEFAULT_NONCE_CAPACITY = 4096
+_SIGNATURE_LENGTH = hashlib.sha256().digest_size * 2
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _REQUIRED_REQUEST_FIELDS = frozenset(
     {
         "protocol_version",
@@ -77,8 +79,8 @@ def canonical_bytes(message: dict[str, Any]) -> bytes:
             ensure_ascii=True,
             allow_nan=False,
         )
-    except (TypeError, ValueError) as exc:
-        raise ProtocolError("message is not valid JSON") from exc
+    except (TypeError, ValueError, RecursionError):
+        raise ProtocolError("message is not valid JSON") from None
     return encoded.encode("ascii")
 
 
@@ -126,6 +128,15 @@ def sign_message(message: dict[str, Any], secret: bytes) -> dict[str, Any]:
     result = dict(message)
     result["signature"] = hmac.new(secret, canonical_bytes(result), hashlib.sha256).hexdigest()
     return result
+
+
+def _is_valid_signature(signature: Any) -> bool:
+    return (
+        isinstance(signature, str)
+        and len(signature) == _SIGNATURE_LENGTH
+        and signature.isascii()
+        and all(character in _HEX_DIGITS for character in signature)
+    )
 
 
 def _validate_request_schema(message: dict[str, Any]) -> None:
@@ -195,11 +206,13 @@ def verify_message(
         raise ProtocolError("invalid signature")
 
     signature = message.get("signature")
+    if not _is_valid_signature(signature):
+        raise ProtocolError("invalid signature")
     try:
         expected = hmac.new(secret, canonical_bytes(message), hashlib.sha256).hexdigest()
     except ProtocolError as exc:
         raise ProtocolError("invalid signature") from exc
-    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+    if not hmac.compare_digest(signature, expected):
         raise ProtocolError("invalid signature")
 
     _validate_request_schema(message)
@@ -228,8 +241,8 @@ def _json_payload(message: dict[str, Any]) -> bytes:
             ensure_ascii=True,
             allow_nan=False,
         ).encode("ascii")
-    except (TypeError, ValueError) as exc:
-        raise ProtocolError("invalid frame JSON") from exc
+    except (TypeError, ValueError, RecursionError):
+        raise ProtocolError("invalid frame JSON") from None
     if len(payload) > MAX_FRAME_SIZE:
         raise ProtocolError("frame too large")
     return payload
@@ -255,15 +268,32 @@ def _read_chunk(reader: BinaryIO, size: int) -> bytes:
 
 
 def _read_exact(reader: BinaryIO, size: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = size
-    while remaining:
+    buffer = bytearray(size)
+    view = memoryview(buffer)
+    offset = 0
+    while offset < size:
+        remaining = size - offset
         chunk = _read_chunk(reader, remaining)
         if not chunk:
             raise ProtocolError("unexpected EOF while reading frame")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+        if len(chunk) > remaining:
+            raise ProtocolError("frame read failed")
+        view[offset : offset + len(chunk)] = chunk
+        offset += len(chunk)
+    return bytes(buffer)
+
+
+def _reject_json_constant(_value: str) -> Any:
+    raise ValueError("nonstandard JSON constant")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 def read_frame(reader: BinaryIO) -> dict[str, Any]:
@@ -277,9 +307,13 @@ def read_frame(reader: BinaryIO) -> dict[str, Any]:
 
     payload = _read_exact(reader, length)
     try:
-        message = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ProtocolError("invalid frame JSON") from exc
+        message = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise ProtocolError("invalid frame JSON") from None
     if not isinstance(message, dict):
         raise ProtocolError("frame must contain a JSON object")
     return message
