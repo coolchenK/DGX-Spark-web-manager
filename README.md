@@ -15,9 +15,14 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Validated SGLang and vLLM deployment adapters with image and argument allowlists.
 - Deployment preview, edit, clone, health-gated replacement, automatic rollback, and retained task history.
 - Context, concurrency, batch-token, memory, quantization, route alias, and remote-code controls.
+- Model-card and device-aware deployment recommendations with per-field source, confidence, and
+  warnings; optional bounded AI fallback for unresolved fields.
+- Optional compatible/reviewed Draft Model selection with runtime-specific speculative settings and
+  combined base-plus-Draft resource checks.
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
 - Hashed gateway API keys, encrypted provider/Hugging Face secrets, administrator sessions, CSRF protection, and audit history.
-- Third-party OpenAI-compatible providers for diagnosis. AI plans require human approval and can only invoke enumerated operations.
+- Third-party OpenAI-compatible providers for bounded deployment recommendations and diagnosis. AI
+  plans require human approval and can only invoke enumerated operations.
 - Responsive Ant Design interface with desktop/mobile layouts and light/dark/system themes.
 
 ## DGX Spark Installation
@@ -80,6 +85,40 @@ Do not expose port 3000 to the public internet without TLS and an authenticated 
 ## Existing Services
 
 On startup the manager scans Docker without restarting or recreating existing containers. Discovered SGLang/vLLM services are registered as unmanaged deployments. They can be observed and controlled, but the manager refuses to delete them. Only containers created by this project carry the `com.dgx-spark-manager.managed=true` label and can be removed from the panel.
+
+## Administrator Workflow
+
+1. In **Settings**, optionally store a Hugging Face token for gated repositories. In **Hugging
+   Face**, search for a model and inspect its repository metadata. DGX Spark compatibility ranking
+   puts NVFP4 candidates first, but remains discovery guidance rather than a deployment guarantee.
+2. Start a download and follow its persistent task. Pause, resume, cancellation, and restart recovery
+   reuse the Hugging Face cache. After inventory refresh marks the asset available, open
+   **Deployments** and create a deployment.
+3. Select the base model, vLLM or SGLang runtime, and an allowlisted image. The panel reads model-card
+   and local configuration evidence, probes/caches image capabilities by digest, applies DGX Spark
+   resource rules, and shows the source, confidence, reason, and warning for each suggested field.
+4. When the model card does not resolve all supported fields, optionally select a tested provider
+   from **Online AI Service** and refresh AI analysis. Provider output can fill only bounded allowlisted
+   fields. Review every suggestion and edit it as needed; AI output is never applied as an
+   unreviewed deployment action.
+5. Optionally select a listed Draft Model. `review` candidates require explicit acknowledgement;
+   incompatible candidates are not deployable. vLLM exposes `num_speculative_tokens`, while SGLang
+   exposes its three grouped tuning values. The panel includes Draft weights in its resource view.
+6. Review the normalized spec, generated runtime command, mounts, current capability snapshot,
+   memory estimate, provenance, and warnings. Resource warnings and review candidates require
+   explicit acknowledgement. Submit only from the current preview; any form change invalidates it.
+7. Follow the queued task through runtime health checks. The same panel then provides start, stop,
+   restart, edit, clone, rollback-aware replacement, logs, task history, audit history, and gateway
+   metrics for managed models. Discovered external containers remain protected from manager delete.
+8. Under **API Gateway**, create a gateway key and record it at creation time; only its hash is stored.
+   Call `GET /v1/models` to obtain the healthy route names, then use the selected name with an
+   OpenAI-compatible client. Saved generation defaults fill only omitted, runtime-supported request
+   fields, so callers can override them explicitly.
+
+Third-party AI providers are configured with an OpenAI-compatible base URL, API key, default model,
+timeout, and optional headers. Test a provider before using it for recommendations or diagnostics.
+Diagnostic plans and executable operations remain separate: AI plans require administrator approval,
+and the executor accepts only its fixed operation enum.
 
 ## OpenAI API
 
@@ -160,6 +199,14 @@ The Vite dev server proxies `/api` and `/v1` to `127.0.0.1:3000`.
 - Model paths must remain inside configured roots. Deployment images and runtime arguments are allowlisted.
 - AI responses never become shell commands. The executor accepts only start, stop, restart, and inventory rescan operations.
 - Authorization headers, API keys, and Hugging Face tokens are redacted from diagnostic context and logs.
+- Model cards are untrusted data. Recommendation requests redact credentials and paths, bound all
+  context, accept only requested typed fields, and still require administrator review plus server
+  preflight.
+- `trust_remote_code` executes repository-supplied Python inside the inference container. Leave it
+  disabled unless the pinned model revision has been reviewed.
+- Gateway keys and provider/Hugging Face tokens are different credentials. Do not place their raw
+  values in model cards, AI prompts, deployment names, logs, screenshots, or support transcripts.
+  Revoke a gateway key if its one-time value is lost or exposed.
 
 ## Documentation
 

@@ -38,6 +38,10 @@ directly on the Spark. No x86 emulation is required.
 Only the two verified adapters are offered in the deployment wizard. Upstream availability alone
 is not treated as DGX Spark compatibility evidence.
 
+The current allowlist defaults include `vllm/vllm-openai:v0.27.1` and
+`sglang-inkling:specforge` (plus `lmsysorg/sglang:dev-cu13-inkling-dspark`). An image must be locally
+available, ARM64/CUDA compatible, and present in the relevant configured allowlist before preview.
+
 ## Runtime Policy
 
 Managed deployments accept only the images listed in `DGX_ALLOWED_VLLM_IMAGES` and
@@ -46,6 +50,59 @@ tested ARM64/CUDA image to the appropriate comma-separated setting before using 
 
 Unmanaged inference containers are read-only imports. The manager can display, probe, and route to
 them, but removal is restricted to containers carrying the manager ownership label.
+
+## Capability Probes and Fallback
+
+The manager keys runtime capability results by the local image digest. It runs a temporary container
+with networking disabled and no volumes:
+
+- vLLM: `vllm serve --help=speculative_config`
+- SGLang: `python3 -m sglang.launch_server --help`
+
+Recognized help output determines speculative transport, supported methods, and method mappings.
+The probe has bounded logs and a timeout, and its container is removed. If the probe fails, the
+manager returns a conservative per-runtime manifest with `source="manifest"` and warnings. The
+administrator must review those warnings; preview and deployment still enforce the resulting
+capability snapshot and runtime adapter rules.
+
+Quantization choices are restricted to the selected image's returned `quantization_methods`.
+Model-card or local values not in that list are clamped to `auto` with a warning. The canonical
+`nvfp4` evidence value maps to `modelopt_fp4` when the runtime exposes that mapping. Hugging Face
+search ranks NVFP4 models first, but search rank is not proof that a particular repository/image
+combination will pass capability and resource preflight.
+
+## Speculative and Draft Model Support
+
+Both runtimes accept the public methods `draft_model`, `eagle`, `eagle3`, and `mtp` only when the
+selected image capability snapshot includes the method. Transport and tuning differ:
+
+| Runtime | Transport | Tuning accepted by the adapter |
+| --- | --- | --- |
+| vLLM | One JSON value passed to `--speculative-config` | Optional `num_speculative_tokens` (1-64); SGLang grouped fields are rejected |
+| SGLang | `--speculative-algorithm` and `--speculative-draft-model-path` flags | `num_steps` (1-32), `eagle_top_k` (1-32), and `num_draft_tokens` (1-256), set together or all omitted; `num_speculative_tokens` is rejected |
+
+Method mappings are resolved from the capability snapshot. The SGLang adapter maps `draft_model` to
+`STANDALONE`, `eagle` to `EAGLE`, `eagle3` to `EAGLE3`, and `mtp` to `NEXTN`; a missing or mismatched
+mapping fails preview.
+
+Draft candidates must be separate available local assets with readable evidence and paths. Explicit
+target pairing, supported method, tokenizer fingerprints for ordinary draft models, and combined
+base-plus-Draft memory determine `compatible`, `review`, or `incompatible`. A `review` candidate
+requires explicit acknowledgement. An incompatible candidate, a blocked resource estimate, or an
+unverifiable final preflight cannot be deployed.
+
+## Model-Card Recommendations
+
+The manager reads bounded deployment flags from model-card shell examples, generation values from
+model-card JSON and local `generation_config.json`, architectural limits from `config.json`, and
+Draft metadata/tokenizer evidence. The deterministic order is model card, local config, runtime
+default, then device rules and clamps.
+
+If deployment or generation fields remain unresolved, a configured, enabled third-party
+OpenAI-compatible provider whose latest test is not failed can analyze the bounded model-card/device
+context. AI output is limited to requested allowlisted fields and remains a medium-confidence
+suggestion. Invalid output degrades the recommendation to `partial`; it never bypasses capability,
+compatibility, memory, preview, or human-review requirements.
 
 ## Model Layout
 
@@ -59,4 +116,6 @@ them, but removal is restricted to containers carrying the manager ownership lab
 - Embeddings are exposed only when the selected upstream runtime implements the endpoint.
 - GPU memory usage can be unavailable on GB10 because `nvidia-smi` reports unified memory as `N/A`.
   The dashboard still shows system unified memory from the host.
+- Runtime capability probes can fall back to a conservative manifest. Read the returned warnings and
+  perform a preview before deploying a newly added image.
 - HTTPS termination is not bundled. Use a trusted reverse proxy and set `DGX_COOKIE_SECURE=true`.
