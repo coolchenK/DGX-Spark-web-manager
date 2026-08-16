@@ -204,7 +204,7 @@ function recommendationFixture(
   }
 }
 
-function previewFixture() {
+function previewFixture(overrides: Record<string, unknown> = {}) {
   return {
     runtime: 'vllm',
     image: 'vllm/vllm-openai:v0.27.1',
@@ -228,6 +228,19 @@ function previewFixture() {
     operations: ['创建受管理容器', '检查 /v1/models 并注册网关路由'],
     api_example: 'client.chat.completions.create(model="qwen-test")',
     rollback: '失败时删除新容器并保留模型文件',
+    spec: {
+      context_length: 16_384,
+      memory_fraction: 0.72,
+      max_concurrency: 4,
+      max_batched_tokens: 8192,
+      quantization: 'modelopt_fp4',
+      speculative: null,
+    },
+    speculative: null,
+    draft_candidate: null,
+    runtime_capabilities: recommendationFixture().runtime_capabilities,
+    warnings: [],
+    ...overrides,
   }
 }
 
@@ -313,6 +326,11 @@ interface ApiFixtureOptions {
     path: string,
     body: Record<string, unknown>,
   ) => Promise<DeploymentRecommendation>
+  previews?: (
+    path: string,
+    body: Record<string, unknown>,
+    options: RequestInit,
+  ) => Promise<ReturnType<typeof previewFixture>>
 }
 
 function renderDeploymentsPage(options: ApiFixtureOptions = {}) {
@@ -327,6 +345,7 @@ function renderDeploymentsPage(options: ApiFixtureOptions = {}) {
   const postSpy = vi.spyOn(api, 'post').mockImplementation(async <T,>(
     path: string,
     body?: unknown,
+    requestOptions: RequestInit = {},
   ): Promise<T> => {
     if (path.startsWith('/api/deployments/recommendations')) {
       const recommendation = options.recommendations
@@ -342,7 +361,11 @@ function renderDeploymentsPage(options: ApiFixtureOptions = {}) {
           })
       return recommendation as T
     }
-    if (path.startsWith('/api/deployments/preview')) return previewFixture() as T
+    if (path.startsWith('/api/deployments/preview')) {
+      return (options.previews
+        ? await options.previews(path, body as Record<string, unknown>, requestOptions)
+        : previewFixture()) as T
+    }
     if (path === '/api/deployments') return task as T
     if (/\/api\/deployments\/[^/]+\/(start|stop|restart|delete)$/.test(path)) return task as T
     throw new Error(`Unexpected POST ${path}`)
@@ -679,5 +702,476 @@ describe('DeploymentsPage assisted deployment wizard', () => {
       },
       resource_warning_acknowledged: false,
     })
+  })
+
+  it('submits only vLLM speculative token tuning and defaults it to five', async () => {
+    const { user, postSpy } = renderDeploymentsPage()
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+
+    expect(screen.getByLabelText('每轮推测 Token')).toHaveValue('5')
+    expect(screen.queryByLabelText('推测步数')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await screen.findByRole('heading', { name: '部署预览' })
+
+    const payload = postSpy.mock.calls.find(([path]) => String(path).startsWith('/api/deployments/preview'))?.[1] as Record<string, unknown>
+    expect(payload.speculative).toEqual({
+      draft_model_id: 'draft-compatible',
+      method: 'eagle3',
+      num_speculative_tokens: 5,
+      manual_review_acknowledged: false,
+    })
+  })
+
+  it('submits only the complete SGLang grouped speculative tuning fields', async () => {
+    const { user, postSpy } = renderDeploymentsPage()
+    await openCreateAndSelectModel(user)
+    await user.click(screen.getByText('SGLang'))
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+    await user.click(screen.getByText('推测解码高级参数'))
+    await user.type(screen.getByLabelText('推测步数'), '3')
+    await user.type(screen.getByLabelText('EAGLE Top K'), '4')
+    await user.type(screen.getByLabelText('Draft Token 数'), '8')
+    expect(screen.queryByLabelText('每轮推测 Token')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await screen.findByRole('heading', { name: '部署预览' })
+
+    const payload = postSpy.mock.calls.find(([path]) => String(path).startsWith('/api/deployments/preview'))?.[1] as Record<string, unknown>
+    expect(payload.speculative).toEqual({
+      draft_model_id: 'draft-compatible',
+      method: 'eagle3',
+      num_steps: 3,
+      eagle_top_k: 4,
+      num_draft_tokens: 8,
+      manual_review_acknowledged: false,
+    })
+  })
+
+  it('rejects a partial SGLang grouped tuning set before preview', async () => {
+    const { user, postSpy } = renderDeploymentsPage()
+    await openCreateAndSelectModel(user)
+    await user.click(screen.getByText('SGLang'))
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+    await user.click(screen.getByText('推测解码高级参数'))
+    await user.type(screen.getByLabelText('推测步数'), '3')
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+
+    expect(await screen.findByText('SGLang 的三个推测解码参数必须全部填写或全部留空')).toBeInTheDocument()
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
+  })
+
+  it('uses the runtime capability quantization list without implicitly adding auto', async () => {
+    const recommendation = recommendationFixture({
+      runtime_capabilities: {
+        ...recommendationFixture().runtime_capabilities,
+        quantization_methods: ['modelopt_fp4'],
+      },
+    })
+    const { user } = renderDeploymentsPage({ recommendations: async () => recommendation })
+    await openCreateAndSelectModel(user)
+    await goToRecommendationStep(user)
+    await screen.findByDisplayValue('16384')
+    await user.click(screen.getByLabelText('量化加载方式'))
+
+    expect(screen.getByRole('option', { name: 'NVFP4 / ModelOpt FP4' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'auto' })).not.toBeInTheDocument()
+  })
+
+  it('validates recommendation numeric fields without advancing or issuing preview', async () => {
+    const { user, postSpy } = renderDeploymentsPage()
+    await openCreateAndSelectModel(user)
+    await goToRecommendationStep(user)
+    const context = await screen.findByLabelText('上下文长度')
+    await user.clear(context)
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+
+    expect(screen.getByRole('heading', { name: '推荐配置' })).toBeInTheDocument()
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
+  })
+
+  it('aborts and ignores an in-flight preview when draft form state changes', async () => {
+    let resolvePreview: ((value: ReturnType<typeof previewFixture>) => void) | undefined
+    const previewSignal: { current: AbortSignal | null } = { current: null }
+    let previewCalls = 0
+    const pendingPreview = new Promise<ReturnType<typeof previewFixture>>((resolve) => { resolvePreview = resolve })
+    const { user } = renderDeploymentsPage({
+      previews: async (_path, _body, options) => {
+        previewCalls += 1
+        previewSignal.current = options.signal as AbortSignal
+        if (previewCalls === 1) return pendingPreview
+        return previewFixture()
+      },
+    })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await waitFor(() => expect(previewCalls).toBe(1))
+    await user.click(screen.getByRole('radio', { name: '不使用 Draft Model' }))
+
+    expect(previewSignal.current).not.toBeNull()
+    expect(previewSignal.current?.aborted).toBe(true)
+    resolvePreview?.(previewFixture())
+    await waitFor(() => expect(screen.queryByRole('heading', { name: '部署预览' })).not.toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    expect(await screen.findByRole('heading', { name: '部署预览' })).toBeInTheDocument()
+  })
+
+  it('ignores a preview response that resolves after the drawer is closed and reopened', async () => {
+    let resolvePreview: ((value: ReturnType<typeof previewFixture>) => void) | undefined
+    const previewSignal: { current: AbortSignal | null } = { current: null }
+    const pendingPreview = new Promise<ReturnType<typeof previewFixture>>((resolve) => { resolvePreview = resolve })
+    const { user } = renderDeploymentsPage({
+      previews: async (_path, _body, options) => {
+        previewSignal.current = options.signal as AbortSignal
+        return pendingPreview
+      },
+    })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+    expect(previewSignal.current).not.toBeNull()
+    expect(previewSignal.current?.aborted).toBe(true)
+    await user.click(await screen.findByRole('button', { name: /新建部署/ }))
+    resolvePreview?.(previewFixture())
+
+    await waitFor(() => expect(screen.getByRole('heading', { name: '基础模型' })).toBeInTheDocument())
+    expect(screen.queryByRole('heading', { name: '部署预览' })).not.toBeInTheDocument()
+  })
+
+  it('invalidates a completed preview when a later AI refresh updates recommendations', async () => {
+    let resolveRefresh: ((value: DeploymentRecommendation) => void) | undefined
+    const pendingRefresh = new Promise<DeploymentRecommendation>((resolve) => { resolveRefresh = resolve })
+    const { user } = renderDeploymentsPage({
+      recommendations: async (path) => path.includes('refresh_ai=true')
+        ? pendingRefresh
+        : recommendationFixture(),
+    })
+    await openCreateAndSelectModel(user)
+    await goToRecommendationStep(user)
+    await screen.findByDisplayValue('16384')
+    await user.click(screen.getByRole('button', { name: '重新分析' }))
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    expect(await screen.findByRole('heading', { name: '部署预览' })).toBeInTheDocument()
+
+    resolveRefresh?.(recommendationFixture({
+      generated_at: '2026-08-16T13:00:00Z',
+      fields: {
+        ...recommendationFixture().fields,
+        context_length: { ...recommendationFixture().fields.context_length, value: 8192 },
+      },
+    }))
+    await waitFor(() => expect(screen.getByRole('heading', { name: '推荐配置' })).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '确认并创建任务' })).not.toBeInTheDocument()
+  })
+
+  it('submits the exact frozen payload that produced the visible preview', async () => {
+    const { user, postSpy } = renderDeploymentsPage()
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await screen.findByRole('heading', { name: '部署预览' })
+    const previewPayload = structuredClone(
+      postSpy.mock.calls.find(([path]) => String(path).startsWith('/api/deployments/preview'))?.[1],
+    )
+    await user.click(screen.getByRole('button', { name: '确认并创建任务' }))
+    await waitFor(() => expect(postSpy.mock.calls.some(([path]) => path === '/api/deployments')).toBe(true))
+    const createPayload = postSpy.mock.calls.find(([path]) => path === '/api/deployments')?.[1]
+
+    expect(createPayload).toEqual(previewPayload)
+  })
+
+  it('resets every managed recommendation field before a sparse model response', async () => {
+    const { user } = renderDeploymentsPage({
+      recommendations: async (_path, body) => body.model_id === 'model-1'
+        ? recommendationFixture()
+        : recommendationFixture({
+            model_id: 'model-2',
+            fields: {},
+            generation_defaults: {},
+          }),
+    })
+    await openCreateAndSelectModel(user)
+    await goToRecommendationStep(user)
+    await screen.findByDisplayValue('16384')
+    await user.click(screen.getByRole('button', { name: '上一步' }))
+    await user.click(screen.getByLabelText('模型'))
+    await user.click(await screen.findByText('Qwen/Qwen-Second'))
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+
+    await waitFor(() => expect(screen.getByLabelText('上下文长度')).toHaveValue('32768'))
+    expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '0.8')
+    expect(screen.getByLabelText('最大并发')).toHaveValue('8')
+    expect(screen.getByLabelText('批处理 Token 上限')).toHaveValue('')
+    expect(screen.getByLabelText('量化加载方式')).not.toHaveTextContent('NVFP4 / ModelOpt FP4')
+    expect(screen.getByLabelText('Temperature')).toHaveValue('')
+    expect(screen.queryByText('已手动修改')).not.toBeInTheDocument()
+  })
+
+  it('keeps generic manual values but clears runtime-specific and stale sparse fields on runtime change', async () => {
+    const { user } = renderDeploymentsPage({
+      recommendations: async (_path, body) => body.runtime === 'vllm'
+        ? recommendationFixture()
+        : recommendationFixture({
+            runtime: 'sglang',
+            fields: {},
+            generation_defaults: {},
+            runtime_capabilities: {
+              ...recommendationFixture().runtime_capabilities,
+              runtime: 'sglang',
+              quantization_methods: ['fp8'],
+            },
+          }),
+    })
+    await openCreateAndSelectModel(user)
+    await goToRecommendationStep(user)
+    const context = await screen.findByLabelText('上下文长度')
+    await user.clear(context)
+    await user.type(context, '12288')
+    await user.click(screen.getByRole('button', { name: '上一步' }))
+    await user.click(screen.getByText('SGLang'))
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+
+    await waitFor(() => expect(screen.getByLabelText('上下文长度')).toHaveValue('12288'))
+    expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '0.8')
+    expect(screen.getByLabelText('批处理 Token 上限')).toHaveValue('')
+    expect(screen.getByLabelText('量化加载方式')).not.toHaveTextContent('NVFP4 / ModelOpt FP4')
+    expect(screen.getByLabelText('Temperature')).toHaveValue('')
+    expect(screen.getAllByText('已手动修改')).toHaveLength(1)
+  })
+
+  it('clears stale recommendation values when the runtime image changes to a sparse tuple', async () => {
+    const { user, postSpy } = renderDeploymentsPage({
+      recommendations: async (_path, body) => String(body.image).includes('lmsysorg')
+        ? recommendationFixture({
+            runtime: 'sglang',
+            fields: {},
+            generation_defaults: {},
+          })
+        : recommendationFixture({ runtime: 'sglang' }),
+    })
+    await openCreateAndSelectModel(user)
+    await user.click(screen.getByText('SGLang'))
+    await goToRecommendationStep(user)
+    await screen.findByDisplayValue('16384')
+    await user.click(screen.getByRole('button', { name: '上一步' }))
+    await user.click(screen.getByLabelText('ARM64 镜像'))
+    await screen.findByRole('option', { name: 'lmsysorg/sglang:dev-cu13-inkling-dspark' })
+    const imageOption = document.querySelector<HTMLElement>(
+      '.ant-select-item-option[title="lmsysorg/sglang:dev-cu13-inkling-dspark"]',
+    )
+    expect(imageOption).not.toBeNull()
+    await user.click(imageOption!)
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+
+    await waitFor(() => expect(postSpy.mock.calls
+      .filter(([path]) => String(path).startsWith('/api/deployments/recommendations'))
+      .map(([, body]) => (body as Record<string, unknown>)?.image))
+      .toContain('lmsysorg/sglang:dev-cu13-inkling-dspark'))
+    await waitFor(() => expect(screen.getByLabelText('上下文长度')).toHaveValue('32768'))
+    expect(screen.getByLabelText('批处理 Token 上限')).toHaveValue('')
+    expect(screen.getByLabelText('量化加载方式')).not.toHaveTextContent('modelopt_fp4')
+    expect(screen.getByLabelText('Temperature')).toHaveValue('')
+  })
+
+  it('clears unedited stale values before a sparse provider-specific response', async () => {
+    const { user } = renderDeploymentsPage({
+      recommendations: async (_path, body) => body.provider_id === null
+        ? recommendationFixture({ fields: {}, generation_defaults: {} })
+        : recommendationFixture(),
+    })
+    await openCreateAndSelectModel(user)
+    await goToRecommendationStep(user)
+    await screen.findByDisplayValue('16384')
+    await user.click(screen.getByRole('button', { name: '上一步' }))
+    await user.click(screen.getByLabelText('AI 推荐服务'))
+    await user.click(await screen.findByText('不使用 AI 补充'))
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+
+    await waitFor(() => expect(screen.getByLabelText('上下文长度')).toHaveValue('32768'))
+    expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '0.8')
+    expect(screen.getByLabelText('Temperature')).toHaveValue('')
+  })
+
+  it('derives a warning from a base-ok estimate plus the selected draft candidate', async () => {
+    const recommendation = recommendationFixture({
+      draft_candidates: recommendationFixture().draft_candidates.map((candidate) => candidate.model_id === 'draft-compatible'
+        ? { ...candidate, estimated_total_bytes: 90 * GiB }
+        : candidate),
+    })
+    const { user, postSpy } = renderDeploymentsPage({ recommendations: async () => recommendation })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+
+    expect(await screen.findByText('当前可用统一内存可能不足')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    expect(await screen.findByText('请确认统一内存资源警告')).toBeInTheDocument()
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
+  })
+
+  it('blocks preview when the selected draft pushes combined resources over total memory', async () => {
+    const recommendation = recommendationFixture({
+      draft_candidates: recommendationFixture().draft_candidates.map((candidate) => candidate.model_id === 'draft-compatible'
+        ? { ...candidate, estimated_total_bytes: 130 * GiB }
+        : candidate),
+    })
+    const { user, postSpy } = renderDeploymentsPage({ recommendations: async () => recommendation })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+
+    expect(await screen.findByText('资源估算超过 DGX Spark 硬上限')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
+  })
+
+  it('requires acknowledgement when a compatible draft has no total resource estimate', async () => {
+    const recommendation = recommendationFixture({
+      draft_candidates: recommendationFixture().draft_candidates.map((candidate) => candidate.model_id === 'draft-compatible'
+        ? { ...candidate, estimated_total_bytes: null }
+        : candidate),
+    })
+    const { user, postSpy } = renderDeploymentsPage({ recommendations: async () => recommendation })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+
+    expect(await screen.findByText('Draft Model 资源未验证')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    expect(await screen.findByText('请确认 Draft Model 资源未验证')).toBeInTheDocument()
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
+  })
+
+  it('clears a previous resource acknowledgement whenever the draft selection changes', async () => {
+    const recommendation = recommendationFixture({
+      draft_candidates: recommendationFixture().draft_candidates.map((candidate) => (
+        candidate.status === 'incompatible'
+          ? candidate
+          : { ...candidate, status: 'compatible' as const, estimated_total_bytes: 90 * GiB }
+      )),
+    })
+    const { user } = renderDeploymentsPage({ recommendations: async () => recommendation })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+    await user.click(screen.getByLabelText('我了解资源不足可能导致部署失败'))
+    expect(screen.getByLabelText('我了解资源不足可能导致部署失败')).toBeChecked()
+    await user.click(screen.getByRole('radio', { name: /Review-Draft/ }))
+
+    expect(screen.getByLabelText('我了解资源不足可能导致部署失败')).not.toBeChecked()
+  })
+
+  it('rejects a restored incompatible draft before preview', async () => {
+    const deployment = structuredClone(existingDeployment)
+    ;(deployment.config.spec as Record<string, unknown>).speculative = {
+      draft_model_id: 'draft-incompatible',
+      method: 'draft_model',
+      manual_review_acknowledged: true,
+    }
+    const { user, postSpy } = renderDeploymentsPage({ deployments: [deployment] })
+    await user.click(await screen.findByRole('button', { name: '编辑部署参数' }))
+    await goToRecommendationStep(user)
+    await screen.findByDisplayValue('8192')
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+    expect(await screen.findByRole('heading', { name: 'Draft Model' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+
+    expect(await screen.findByText('当前 Draft Model 与基础模型不兼容')).toBeInTheDocument()
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
+  })
+
+  it('preserves restored provenance when edit recommendation analysis fails for the unchanged tuple', async () => {
+    const { user, postSpy } = renderDeploymentsPage({
+      deployments: [existingDeployment],
+      recommendations: async () => { throw new Error('provider unavailable') },
+    })
+    await user.click(await screen.findByRole('button', { name: '编辑部署参数' }))
+    await goToRecommendationStep(user)
+    expect(await screen.findByText('推荐分析失败')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+
+    await waitFor(() => expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(true))
+    const payload = postSpy.mock.calls.find(([path]) => String(path).startsWith('/api/deployments/preview'))?.[1] as Record<string, unknown>
+    expect(payload.recommendation).toEqual((existingDeployment.config.spec as Record<string, unknown>).recommendation)
+  })
+
+  it('omits cleared runtime fields from recommendation provenance', async () => {
+    const { user, postSpy } = renderDeploymentsPage({
+      recommendations: async (_path, body) => body.runtime === 'vllm'
+        ? recommendationFixture()
+        : recommendationFixture({
+            runtime: 'sglang',
+            fields: {
+              context_length: recommendationFixture().fields.context_length,
+            },
+            generation_defaults: {},
+          }),
+    })
+    await openCreateAndSelectModel(user)
+    await goToRecommendationStep(user)
+    const batched = await screen.findByLabelText('批处理 Token 上限')
+    await user.clear(batched)
+    await user.type(batched, '4096')
+    await user.click(screen.getByRole('button', { name: '上一步' }))
+    await user.click(screen.getByText('SGLang'))
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+    await screen.findByDisplayValue('16384')
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+
+    const payload = postSpy.mock.calls.find(([path]) => String(path).startsWith('/api/deployments/preview'))?.[1] as Record<string, unknown>
+    expect(payload).not.toHaveProperty('max_batched_tokens')
+    expect(payload.recommendation).toMatchObject({
+      modified_fields: expect.not.arrayContaining(['max_batched_tokens']),
+      sources: expect.not.objectContaining({ max_batched_tokens: expect.anything() }),
+    })
+  })
+
+  it('renders the full resolved preview spec, resources, draft and warnings', async () => {
+    const preview = previewFixture({
+      spec: {
+        context_length: 16_384,
+        memory_fraction: 0.72,
+        max_concurrency: 4,
+        max_batched_tokens: 8192,
+        quantization: 'modelopt_fp4',
+      },
+      speculative: {
+        draft_model_id: 'draft-compatible',
+        method: 'eagle3',
+        num_speculative_tokens: 5,
+      },
+      draft_candidate: recommendationFixture().draft_candidates[0],
+      warnings: ['Runtime image probe used a cached capability manifest'],
+      runtime_capabilities: {
+        ...recommendationFixture().runtime_capabilities,
+        warnings: ['Speculative transport fallback is active'],
+      },
+      resource_estimate: {
+        ...recommendationFixture().resource_estimate,
+        decision: 'blocked',
+        reasons: ['physical memory requirement exceeds total memory'],
+      },
+    })
+    const { user } = renderDeploymentsPage({ previews: async () => preview })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+
+    expect(await screen.findByText('上下文长度')).toBeInTheDocument()
+    expect(screen.getByText('Draft Model 配置')).toBeInTheDocument()
+    expect(screen.getByText('资源明细')).toBeInTheDocument()
+    expect(screen.getByText('physical memory requirement exceeds total memory')).toBeInTheDocument()
+    expect(screen.getByText('Runtime image probe used a cached capability manifest')).toBeInTheDocument()
+    expect(screen.getByText('Speculative transport fallback is active')).toBeInTheDocument()
+    expect(screen.getAllByText('blocked').every((tag) => tag.classList.contains('ant-tag-error'))).toBe(true)
   })
 })

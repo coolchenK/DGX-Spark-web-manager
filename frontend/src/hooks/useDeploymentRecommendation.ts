@@ -216,5 +216,9 @@ export function useDeploymentRecommendation({
     }
   }, [activeTuple, body, queryClient, queryKey, refreshOwner, stable])
 
-  return { ...query, refreshAI }
+  return {
+    ...query,
+    refreshAI,
+    activeTupleKey: activeTuple ? tupleKey : null,
+  }
 }

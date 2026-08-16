@@ -38,6 +38,7 @@ import type {
   Provider,
   RecommendationProvenance,
   RecommendationSource,
+  ResourceEstimate,
   TaskRecord,
 } from '../api/types'
 import { DeploymentBasicsStep } from '../components/deployments/DeploymentBasicsStep'
@@ -109,6 +110,38 @@ const basicFields: Array<keyof DeploymentWizardValues> = [
   'port',
 ]
 
+const recommendationValidationFields: Array<string | string[]> = [
+  'context_length',
+  'memory_fraction',
+  'max_concurrency',
+  'max_batched_tokens',
+  ['generation_defaults', 'temperature'],
+  ['generation_defaults', 'top_p'],
+  ['generation_defaults', 'top_k'],
+  ['generation_defaults', 'min_p'],
+  ['generation_defaults', 'repetition_penalty'],
+  ['generation_defaults', 'presence_penalty'],
+  ['generation_defaults', 'frequency_penalty'],
+  ['generation_defaults', 'max_tokens'],
+]
+
+const recommendationDefaults: Record<string, unknown> = {
+  context_length: 32768,
+  memory_fraction: 0.8,
+  max_concurrency: 8,
+  max_batched_tokens: undefined,
+  quantization: 'auto',
+  'generation_defaults.temperature': undefined,
+  'generation_defaults.top_p': undefined,
+  'generation_defaults.top_k': undefined,
+  'generation_defaults.min_p': undefined,
+  'generation_defaults.repetition_penalty': undefined,
+  'generation_defaults.presence_penalty': undefined,
+  'generation_defaults.frequency_penalty': undefined,
+  'generation_defaults.max_tokens': undefined,
+  'generation_defaults.stop': undefined,
+}
+
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException
@@ -138,16 +171,88 @@ function restoredRecommendationFields(values: DeploymentFormValues): Set<string>
 }
 
 
-function sourceSnapshot(recommendation: DeploymentRecommendation): Record<string, RecommendationSource> {
+function hasPathValue(values: DeploymentFormValues, path: string): boolean {
+  const [root, nested] = path.split('.')
+  const value = nested
+    ? (values[root as 'generation_defaults'] as Record<string, unknown> | undefined)?.[nested]
+    : values[root as keyof DeploymentFormValues]
+  return value !== undefined && value !== null
+}
+
+
+function sourceSnapshot(
+  recommendation: DeploymentRecommendation,
+  values: DeploymentFormValues,
+): Record<string, RecommendationSource> {
   const sources: Record<string, RecommendationSource> = {}
   for (const [field, value] of Object.entries(recommendation.fields)) {
-    if (recommendationFieldPaths.has(field)) sources[field] = value.source
+    if (recommendationFieldPaths.has(field) && hasPathValue(values, field)) {
+      sources[field] = value.source
+    }
   }
   for (const [field, value] of Object.entries(recommendation.generation_defaults)) {
     const path = `generation_defaults.${field}`
-    if (recommendationFieldPaths.has(path)) sources[path] = value.source
+    if (recommendationFieldPaths.has(path) && hasPathValue(values, path)) {
+      sources[path] = value.source
+    }
   }
   return sources
+}
+
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+
+function combinedResourceEstimate(
+  base: Partial<ResourceEstimate> | undefined,
+  candidate: DraftCandidate | undefined,
+): { estimate: Partial<ResourceEstimate> | undefined; unverified: boolean } {
+  if (!candidate) return { estimate: base, unverified: false }
+  const required = base?.required_bytes
+  const existingDraft = base?.draft_weight_bytes ?? 0
+  const draftWeight = Math.ceil(Math.max(0, candidate.size_bytes) * 1.15)
+  if (typeof required !== 'number') {
+    return { estimate: base, unverified: true }
+  }
+  const calculatedRequired = Math.max(0, required - existingDraft) + draftWeight
+  const candidateTotal = candidate.estimated_total_bytes
+  const combinedRequired = typeof candidateTotal === 'number'
+    ? Math.max(calculatedRequired, candidateTotal)
+    : calculatedRequired
+  const total = base?.total_bytes
+  const available = base?.available_bytes
+  const reserved = base?.reserved_bytes
+  let decision = base?.decision ?? 'warning'
+  if (typeof total === 'number' && combinedRequired > total) {
+    decision = 'blocked'
+  } else if (
+    typeof available === 'number'
+    && typeof reserved === 'number'
+    && combinedRequired > Math.max(0, available - reserved)
+  ) {
+    decision = 'warning'
+  } else if (decision !== 'blocked' && decision !== 'warning') {
+    decision = 'ok'
+  }
+  const unverified = candidateTotal === null
+  const resourceReason = decision === 'blocked'
+    ? '基础模型与 Draft Model 的组合资源超过物理统一内存'
+    : decision === 'warning'
+      ? '基础模型与 Draft Model 的组合资源超过当前可用统一内存余量'
+      : '基础模型与 Draft Model 的组合资源在当前统一内存余量内'
+  return {
+    estimate: {
+      ...base,
+      draft_weight_bytes: draftWeight,
+      required_bytes: combinedRequired,
+      decision,
+      confidence: unverified ? 'low' : base?.confidence,
+      reasons: [...(base?.reasons ?? []), resourceReason],
+    },
+    unverified,
+  }
 }
 
 
@@ -163,8 +268,14 @@ export function DeploymentsPage() {
   const [advancedDrafts, setAdvancedDrafts] = useState(false)
   const [draftValidationError, setDraftValidationError] = useState<string | null>(null)
   const [preview, setPreview] = useState<DeploymentPreview | null>(null)
+  const [previewedPayload, setPreviewedPayload] = useState<DeploymentFormValues | null>(null)
   const [logsFor, setLogsFor] = useState<Deployment | null>(null)
   const applyingRecommendation = useRef(false)
+  const drawerOpenRef = useRef(false)
+  const previewSequence = useRef(0)
+  const previewController = useRef<AbortController | null>(null)
+  const lastAppliedRecommendation = useRef<DeploymentRecommendation | null>(null)
+  const restoredTupleKey = useRef<string | null>(null)
   const queryClient = useQueryClient()
 
   const deployments = useQuery({
@@ -193,6 +304,10 @@ export function DeploymentsPage() {
   const image = Form.useWatch('image', watchOptions)
   const providerId = Form.useWatch('provider_id', watchOptions)
   const selectedDraftId = Form.useWatch(['speculative', 'draft_model_id'], watchOptions)
+  const currentTupleKey = useMemo(
+    () => JSON.stringify([modelId ?? '', runtime, image ?? '', providerId || null]),
+    [image, modelId, providerId, runtime],
+  )
 
   const recommendation = useDeploymentRecommendation({
     modelId,
@@ -203,26 +318,84 @@ export function DeploymentsPage() {
   })
   const activeRecommendation = useMemo(() => {
     const data = recommendation.data
-    if (!data || data.model_id !== modelId || data.runtime !== runtime) return undefined
+    if (
+      !data
+      || data.model_id !== modelId
+      || data.runtime !== runtime
+      || recommendation.activeTupleKey !== currentTupleKey
+    ) return undefined
     return data
-  }, [modelId, recommendation.data, runtime])
+  }, [currentTupleKey, modelId, recommendation.activeTupleKey, recommendation.data, runtime])
 
   const replaceEditedFields = useCallback((next: Set<string>) => {
     editedFieldsRef.current = next
     setEditedFields(next)
   }, [])
 
+  const invalidatePreview = useCallback((fallbackStep?: 0 | 1 | 2) => {
+    previewSequence.current += 1
+    previewController.current?.abort()
+    previewController.current = null
+    setPreview(null)
+    setPreviewedPayload(null)
+    if (fallbackStep !== undefined) {
+      setStep((current) => current === 3 ? fallbackStep : current)
+    }
+  }, [])
+
+  const clearRecommendationValues = useCallback((
+    paths: Iterable<string>,
+    forcedPaths: ReadonlySet<string> = new Set(),
+  ) => {
+    const updates: Record<string, unknown> = {}
+    const generationUpdates: Record<string, unknown> = {}
+    const cleared = new Set<string>()
+    for (const path of paths) {
+      if (!recommendationFieldPaths.has(path)) continue
+      if (editedFieldsRef.current.has(path) && !forcedPaths.has(path)) continue
+      const [root, nested] = path.split('.')
+      if (nested) generationUpdates[nested] = recommendationDefaults[path]
+      else updates[root] = recommendationDefaults[path]
+      cleared.add(path)
+    }
+    if (Object.keys(generationUpdates).length) updates.generation_defaults = generationUpdates
+    if (Object.keys(updates).length) {
+      applyingRecommendation.current = true
+      form.setFieldsValue(updates)
+      applyingRecommendation.current = false
+    }
+    if (cleared.size) {
+      replaceEditedFields(new Set(
+        [...editedFieldsRef.current].filter((path) => !cleared.has(path)),
+      ))
+    }
+    return cleared
+  }, [form, replaceEditedFields])
+
+  const priorRecommendationPaths = useCallback(() => new Set([
+    ...(lastAppliedRecommendation.current
+      ? recommendationPaths(lastAppliedRecommendation.current)
+      : []),
+    ...Object.keys(form.getFieldValue('recommendation')?.sources ?? {}),
+  ]), [form])
+
   const applyRecommendation = useCallback((result: DeploymentRecommendation, force: boolean) => {
     const currentEdited = editedFieldsRef.current
+    const nextPaths = recommendationPaths(result)
+    const previousPaths = lastAppliedRecommendation.current
+      ? recommendationPaths(lastAppliedRecommendation.current)
+      : new Set<string>()
+    const stalePaths = new Set([...previousPaths].filter((path) => !nextPaths.has(path)))
+    clearRecommendationValues(stalePaths, force ? stalePaths : new Set())
+    invalidatePreview(1)
     applyingRecommendation.current = true
     form.setFieldsValue(valuesFromRecommendation(result, currentEdited, force))
     applyingRecommendation.current = false
+    lastAppliedRecommendation.current = result
     if (force) {
-      const appliedPaths = recommendationPaths(result)
-      replaceEditedFields(new Set([...currentEdited].filter((path) => !appliedPaths.has(path))))
+      replaceEditedFields(new Set([...editedFieldsRef.current].filter((path) => !nextPaths.has(path))))
     }
-    setPreview(null)
-  }, [form, replaceEditedFields])
+  }, [clearRecommendationValues, form, invalidatePreview, replaceEditedFields])
 
   useEffect(() => {
     if (activeRecommendation) applyRecommendation(activeRecommendation, false)
@@ -239,12 +412,14 @@ export function DeploymentsPage() {
   }, [drawerOpen, form, providers.data])
 
   const resetWizardState = useCallback(() => {
+    invalidatePreview()
     setStep(0)
     replaceEditedFields(new Set())
     setAdvancedDrafts(false)
     setDraftValidationError(null)
-    setPreview(null)
-  }, [replaceEditedFields])
+    lastAppliedRecommendation.current = null
+    restoredTupleKey.current = null
+  }, [invalidatePreview, replaceEditedFields])
 
   const selectModel = useCallback((selectedModelId: string) => {
     const model = models.data?.find((item) => item.id === selectedModelId)
@@ -256,17 +431,28 @@ export function DeploymentsPage() {
       model_path: model.local_path,
       api_model_name: model.alias ?? shortName.toLowerCase(),
       model_id: model.id,
+      context_length: 32768,
+      memory_fraction: 0.8,
+      max_concurrency: 8,
+      max_batched_tokens: undefined,
       quantization: 'auto',
+      generation_defaults: Object.fromEntries(
+        [...recommendationFieldPaths]
+          .filter((path) => path.startsWith('generation_defaults.'))
+          .map((path) => [path.split('.')[1], undefined]),
+      ),
       speculative: null,
       resource_warning_acknowledged: false,
       recommendation: null,
     })
     applyingRecommendation.current = false
     replaceEditedFields(new Set())
+    lastAppliedRecommendation.current = null
+    restoredTupleKey.current = null
     setAdvancedDrafts(false)
     setDraftValidationError(null)
-    setPreview(null)
-  }, [form, models.data, replaceEditedFields])
+    invalidatePreview(0)
+  }, [form, invalidatePreview, models.data, replaceEditedFields])
 
   const openCreate = useCallback(() => {
     setEditingDeployment(null)
@@ -275,6 +461,7 @@ export function DeploymentsPage() {
     applyingRecommendation.current = true
     form.setFieldsValue(defaultValues)
     applyingRecommendation.current = false
+    drawerOpenRef.current = true
     setDrawerOpen(true)
   }, [form, resetWizardState])
 
@@ -294,8 +481,15 @@ export function DeploymentsPage() {
       provider_id: restored.recommendation?.provider_id ?? '',
     })
     applyingRecommendation.current = false
+    restoredTupleKey.current = JSON.stringify([
+      restored.model_id,
+      restored.runtime,
+      restored.image,
+      restored.recommendation?.provider_id ?? null,
+    ])
     if (mode === 'edit') replaceEditedFields(restoredRecommendationFields(restored))
     setAdvancedDrafts(Boolean(restored.speculative))
+    drawerOpenRef.current = true
     setDrawerOpen(true)
   }
 
@@ -308,6 +502,8 @@ export function DeploymentsPage() {
   }, [models.data, openCreate, searchParams, selectModel])
 
   const closeDrawer = () => {
+    drawerOpenRef.current = false
+    invalidatePreview()
     setDrawerOpen(false)
     setEditingDeployment(null)
     resetWizardState()
@@ -318,7 +514,11 @@ export function DeploymentsPage() {
     const values = form.getFieldsValue(true)
     const { provider_id: _, ...deploymentValues } = values
     const data = activeRecommendation
-    let provenance: RecommendationProvenance | null = null
+    let provenance: RecommendationProvenance | null = (
+      currentTupleKey === restoredTupleKey.current
+      ? deploymentValues.recommendation ?? null
+      : null
+    )
     const snapshot = data?.resource_snapshot
     if (
       data?.evidence_hash
@@ -326,6 +526,7 @@ export function DeploymentsPage() {
       && typeof snapshot.available_bytes === 'number'
       && typeof snapshot.reserved_bytes === 'number'
     ) {
+      const sources = sourceSnapshot(data, deploymentValues)
       provenance = {
         generated_at: data.generated_at,
         evidence_hash: data.evidence_hash,
@@ -335,34 +536,84 @@ export function DeploymentsPage() {
           available_bytes: snapshot.available_bytes,
           reserved_bytes: snapshot.reserved_bytes,
         },
-        modified_fields: [...editedFieldsRef.current].sort(),
-        sources: sourceSnapshot(data),
+        modified_fields: [...editedFieldsRef.current]
+          .filter((path) => path in sources && hasPathValue(deploymentValues, path))
+          .sort(),
+        sources,
       }
     }
-    const speculative = deploymentValues.speculative?.draft_model_id
-      ? deploymentValues.speculative
-      : null
-    return {
+    const savedSpeculative = deploymentValues.speculative
+    let speculative: SpeculativeSettings | null = null
+    if (savedSpeculative?.draft_model_id) {
+      speculative = {
+        draft_model_id: savedSpeculative.draft_model_id,
+        method: savedSpeculative.method,
+        manual_review_acknowledged: savedSpeculative.manual_review_acknowledged === true,
+        ...(runtime === 'vllm' && savedSpeculative.num_speculative_tokens != null
+          ? { num_speculative_tokens: savedSpeculative.num_speculative_tokens }
+          : {}),
+        ...(runtime === 'sglang'
+          && savedSpeculative.num_steps != null
+          && savedSpeculative.eagle_top_k != null
+          && savedSpeculative.num_draft_tokens != null
+          ? {
+              num_steps: savedSpeculative.num_steps,
+              eagle_top_k: savedSpeculative.eagle_top_k,
+              num_draft_tokens: savedSpeculative.num_draft_tokens,
+            }
+          : {}),
+      }
+    }
+    const result: DeploymentFormValues = {
       ...deploymentValues,
       route_alias: deploymentValues.route_alias || undefined,
-      generation_defaults: deploymentValues.generation_defaults ?? {},
+      generation_defaults: Object.fromEntries(
+        Object.entries(deploymentValues.generation_defaults ?? {})
+          .filter(([, value]) => value !== undefined && value !== null),
+      ),
       speculative,
       recommendation: provenance,
       resource_warning_acknowledged: deploymentValues.resource_warning_acknowledged === true,
     }
-  }, [activeRecommendation, form, providerId])
+    if (runtime !== 'vllm' || result.max_batched_tokens === undefined) {
+      delete result.max_batched_tokens
+    }
+    return cloneJson(result)
+  }, [activeRecommendation, currentTupleKey, form, providerId, runtime])
 
   const previewMutation = useMutation({
-    mutationFn: (values: DeploymentFormValues) => {
+    mutationFn: async ({
+      payload,
+      sequence,
+      controller,
+    }: {
+      payload: DeploymentFormValues
+      sequence: number
+      controller: AbortController
+    }) => {
       const suffix = editingDeployment ? `?deployment_id=${encodeURIComponent(editingDeployment.id)}` : ''
-      return api.post<DeploymentPreview>(`/api/deployments/preview${suffix}`, values)
+      const result = await api.post<DeploymentPreview>(
+        `/api/deployments/preview${suffix}`,
+        payload,
+        { signal: controller.signal },
+      )
+      return { result, payload, sequence, controller }
     },
-    onSuccess: (result) => {
-      setPreview(result)
+    onSuccess: ({ result, payload, sequence, controller }) => {
+      if (
+        sequence !== previewSequence.current
+        || controller.signal.aborted
+        || !drawerOpenRef.current
+      ) return
+      previewController.current = null
+      setPreview(cloneJson(result))
+      setPreviewedPayload(cloneJson(payload))
       setStep(3)
     },
-    onError: (error: Error) => {
-      if (!isAbortError(error)) message.error(error.message)
+    onError: (error: Error, variables) => {
+      if (variables.sequence !== previewSequence.current || isAbortError(error)) return
+      previewController.current = null
+      message.error(error.message)
     },
   })
   const saveMutation = useMutation({
@@ -400,6 +651,7 @@ export function DeploymentsPage() {
   }
 
   const handleDraftSelect = (candidate?: DraftCandidate) => {
+    invalidatePreview(2)
     applyingRecommendation.current = true
     if (!candidate) {
       form.setFieldValue('speculative', null)
@@ -409,39 +661,88 @@ export function DeploymentsPage() {
       const next: SpeculativeSettings = {
         draft_model_id: candidate.model_id,
         method: candidate.method ?? 'draft_model',
-        num_speculative_tokens: keepRestored ? restored.num_speculative_tokens : 5,
-        num_steps: keepRestored ? restored.num_steps : undefined,
-        eagle_top_k: keepRestored ? restored.eagle_top_k : undefined,
-        num_draft_tokens: keepRestored ? restored.num_draft_tokens : undefined,
+        num_speculative_tokens: runtime === 'vllm'
+          ? (keepRestored ? restored.num_speculative_tokens ?? 5 : 5)
+          : undefined,
+        num_steps: runtime === 'sglang' && keepRestored ? restored.num_steps : undefined,
+        eagle_top_k: runtime === 'sglang' && keepRestored ? restored.eagle_top_k : undefined,
+        num_draft_tokens: runtime === 'sglang' && keepRestored ? restored.num_draft_tokens : undefined,
         manual_review_acknowledged: keepRestored
           ? restored.manual_review_acknowledged
           : false,
       }
       form.setFieldValue('speculative', next)
     }
+    form.setFieldValue('resource_warning_acknowledged', false)
     applyingRecommendation.current = false
-    replaceEditedFields(new Set([...editedFieldsRef.current, 'speculative.draft_model_id']))
-    setPreview(null)
+    replaceEditedFields(new Set([
+      ...[...editedFieldsRef.current].filter((path) => path !== 'resource_warning_acknowledged'),
+      'speculative.draft_model_id',
+    ]))
     setDraftValidationError(null)
   }
 
+  const selectedDraft = activeRecommendation?.draft_candidates.find(
+    (item) => item.model_id === selectedDraftId,
+  )
+  const draftResources = useMemo(
+    () => combinedResourceEstimate(activeRecommendation?.resource_estimate, selectedDraft),
+    [activeRecommendation?.resource_estimate, selectedDraft],
+  )
+
   const goForward = async () => {
     if (step === 0) {
-      await form.validateFields(basicFields)
+      try {
+        await form.validateFields(basicFields)
+      } catch {
+        return
+      }
       setStep(1)
       return
     }
     if (step === 1) {
+      try {
+        await form.validateFields(recommendationValidationFields)
+      } catch {
+        return
+      }
       setStep(2)
       return
     }
     if (step === 2) {
-      const selected = activeRecommendation?.draft_candidates.find((item) => item.model_id === selectedDraftId)
-      if (selected?.status === 'review' && !form.getFieldValue(['speculative', 'manual_review_acknowledged'])) {
+      if (activeRecommendation && selectedDraftId && !selectedDraft) {
+        setDraftValidationError('当前 Draft Model 不在最新候选列表中')
+        return
+      }
+      if (selectedDraft?.status === 'incompatible') {
+        setDraftValidationError('当前 Draft Model 与基础模型不兼容')
+        return
+      }
+      const speculative = form.getFieldValue('speculative') as SpeculativeSettings | null
+      if (speculative) {
+        const grouped = [speculative.num_steps, speculative.eagle_top_k, speculative.num_draft_tokens]
+        if (runtime === 'vllm' && grouped.some((value) => value != null)) {
+          setDraftValidationError('vLLM 不支持 SGLang 分组推测解码参数')
+          return
+        }
+        if (runtime === 'sglang' && speculative.num_speculative_tokens != null) {
+          setDraftValidationError('SGLang 不支持每轮推测 Token 参数')
+          return
+        }
+        if (runtime === 'sglang' && grouped.some((value) => value != null) && !grouped.every((value) => value != null)) {
+          setDraftValidationError('SGLang 的三个推测解码参数必须全部填写或全部留空')
+          return
+        }
+      }
+      if (selectedDraft?.status === 'review' && !form.getFieldValue(['speculative', 'manual_review_acknowledged'])) {
         setDraftValidationError('请确认 Draft Model 配对风险')
         return
       }
-      const resourceDecision = activeRecommendation?.resource_estimate.decision
+      const resourceDecision = draftResources.estimate?.decision
+      if (selectedDraft && draftResources.unverified && !form.getFieldValue('resource_warning_acknowledged')) {
+        setDraftValidationError('请确认 Draft Model 资源未验证')
+        return
+      }
       if (resourceDecision === 'warning' && !form.getFieldValue('resource_warning_acknowledged')) {
         setDraftValidationError('请确认统一内存资源警告')
         return
@@ -450,22 +751,37 @@ export function DeploymentsPage() {
         message.error('资源估算超过 DGX Spark 硬上限，无法生成部署任务')
         return
       }
-      previewMutation.mutate(payloadFromForm())
+      const payload = payloadFromForm()
+      previewController.current?.abort()
+      const controller = new AbortController()
+      const sequence = previewSequence.current + 1
+      previewSequence.current = sequence
+      previewController.current = controller
+      previewMutation.mutate({ payload: cloneJson(payload), sequence, controller })
     }
   }
 
   const goBack = () => {
-    if (step === 3) setPreview(null)
+    if (step === 3) {
+      invalidatePreview()
+      setStep(2)
+      return
+    }
     setStep((current) => Math.max(0, current - 1))
   }
 
   const onValuesChange = (changed: Record<string, unknown>) => {
     if (applyingRecommendation.current) return
-    setPreview(null)
+    invalidatePreview(step === 0 ? 0 : step === 1 ? 1 : 2)
     setDraftValidationError(null)
     const changedPaths = flattenChangedFields(changed)
     replaceEditedFields(new Set([...editedFieldsRef.current, ...changedPaths]))
     if ('runtime' in changed) {
+      const previousPaths = priorRecommendationPaths()
+      const forced = new Set(['max_batched_tokens', 'quantization'])
+      clearRecommendationValues(new Set([...previousPaths, ...forced]), forced)
+      lastAppliedRecommendation.current = null
+      restoredTupleKey.current = null
       const nextRuntime = changed.runtime as 'vllm' | 'sglang'
       applyingRecommendation.current = true
       form.setFieldsValue({
@@ -474,13 +790,48 @@ export function DeploymentsPage() {
           : 'sglang-inkling:specforge',
         speculative: null,
         resource_warning_acknowledged: false,
+        recommendation: null,
+        max_batched_tokens: undefined,
+        quantization: 'auto',
       })
       applyingRecommendation.current = false
+      replaceEditedFields(new Set([...editedFieldsRef.current].filter((path) => (
+        !path.startsWith('speculative.')
+        && path !== 'resource_warning_acknowledged'
+        && path !== 'max_batched_tokens'
+        && path !== 'quantization'
+      ))))
       return
     }
     if ('image' in changed) {
+      const previousPaths = priorRecommendationPaths()
+      const forced = new Set(['max_batched_tokens', 'quantization'])
+      clearRecommendationValues(new Set([...previousPaths, ...forced]), forced)
+      lastAppliedRecommendation.current = null
+      restoredTupleKey.current = null
       applyingRecommendation.current = true
-      form.setFieldsValue({ speculative: null, resource_warning_acknowledged: false })
+      form.setFieldsValue({
+        speculative: null,
+        resource_warning_acknowledged: false,
+        recommendation: null,
+        max_batched_tokens: undefined,
+        quantization: 'auto',
+      })
+      applyingRecommendation.current = false
+      replaceEditedFields(new Set([...editedFieldsRef.current].filter((path) => (
+        !path.startsWith('speculative.')
+        && path !== 'resource_warning_acknowledged'
+        && path !== 'max_batched_tokens'
+        && path !== 'quantization'
+      ))))
+      return
+    }
+    if ('provider_id' in changed) {
+      const previousPaths = priorRecommendationPaths()
+      clearRecommendationValues(previousPaths)
+      lastAppliedRecommendation.current = null
+      applyingRecommendation.current = true
+      form.setFieldValue('recommendation', null)
       applyingRecommendation.current = false
     }
   }
@@ -540,7 +891,7 @@ export function DeploymentsPage() {
         } else {
           window.localStorage.removeItem('dgx-deployment-recommendation-provider')
         }
-        setPreview(null)
+        invalidatePreview(0)
       }}
     />,
     <RecommendationStep
@@ -551,6 +902,7 @@ export function DeploymentsPage() {
       refreshing={recommendation.isFetching}
       error={recommendation.error}
       runtime={runtime}
+      editing={Boolean(editingDeployment)}
       onReapplyAll={() => activeRecommendation && applyRecommendation(activeRecommendation, true)}
       onRetryAI={handleRetryAI}
     />,
@@ -558,8 +910,10 @@ export function DeploymentsPage() {
       key="draft"
       candidates={activeRecommendation?.draft_candidates ?? []}
       selectedId={selectedDraftId}
+      runtime={runtime}
       advanced={advancedDrafts}
-      resourceEstimate={activeRecommendation?.resource_estimate}
+      resourceEstimate={draftResources.estimate}
+      resourceUnverified={draftResources.unverified}
       validationError={draftValidationError}
       onAdvancedChange={setAdvancedDrafts}
       onSelect={handleDraftSelect}
@@ -642,7 +996,8 @@ export function DeploymentsPage() {
                 type="primary"
                 icon={<RocketOutlined />}
                 loading={saveMutation.isPending}
-                onClick={() => saveMutation.mutate(payloadFromForm())}
+                disabled={!previewedPayload}
+                onClick={() => previewedPayload && saveMutation.mutate(cloneJson(previewedPayload))}
                 aria-label={editingDeployment ? '确认并创建更新任务' : '确认并创建任务'}
               >
                 {editingDeployment ? '确认并创建更新任务' : '确认并创建任务'}

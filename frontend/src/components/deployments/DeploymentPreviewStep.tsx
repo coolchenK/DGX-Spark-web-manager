@@ -1,6 +1,8 @@
 import { Alert, Descriptions, List, Tag, Typography } from 'antd'
 
+import type { DraftCandidate, ResourceEstimate, RuntimeCapabilities } from '../../api/types'
 import { formatBytes } from '../../utils/format'
+import type { DeploymentFormValues, SpeculativeSettings } from '../../utils/deployments'
 
 
 export interface DeploymentPreview {
@@ -16,15 +18,12 @@ export interface DeploymentPreview {
     architectures: string[]
     reasons: string[]
   }
-  resource_estimate?: {
-    required_bytes?: number
-    weight_bytes?: number
-    draft_weight_bytes?: number
-    kv_cache_bytes?: number
-    runtime_overhead_bytes?: number
-    decision?: string
-    reasons?: string[]
-  }
+  spec?: Partial<DeploymentFormValues>
+  resource_estimate?: Partial<ResourceEstimate>
+  runtime_capabilities?: Partial<RuntimeCapabilities>
+  draft_candidate?: DraftCandidate | null
+  speculative?: SpeculativeSettings | null
+  warnings?: string[]
   generation_defaults?: Record<string, unknown>
   mounts?: Record<string, unknown>
   command?: string[]
@@ -50,6 +49,10 @@ export function DeploymentPreviewStep({
 }) {
   const compatibility = preview.compatibility
   const resource = preview.resource_estimate
+  const spec = preview.spec
+  const decisionColor = resource?.decision === 'blocked'
+    ? 'error'
+    : resource?.decision === 'warning' ? 'warning' : 'success'
 
   return (
     <section className="deployment-step deployment-preview" aria-labelledby="deployment-preview-heading">
@@ -81,8 +84,48 @@ export function DeploymentPreviewStep({
         { key: 'disk', label: '模型磁盘', children: formatBytes(Number(preview.estimated_disk_bytes ?? 0)) },
         { key: 'memory', label: '估算统一内存', children: formatBytes(Number(resource?.required_bytes ?? preview.estimated_memory_bytes ?? 0)) },
         { key: 'route', label: '网关模型名', children: preview.route_alias || fallbackRoute },
-        { key: 'decision', label: '资源结论', children: <Tag color={resource?.decision === 'warning' ? 'warning' : 'success'}>{resource?.decision ?? 'ok'}</Tag> },
+        { key: 'decision', label: '资源结论', children: <Tag color={decisionColor}>{resource?.decision ?? 'ok'}</Tag> },
       ]} />
+      <div className="preview-section">
+        <Typography.Title level={5}>解析后的部署参数</Typography.Title>
+        <Descriptions bordered size="small" column={1} items={[
+          { key: 'context', label: '上下文长度', children: spec?.context_length ?? '未设置' },
+          { key: 'fraction', label: '统一内存比例', children: spec?.memory_fraction ?? '未设置' },
+          { key: 'concurrency', label: '最大并发', children: spec?.max_concurrency ?? '未设置' },
+          { key: 'batched', label: '批处理 Token 上限', children: spec?.max_batched_tokens ?? '不适用' },
+          { key: 'quantization', label: '量化加载方式', children: spec?.quantization ?? 'auto' },
+        ]} />
+      </div>
+      <div className="preview-section">
+        <Typography.Title level={5}>Draft Model 配置</Typography.Title>
+        {preview.speculative ? (
+          <Descriptions bordered size="small" column={1} items={[
+            { key: 'draft', label: '候选模型', children: preview.draft_candidate?.name ?? preview.speculative.draft_model_id },
+            { key: 'method', label: '推测方法', children: preview.speculative.method },
+            { key: 'tuning', label: '运行时参数', children: <pre><code>{jsonPreview(preview.speculative)}</code></pre> },
+          ]} />
+        ) : <Typography.Text type="secondary">未附带 Draft Model</Typography.Text>}
+      </div>
+      <div className="preview-section">
+        <Typography.Title level={5}>资源明细</Typography.Title>
+        <Descriptions bordered size="small" column={1} items={[
+          { key: 'required', label: '总需求', children: formatBytes(Number(resource?.required_bytes ?? 0)) },
+          { key: 'weight', label: '基础权重', children: formatBytes(Number(resource?.weight_bytes ?? 0)) },
+          { key: 'draft-weight', label: 'Draft 权重', children: formatBytes(Number(resource?.draft_weight_bytes ?? 0)) },
+          { key: 'kv', label: 'KV Cache', children: formatBytes(Number(resource?.kv_cache_bytes ?? 0)) },
+          { key: 'overhead', label: '运行时开销', children: formatBytes(Number(resource?.runtime_overhead_bytes ?? 0)) },
+          { key: 'resource-decision', label: '结论', children: <Tag color={decisionColor}>{resource?.decision ?? 'ok'}</Tag> },
+        ]} />
+        {(resource?.reasons ?? []).map((reason) => (
+          <Alert key={reason} type={resource?.decision === 'blocked' ? 'error' : 'info'} showIcon message={reason} />
+        ))}
+      </div>
+      {(preview.warnings ?? []).map((warning) => (
+        <Alert key={`preview-${warning}`} type="warning" showIcon message={warning} />
+      ))}
+      {(preview.runtime_capabilities?.warnings ?? []).map((warning) => (
+        <Alert key={`runtime-${warning}`} type="warning" showIcon message={warning} />
+      ))}
       <div className="preview-section">
         <Typography.Title level={5}>容器命令</Typography.Title>
         <pre><code>{(preview.command ?? []).join(' ')}</code></pre>

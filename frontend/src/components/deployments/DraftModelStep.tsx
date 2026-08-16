@@ -7,8 +7,10 @@ import { formatBytes } from '../../utils/format'
 interface DraftModelStepProps {
   candidates: DraftCandidate[]
   selectedId?: string
+  runtime: 'vllm' | 'sglang'
   advanced: boolean
   resourceEstimate?: Partial<ResourceEstimate>
+  resourceUnverified?: boolean
   validationError?: string | null
   onAdvancedChange: (value: boolean) => void
   onSelect: (candidate?: DraftCandidate) => void
@@ -24,8 +26,10 @@ const statusPresentation = {
 export function DraftModelStep({
   candidates,
   selectedId,
+  runtime,
   advanced,
   resourceEstimate,
+  resourceUnverified = false,
   validationError,
   onAdvancedChange,
   onSelect,
@@ -98,29 +102,46 @@ export function DraftModelStep({
       )}
       {selectedCandidate && (
         <Collapse
+          defaultActiveKey={['speculative-tuning']}
           items={[{
             key: 'speculative-tuning',
             label: '推测解码高级参数',
             children: (
-              <div className="form-grid">
+              runtime === 'vllm' ? (
                 <Form.Item name={['speculative', 'num_speculative_tokens']} label="每轮推测 Token">
                   <InputNumber min={1} max={64} />
                 </Form.Item>
-                <Form.Item name={['speculative', 'num_steps']} label="推测步数">
-                  <InputNumber min={1} max={32} />
-                </Form.Item>
-                <Form.Item name={['speculative', 'eagle_top_k']} label="EAGLE Top K">
-                  <InputNumber min={1} max={32} />
-                </Form.Item>
-                <Form.Item name={['speculative', 'num_draft_tokens']} label="Draft Token 数">
-                  <InputNumber min={1} max={256} />
-                </Form.Item>
-              </div>
+              ) : (
+                <div className="form-grid">
+                  <Form.Item name={['speculative', 'num_steps']} label="推测步数">
+                    <InputNumber min={1} max={32} />
+                  </Form.Item>
+                  <Form.Item name={['speculative', 'eagle_top_k']} label="EAGLE Top K">
+                    <InputNumber min={1} max={32} />
+                  </Form.Item>
+                  <Form.Item name={['speculative', 'num_draft_tokens']} label="Draft Token 数">
+                    <InputNumber min={1} max={256} />
+                  </Form.Item>
+                </div>
+              )
             ),
           }]}
         />
       )}
-      {resourceDecision === 'warning' && (
+      {resourceUnverified && (
+        <Alert
+          type="warning"
+          showIcon
+          message="Draft Model 资源未验证"
+          description="候选模型缺少完整总资源估算，部署前必须确认当前统一内存余量。"
+          action={(
+            <Form.Item name="resource_warning_acknowledged" valuePropName="checked" noStyle>
+              <Checkbox>我了解资源不足可能导致部署失败</Checkbox>
+            </Form.Item>
+          )}
+        />
+      )}
+      {resourceDecision === 'warning' && !resourceUnverified && (
         <Alert
           type="warning"
           showIcon
