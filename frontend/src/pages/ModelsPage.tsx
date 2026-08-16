@@ -1,7 +1,7 @@
 import { AppstoreAddOutlined, DeleteOutlined, ReloadOutlined, RocketOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Alert, Button, Descriptions, Flex, Input, Modal, Space, Tag, Tooltip, Typography, message } from 'antd'
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
 import { ApiError, api } from '../api/client'
@@ -16,31 +16,37 @@ import { formatBytes, formatDate } from '../utils/format'
 export function ModelsPage() {
   const [filter, setFilter] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<ModelAsset | null>(null)
+  const deleteTargetRef = useRef<ModelAsset | null>(null)
   const [confirmation, setConfirmation] = useState('')
   const [references, setReferences] = useState<ModelReference[]>([])
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const models = useQuery({ queryKey: ['models'], queryFn: () => api.get<ModelAsset[]>('/api/models') })
   const scan = useMutation({ mutationFn: () => api.post('/api/discovery/scan'), onSuccess: () => { message.success('模型扫描完成'); queryClient.invalidateQueries({ queryKey: ['models'] }) } })
-  const closeDelete = () => {
+  const closeDelete = (targetId?: string) => {
+    if (targetId && deleteTargetRef.current?.id !== targetId) return
+    deleteTargetRef.current = null
     setDeleteTarget(null)
     setConfirmation('')
     setReferences([])
   }
   const openDelete = (model: ModelAsset) => {
+    deleteTargetRef.current = model
     setConfirmation('')
     setReferences([])
     setDeleteTarget(model)
   }
   const remove = useMutation({
     mutationFn: (model: ModelAsset) => api.delete<TaskRecord>(`/api/models/${model.id}`, { confirmation: model.name }),
-    onSuccess: () => {
-      closeDelete()
+    onSuccess: (_task, model) => {
+      if (deleteTargetRef.current?.id !== model.id) return
+      closeDelete(model.id)
       message.success('模型删除任务已创建')
       queryClient.invalidateQueries({ queryKey: ['models'] })
       queryClient.invalidateQueries({ queryKey: ['tasks'] })
     },
-    onError: (error) => {
+    onError: (error, model) => {
+      if (deleteTargetRef.current?.id !== model.id) return
       if (error instanceof ApiError && error.status === 409 && isModelInUseDetail(error.detail)) {
         setReferences(error.detail.references)
         return
@@ -51,7 +57,7 @@ export function ModelsPage() {
   const data = useMemo(() => (models.data ?? []).filter((item) => `${item.name} ${item.repository_id ?? ''}`.toLowerCase().includes(filter.toLowerCase())), [models.data, filter])
   const deleteButton = (item: ModelAsset) => (
     <Tooltip title="删除模型">
-      <Button danger size="small" icon={<DeleteOutlined />} aria-label="删除模型" onClick={() => openDelete(item)} />
+      <Button danger size="small" icon={<DeleteOutlined />} aria-label={`删除模型 ${item.name}`} onClick={() => openDelete(item)} />
     </Tooltip>
   )
   return (
@@ -71,23 +77,22 @@ export function ModelsPage() {
       <Modal
         title="永久删除模型"
         open={Boolean(deleteTarget)}
-        onCancel={closeDelete}
+        onCancel={() => {
+          if (!remove.isPending) closeDelete()
+        }}
+        onOk={() => deleteTarget && remove.mutate(deleteTarget)}
+        okText="永久删除"
+        cancelText="取消"
+        confirmLoading={remove.isPending}
+        okButtonProps={{
+          danger: true,
+          disabled: !deleteTarget || confirmation !== deleteTarget.name,
+        }}
+        cancelButtonProps={{ disabled: remove.isPending }}
         destroyOnHidden
+        keyboard={!remove.isPending}
         closable={!remove.isPending}
         maskClosable={!remove.isPending}
-        footer={[
-          <Button key="cancel" disabled={remove.isPending} onClick={closeDelete}>取消</Button>,
-          <Button
-            key="delete"
-            danger
-            type="primary"
-            loading={remove.isPending}
-            disabled={!deleteTarget || confirmation !== deleteTarget.name}
-            onClick={() => deleteTarget && remove.mutate(deleteTarget)}
-          >
-            永久删除
-          </Button>,
-        ]}
       >
         {deleteTarget && (
           <Space direction="vertical" size="middle" style={{ width: '100%' }}>

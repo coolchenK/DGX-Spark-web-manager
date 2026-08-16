@@ -322,6 +322,9 @@ const existingDeployment: Deployment = {
 
 interface ApiFixtureOptions {
   deployments?: Deployment[]
+  cachedDeployments?: Deployment[]
+  deploymentsRequest?: () => Promise<Deployment[]>
+  deploymentStaleTime?: number
   initialEntry?: string
   recommendations?: (
     path: string,
@@ -337,7 +340,11 @@ interface ApiFixtureOptions {
 function renderDeploymentsPage(options: ApiFixtureOptions = {}) {
   const user = userEvent.setup()
   const getSpy = vi.spyOn(api, 'get').mockImplementation(async <T,>(path: string): Promise<T> => {
-    if (path === '/api/deployments') return (options.deployments ?? []) as T
+    if (path === '/api/deployments') {
+      return (options.deploymentsRequest
+        ? await options.deploymentsRequest()
+        : options.deployments ?? []) as T
+    }
     if (path === '/api/models') return models as T
     if (path === '/api/providers') return providers as T
     if (path.includes('/logs')) return { logs: '' } as T
@@ -374,10 +381,13 @@ function renderDeploymentsPage(options: ApiFixtureOptions = {}) {
   const patchSpy = vi.spyOn(api, 'patch').mockResolvedValue(task)
   const queryClient = new QueryClient({
     defaultOptions: {
-      queries: { retry: false, staleTime: 0 },
+      queries: { retry: false, staleTime: options.deploymentStaleTime ?? 0 },
       mutations: { retry: false },
     },
   })
+  if (options.cachedDeployments) {
+    queryClient.setQueryData(['deployments'], options.cachedDeployments)
+  }
 
   render(
     <QueryClientProvider client={queryClient}>
@@ -400,6 +410,14 @@ describe('DeploymentsPage deployment locator', () => {
     endpoint_url: 'http://127.0.0.1:8200',
     api_model_name: 'draft-production',
     port: 8200,
+  }
+
+  function deferredDeployments() {
+    let resolve!: (value: Deployment[]) => void
+    const promise = new Promise<Deployment[]>((resolvePromise) => {
+      resolve = resolvePromise
+    })
+    return { promise, resolve }
   }
 
   it('locates a deployment from its direct URL on mobile and can show all deployments', async () => {
@@ -450,6 +468,44 @@ describe('DeploymentsPage deployment locator', () => {
     expect(await screen.findByText('未找到指定部署')).toBeInTheDocument()
     expect(screen.getAllByText('qwen-production')).toHaveLength(2)
     expect(screen.getAllByText('draft-production')).toHaveLength(2)
+  })
+
+  it('waits for a forced locator refresh before treating a fresh cache miss as unknown', async () => {
+    const response = deferredDeployments()
+    const { getSpy } = renderDeploymentsPage({
+      cachedDeployments: [secondDeployment],
+      deploymentStaleTime: Number.POSITIVE_INFINITY,
+      deploymentsRequest: () => response.promise,
+      initialEntry: '/deployments?deployment=deployment-1',
+    })
+
+    await waitFor(() => expect(getSpy).toHaveBeenCalledWith('/api/deployments'))
+    expect(screen.queryByText('未找到指定部署')).not.toBeInTheDocument()
+
+    response.resolve([existingDeployment, secondDeployment])
+
+    expect(await screen.findByText('正在定位部署 qwen-production')).toBeInTheDocument()
+    expect(screen.queryAllByText('draft-production')).toHaveLength(0)
+  })
+
+  it('shows only the query error when locator validation fails', async () => {
+    renderDeploymentsPage({
+      deploymentsRequest: async () => { throw new Error('network unavailable') },
+      initialEntry: '/deployments?deployment=deployment-1',
+    })
+
+    expect(await screen.findByText('数据加载失败')).toBeInTheDocument()
+    expect(screen.queryByText('未找到指定部署')).not.toBeInTheDocument()
+  })
+
+  it('does not force a deployment request without a locator', async () => {
+    const { getSpy } = renderDeploymentsPage({
+      cachedDeployments: [existingDeployment],
+      deploymentStaleTime: Number.POSITIVE_INFINITY,
+    })
+
+    expect(await screen.findAllByText('qwen-production')).toHaveLength(2)
+    expect(getSpy.mock.calls.filter(([path]) => path === '/api/deployments')).toHaveLength(0)
   })
 })
 

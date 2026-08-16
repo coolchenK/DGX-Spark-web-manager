@@ -270,6 +270,7 @@ function combinedResourceEstimate(
 export function DeploymentsPage() {
   const [form] = Form.useForm<DeploymentWizardValues>()
   const [searchParams, setSearchParams] = useSearchParams()
+  const deploymentTargetId = searchParams.get('deployment')
   const screens = Grid.useBreakpoint()
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [editingDeployment, setEditingDeployment] = useState<Deployment | null>(null)
@@ -293,10 +294,11 @@ export function DeploymentsPage() {
     queryKey: ['deployments'],
     queryFn: () => api.get<Deployment[]>('/api/deployments'),
     refetchInterval: 8_000,
+    refetchOnMount: deploymentTargetId ? 'always' : undefined,
   })
-  const deploymentTargetId = searchParams.get('deployment')
   const locatedDeployment = deployments.data?.find((item) => item.id === deploymentTargetId)
   const visibleDeployments = locatedDeployment ? [locatedDeployment] : deployments.data ?? []
+  const locatorValidated = deployments.isFetchedAfterMount && !deployments.error
   const clearDeploymentLocator = () => {
     const next = new URLSearchParams(searchParams)
     next.delete('deployment')
@@ -1003,7 +1005,7 @@ export function DeploymentsPage() {
         description="管理已发现容器，并通过受控适配器创建新服务"
         extra={<Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新建部署</Button>}
       />
-      {deploymentTargetId && !deployments.isLoading && (
+      {deploymentTargetId && !deployments.error && (locatedDeployment || locatorValidated) && (
         <Alert
           type={locatedDeployment ? 'info' : 'warning'}
           showIcon

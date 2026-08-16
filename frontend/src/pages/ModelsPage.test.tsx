@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
@@ -69,6 +69,16 @@ const task: TaskRecord = {
   finished_at: null,
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, reject, resolve }
+}
+
 function renderModelsPage() {
   const user = userEvent.setup()
   vi.spyOn(api, 'get').mockResolvedValue(models)
@@ -94,15 +104,23 @@ function renderModelsPage() {
 
 async function openDeleteDialog(
   user: ReturnType<typeof userEvent.setup>,
-  index = 0,
+  modelName = 'Qwen/Qwen-Test',
 ) {
-  const deleteButtons = await screen.findAllByRole('button', { name: '删除模型' })
-  await user.click(deleteButtons[index])
+  const deleteButton = await screen.findByRole('button', { name: `删除模型 ${modelName}` })
+  await user.click(deleteButton)
   return screen.getByRole('dialog', { name: '永久删除模型' })
 }
 
 
 describe('ModelsPage permanent deletion', () => {
+  it('offers model-specific delete actions in the mobile list', async () => {
+    renderModelsPage()
+
+    expect(await screen.findByRole('button', { name: '删除模型 Qwen/Qwen-Test' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '删除模型 Local Model' })).toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
   it('offers delete actions in the desktop model table', async () => {
     vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
       matches: query.includes('min-width'),
@@ -117,7 +135,8 @@ describe('ModelsPage permanent deletion', () => {
     renderModelsPage()
 
     const table = await screen.findByRole('table')
-    expect(within(table).getAllByRole('button', { name: '删除模型' })).toHaveLength(2)
+    expect(within(table).getByRole('button', { name: '删除模型 Qwen/Qwen-Test' })).toBeInTheDocument()
+    expect(within(table).getByRole('button', { name: '删除模型 Local Model' })).toBeInTheDocument()
   })
 
   it('shows model details and requires an exact full-name confirmation', async () => {
@@ -197,11 +216,61 @@ describe('ModelsPage permanent deletion', () => {
     expect(await within(firstDialog).findByText('Primary service')).toBeInTheDocument()
 
     await user.click(within(firstDialog).getByRole('button', { name: /取\s*消/ }))
-    const secondDialog = await openDeleteDialog(user, 1)
+    const secondDialog = await openDeleteDialog(user, 'Local Model')
 
     expect(within(secondDialog).getByLabelText('输入完整模型名称')).toHaveValue('')
     expect(within(secondDialog).queryByText('Primary service')).not.toBeInTheDocument()
     expect(within(secondDialog).getByText('/models/local-model')).toBeInTheDocument()
+  })
+
+  it('blocks Escape while pending and ignores a late success after another model is opened', async () => {
+    const pending = deferred<TaskRecord>()
+    const { user, deleteSpy } = renderModelsPage()
+    deleteSpy.mockReturnValueOnce(pending.promise)
+    const secondDeleteButton = await screen.findByRole('button', { name: '删除模型 Local Model' })
+    const firstDialog = await openDeleteDialog(user)
+    await user.type(within(firstDialog).getByLabelText('输入完整模型名称'), 'Qwen/Qwen-Test')
+    await user.click(within(firstDialog).getByRole('button', { name: '永久删除' }))
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledTimes(1))
+
+    await user.keyboard('{Escape}')
+    expect(screen.getByRole('dialog', { name: '永久删除模型' })).toBeInTheDocument()
+    fireEvent.click(secondDeleteButton)
+    const secondDialog = screen.getByRole('dialog', { name: '永久删除模型' })
+    expect(within(secondDialog).getByText('/models/local-model')).toBeInTheDocument()
+
+    pending.resolve(task)
+
+    const permanentDeleteButton = within(secondDialog).getByText('永久删除').closest('button')
+    await waitFor(() => expect(permanentDeleteButton).not.toHaveClass('ant-btn-loading'))
+    expect(within(secondDialog).getByText('/models/local-model')).toBeInTheDocument()
+    expect(screen.queryByText('Primary service')).not.toBeInTheDocument()
+  })
+
+  it('ignores a late model-in-use conflict after another model is opened', async () => {
+    const pending = deferred<TaskRecord>()
+    const { user, deleteSpy } = renderModelsPage()
+    deleteSpy.mockReturnValueOnce(pending.promise)
+    const secondDeleteButton = await screen.findByRole('button', { name: '删除模型 Local Model' })
+    const firstDialog = await openDeleteDialog(user)
+    await user.type(within(firstDialog).getByLabelText('输入完整模型名称'), 'Qwen/Qwen-Test')
+    await user.click(within(firstDialog).getByRole('button', { name: '永久删除' }))
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledTimes(1))
+    fireEvent.click(secondDeleteButton)
+    const secondDialog = screen.getByRole('dialog', { name: '永久删除模型' })
+
+    pending.reject(new ApiError(409, '请求失败 (409)', {
+      code: 'model_in_use',
+      references: [
+        { deployment_id: 'deployment-base', deployment_name: 'Primary service', usage: 'base' },
+      ],
+    }))
+
+    const permanentDeleteButton = within(secondDialog).getByText('永久删除').closest('button')
+    await waitFor(() => expect(permanentDeleteButton).not.toHaveClass('ant-btn-loading'))
+    expect(within(secondDialog).getByText('/models/local-model')).toBeInTheDocument()
+    expect(screen.queryByText('Primary service')).not.toBeInTheDocument()
+    expect(secondDialog).toBeInTheDocument()
   })
 })
 
