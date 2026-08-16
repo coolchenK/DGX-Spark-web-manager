@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
+import stat
+from collections import namedtuple
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -73,11 +78,8 @@ SAFE_CARD_DATA_KEYS = (
     "tags",
 )
 
-FENCE_PATTERN = re.compile(
-    r"^[ \t]*```(?P<language>[A-Za-z0-9_-]*)[ \t]*\r?\n"
-    r"(?P<body>.*?)^[ \t]*```[ \t]*$",
-    re.MULTILINE | re.DOTALL,
-)
+OPEN_FENCE_LINE = re.compile(r"^[ \t]*```(?P<language>[A-Za-z0-9_-]*)[ \t]*(?:\r?\n)?$")
+CLOSE_FENCE_LINE = re.compile(r"^[ \t]*```[ \t]*(?:\r?\n)?$")
 QUANTIZATION_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REPOSITORY_ID = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -106,31 +108,100 @@ class ModelEvidence(BaseModel):
     warnings: list[str]
 
 
-def _safe_regular_file(model_root: Path, candidate: Path) -> bool:
-    if candidate.is_symlink() or not candidate.is_file():
-        return False
+Fence = namedtuple("Fence", "language body start end closed")
+
+
+def iter_fences(card_text: str) -> Iterator[Fence]:
+    """Yield fenced blocks with one linear pass over the bounded card text."""
+    lines = card_text.splitlines(keepends=True)
+    offset = 0
+    index = 0
+    while index < len(lines):
+        opening = OPEN_FENCE_LINE.fullmatch(lines[index])
+        if opening is None:
+            offset += len(lines[index])
+            index += 1
+            continue
+        start = offset
+        language = opening.group("language")
+        offset += len(lines[index])
+        index += 1
+        body_parts: list[str] = []
+        closed = False
+        while index < len(lines):
+            line = lines[index]
+            if CLOSE_FENCE_LINE.fullmatch(line):
+                offset += len(line)
+                index += 1
+                closed = True
+                break
+            body_parts.append(line)
+            offset += len(line)
+            index += 1
+        yield Fence(language, "".join(body_parts), start, offset, closed)
+
+
+@contextmanager
+def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
+    if os.name == "posix":
+        root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        root_fd = os.open(model_root, root_flags)
+        file_fd: int | None = None
+        try:
+            file_fd = os.open(
+                filename,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise ValueError("model evidence file is not regular")
+            with os.fdopen(file_fd, "rb") as stream:
+                file_fd = None
+                yield stream
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            os.close(root_fd)
+        return
+
+    candidate = model_root / filename
+    if candidate.is_symlink():
+        raise ValueError("model evidence file is a symlink")
+    with candidate.open("rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("model evidence file is not regular")
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_relative_to(model_root):
+            raise ValueError("model evidence file escapes model directory")
+        yield stream
+
+
+def _read_model_file(
+    model_root: Path, filename: str, max_bytes: int
+) -> tuple[bytes | None, str]:
     try:
-        return candidate.resolve(strict=True).is_relative_to(model_root)
-    except (OSError, RuntimeError):
-        return False
+        with _open_model_file(model_root, filename) as stream:
+            payload = stream.read(max_bytes + 1)
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, ValueError):
+        return None, "unreadable"
+    if len(payload) > max_bytes:
+        return payload, "too_large"
+    return payload, "ok"
 
 
 def _read_json_dict(model_root: Path, filename: str, warnings: list[str]) -> dict[str, Any]:
-    candidate = model_root / filename
-    if not candidate.exists() and not candidate.is_symlink():
+    payload, status = _read_model_file(model_root, filename, MAX_JSON_BYTES)
+    if status == "missing":
         return {}
-    if not _safe_regular_file(model_root, candidate):
+    if status == "unreadable":
         warnings.append(f"{filename} is not a safe regular file")
         return {}
-    try:
-        with candidate.open("rb") as stream:
-            payload = stream.read(MAX_JSON_BYTES + 1)
-    except OSError:
-        warnings.append(f"{filename} could not be read")
-        return {}
-    if len(payload) > MAX_JSON_BYTES:
+    if status == "too_large":
         warnings.append(f"{filename} exceeds the size limit")
         return {}
+    assert payload is not None
     try:
         value = json.loads(payload, parse_constant=_reject_json_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -143,37 +214,31 @@ def _read_json_dict(model_root: Path, filename: str, warnings: list[str]) -> dic
 
 
 def _read_card(model_root: Path, max_chars: int, warnings: list[str]) -> str:
-    candidate = model_root / "README.md"
-    if not candidate.exists() and not candidate.is_symlink():
+    payload, status = _read_model_file(model_root, "README.md", max_chars * 4 + 1)
+    if status == "missing":
         return ""
-    if not _safe_regular_file(model_root, candidate):
+    if status == "unreadable" or payload is None:
         warnings.append("README.md is not a safe regular file")
         return ""
-    try:
-        with candidate.open("r", encoding="utf-8", errors="replace") as stream:
-            text = stream.read(max_chars + 1)
-    except OSError:
-        warnings.append("README.md could not be read")
-        return ""
+    text = payload.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     if len(text) > max_chars:
         warnings.append("README.md was truncated")
     return text[:max_chars]
 
 
-def tokenizer_fingerprint(model_path: Path | str) -> str | None:
-    model_root = Path(model_path).resolve(strict=True)
+def _tokenizer_fingerprint(model_root: Path) -> tuple[str | None, list[str]]:
     digest = hashlib.sha256()
     found = False
+    warnings: list[str] = []
     for filename in sorted(TOKENIZER_FILES):
-        candidate = model_root / filename
-        if not candidate.exists() or not _safe_regular_file(model_root, candidate):
+        content, status = _read_model_file(model_root, filename, MAX_TOKENIZER_FILE_BYTES)
+        if status == "missing":
             continue
-        try:
-            with candidate.open("rb") as stream:
-                content = stream.read(MAX_TOKENIZER_FILE_BYTES + 1)
-        except OSError:
+        if status == "too_large":
+            warnings.append(f"{filename} is too large for tokenizer fingerprint")
             continue
-        if len(content) > MAX_TOKENIZER_FILE_BYTES:
+        if status != "ok" or content is None:
+            warnings.append(f"{filename} could not be read for tokenizer fingerprint")
             continue
         found = True
         encoded_name = filename.encode("utf-8")
@@ -181,7 +246,15 @@ def tokenizer_fingerprint(model_path: Path | str) -> str | None:
         digest.update(encoded_name)
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
-    return digest.hexdigest() if found else None
+    return (digest.hexdigest() if found else None), warnings
+
+
+def tokenizer_fingerprint(model_path: Path | str) -> str | None:
+    supplied_path = Path(model_path)
+    if not supplied_path.is_dir() or supplied_path.is_symlink():
+        raise ValueError("model directory must be a regular directory")
+    fingerprint, _warnings = _tokenizer_fingerprint(supplied_path.resolve(strict=True))
+    return fingerprint
 
 
 def _normalize_int(value: Any) -> int | None:
@@ -274,19 +347,24 @@ def _extract_shell_values(body: str) -> dict[str, int | float | bool | str]:
 
 
 def _sanitize_shell_fences(card_text: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        language = match.group("language")
-        if language.casefold() not in {"bash", "sh", "shell"}:
-            return match.group(0)
+    parts: list[str] = []
+    cursor = 0
+    for fence in iter_fences(card_text):
+        if fence.language.casefold() not in {"bash", "sh", "shell"}:
+            continue
+        parts.append(card_text[cursor : fence.start])
         try:
-            values = _extract_shell_values(match.group("body"))
+            values = _extract_shell_values(fence.body)
         except ValueError:
             values = {}
         safe_lines = [f"{key}={json.dumps(value)}" for key, value in sorted(values.items())]
         body = "\n".join(safe_lines)
-        return f"```{language}\n{body}\n```"
-
-    return FENCE_PATTERN.sub(replace, card_text)
+        parts.append(f"```{fence.language}\n{body}\n```")
+        cursor = fence.end
+    if not parts:
+        return card_text
+    parts.append(card_text[cursor:])
+    return "".join(parts)
 
 
 def _safe_card_data(value: dict[str, Any]) -> dict[str, Any]:
@@ -347,9 +425,12 @@ def _card_values(
 ) -> tuple[dict[str, int | float | bool | str], dict[str, Any]]:
     deployment: dict[str, int | float | bool | str] = {}
     generation: dict[str, Any] = {}
-    for match in FENCE_PATTERN.finditer(card_text):
-        language = match.group("language").casefold()
-        body = match.group("body")
+    for fence in iter_fences(card_text):
+        language = fence.language.casefold()
+        if not fence.closed and language in {"bash", "sh", "shell"}:
+            warnings.append("README.md contains a malformed shell fence")
+            continue
+        body = fence.body
         if language in {"bash", "sh", "shell"}:
             try:
                 deployment.update(_extract_shell_values(body))
@@ -391,7 +472,8 @@ class ModelEvidenceLoader:
         card_deployment_values, card_generation_values = _card_values(raw_card_text, warnings)
         card_text = _sanitize_shell_fences(raw_card_text)
         local_generation_values = _extract_generation_values(generation_config)
-        fingerprint = tokenizer_fingerprint(model_root)
+        fingerprint, tokenizer_warnings = _tokenizer_fingerprint(model_root)
+        warnings.extend(tokenizer_warnings)
         targets = _target_model_ids(card_data)
         method = _speculative_method(card_data)
         hash_payload = {

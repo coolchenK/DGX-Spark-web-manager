@@ -1,6 +1,8 @@
 import json
+import time
 
 import pytest
+from app.services import model_evidence
 from app.services.model_evidence import ModelEvidenceLoader, tokenizer_fingerprint
 
 
@@ -105,6 +107,34 @@ def test_tokenizer_fingerprint_changes_when_special_tokens_change(tmp_path):
     )
 
     assert tokenizer_fingerprint(first) != tokenizer_fingerprint(second)
+
+
+def test_unclosed_and_repeated_fences_are_scanned_linearly(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    body = "\n".join(
+        ["```bash", "vllm serve x --max-model-len 4096"] * 5_000
+    )
+    (model / "README.md").write_text(body, encoding="utf-8")
+
+    started = time.perf_counter()
+    evidence = ModelEvidenceLoader(card_max_chars=500_000).load(model)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 2
+    assert evidence.card_deployment_values == {}
+
+
+def test_oversized_tokenizer_file_is_reported_without_fingerprint(tmp_path, monkeypatch):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "tokenizer.json").write_bytes(b"12345")
+    monkeypatch.setattr(model_evidence, "MAX_TOKENIZER_FILE_BYTES", 4)
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+    assert evidence.tokenizer_fingerprint is None
+    assert evidence.warnings == ["tokenizer.json is too large for tokenizer fingerprint"]
 
 
 def test_invalid_oversized_and_non_dictionary_json_is_bounded(tmp_path):
@@ -278,6 +308,26 @@ def test_symlinked_evidence_files_outside_model_are_never_read(tmp_path):
 
     assert evidence.config == {}
     assert evidence.warnings == ["config.json is not a safe regular file"]
+
+
+def test_unreadable_tokenizer_file_is_reported_without_fingerprint(tmp_path, monkeypatch):
+    model = tmp_path / "model"
+    model.mkdir()
+    tokenizer = model / "tokenizer.json"
+    tokenizer.write_text("{}", encoding="utf-8")
+
+    original = model_evidence._read_model_file
+
+    def fail_tokenizer(root, filename, max_bytes):
+        if filename == "tokenizer.json":
+            return None, "unreadable"
+        return original(root, filename, max_bytes)
+
+    monkeypatch.setattr(model_evidence, "_read_model_file", fail_tokenizer)
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+    assert evidence.tokenizer_fingerprint is None
+    assert evidence.warnings == ["tokenizer.json could not be read for tokenizer fingerprint"]
 
 
 def test_generation_config_keeps_dict_but_only_exposes_generation_allowlist(tmp_path):

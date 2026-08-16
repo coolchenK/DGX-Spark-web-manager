@@ -66,7 +66,8 @@ def test_model_card_data_uses_hub_serialization_contract():
 
 def test_model_card_text_uses_download_contract_and_bounds_content(tmp_path, monkeypatch):
     cache_dir = tmp_path / "hub"
-    downloaded = tmp_path / "README.md"
+    downloaded = cache_dir / "README.md"
+    cache_dir.mkdir()
     downloaded.write_text("abcdef", encoding="utf-8")
     calls = []
 
@@ -87,6 +88,30 @@ def test_model_card_text_uses_download_contract_and_bounds_content(tmp_path, mon
             "token": "hf_test_token",
         }
     ]
+
+
+def test_model_card_text_rejects_downloaded_path_outside_cache(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "hub"
+    cache_dir.mkdir()
+    outside = tmp_path / "README.md"
+    outside.write_text("secret", encoding="utf-8")
+    monkeypatch.setattr(huggingface, "hf_hub_download", lambda **_kwargs: outside)
+    service = huggingface.HuggingFaceService(cache_dir)
+
+    with pytest.raises(ValueError, match="safe regular file"):
+        service.model_card_text("org/model")
+
+
+def test_model_card_text_rejects_downloaded_directory(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "hub"
+    cache_dir.mkdir()
+    downloaded = cache_dir / "README.md"
+    downloaded.mkdir()
+    monkeypatch.setattr(huggingface, "hf_hub_download", lambda **_kwargs: downloaded)
+    service = huggingface.HuggingFaceService(cache_dir)
+
+    with pytest.raises(ValueError, match="safe regular file"):
+        service.model_card_text("org/model")
 
 
 @pytest.mark.parametrize("max_chars", [0, -1, 500_001])

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -334,8 +335,23 @@ class HuggingFaceService:
             cache_dir=self.cache_dir,
             token=self.token,
         )
-        with Path(path).open("r", encoding="utf-8", errors="replace") as stream:
-            return stream.read(max_chars)
+        try:
+            cache_root = self.cache_dir.resolve(strict=True)
+            resolved_path = Path(path).resolve(strict=True)
+            if (
+                not resolved_path.is_relative_to(cache_root)
+                or not resolved_path.is_file()
+            ):
+                raise ValueError("Downloaded model card is not a safe regular file")
+            with resolved_path.open("rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("Downloaded model card is not a safe regular file")
+                payload = stream.read(max_chars * 4 + 1)
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError("Downloaded model card is not a safe regular file") from exc
+        return payload.decode("utf-8", errors="replace")[:max_chars]
 
     def download_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         repository_id = validate_repository_id(str(payload["repository_id"]))
