@@ -481,6 +481,106 @@ describe('recommendation client and hook', () => {
     await waitFor(() => expect(result.current.data).toEqual(secondResult))
   })
 
+  it('shares refresh ownership across hooks without old-hook cleanup aborting the winner', async () => {
+    const ordinary = recommendationFixture({ status: 'partial' })
+    const firstResult = recommendationFixture({ generated_at: '2026-08-16T06:00:00Z' })
+    const secondResult = recommendationFixture({ generated_at: '2026-08-16T07:00:00Z' })
+    const first = deferred<DeploymentRecommendation>()
+    const second = deferred<DeploymentRecommendation>()
+    const refreshSignals: Array<AbortSignal | null | undefined> = []
+    let refreshCalls = 0
+    vi.spyOn(api, 'post').mockImplementation((path, _body, options) => {
+      if (!path.includes('refresh_ai=true')) return Promise.resolve(ordinary)
+      refreshSignals.push(options?.signal)
+      return (++refreshCalls === 1 ? first : second).promise
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const options = {
+      modelId: 'model-1', runtime: 'vllm' as const, image: 'vllm:test', enabled: true,
+    }
+    const hook1 = renderHook(
+      () => useDeploymentRecommendation(options),
+      { wrapper: wrapper(queryClient) },
+    )
+    const hook2 = renderHook(
+      () => useDeploymentRecommendation(options),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(hook1.result.current.data).toEqual(ordinary))
+    await waitFor(() => expect(hook2.result.current.data).toEqual(ordinary))
+    const firstRefresh = hook1.result.current.refreshAI()
+    await waitFor(() => expect(refreshCalls).toBe(1))
+    const secondRefresh = hook2.result.current.refreshAI()
+    await waitFor(() => expect(refreshCalls).toBe(2))
+    expect(refreshSignals[0]?.aborted).toBe(true)
+
+    hook1.unmount()
+    expect(refreshSignals[1]?.aborted).toBe(false)
+    second.resolve(secondResult)
+    await expect(secondRefresh).resolves.toEqual(secondResult)
+    first.resolve(firstResult)
+    await expect(firstRefresh).rejects.toMatchObject({ name: 'AbortError' })
+    expect(queryClient.getQueryData([
+      'deployment-recommendation',
+      { modelId: 'model-1', runtime: 'vllm', image: 'vllm:test', providerId: null },
+    ])).toEqual(secondResult)
+  })
+
+  it('allows either hook to become the latest shared refresh owner', async () => {
+    const ordinary = recommendationFixture({ status: 'partial' })
+    const first = deferred<DeploymentRecommendation>()
+    const second = deferred<DeploymentRecommendation>()
+    const third = deferred<DeploymentRecommendation>()
+    const thirdResult = recommendationFixture({ generated_at: '2026-08-16T08:00:00Z' })
+    const pending = [first, second, third]
+    const refreshSignals: Array<AbortSignal | null | undefined> = []
+    let refreshCalls = 0
+    vi.spyOn(api, 'post').mockImplementation((path, _body, options) => {
+      if (!path.includes('refresh_ai=true')) return Promise.resolve(ordinary)
+      refreshSignals.push(options?.signal)
+      const current = pending[refreshCalls]
+      refreshCalls += 1
+      return current.promise
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const options = {
+      modelId: 'model-1', runtime: 'vllm' as const, image: 'vllm:test', enabled: true,
+    }
+    const hook1 = renderHook(
+      () => useDeploymentRecommendation(options),
+      { wrapper: wrapper(queryClient) },
+    )
+    const hook2 = renderHook(
+      () => useDeploymentRecommendation(options),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(hook1.result.current.data).toEqual(ordinary))
+    const refresh1 = hook1.result.current.refreshAI()
+    await waitFor(() => expect(refreshCalls).toBe(1))
+    const refresh2 = hook2.result.current.refreshAI()
+    await waitFor(() => expect(refreshCalls).toBe(2))
+    const refresh3 = hook1.result.current.refreshAI()
+    await waitFor(() => expect(refreshCalls).toBe(3))
+    expect(refreshSignals[0]?.aborted).toBe(true)
+    expect(refreshSignals[1]?.aborted).toBe(true)
+    expect(refreshSignals[2]?.aborted).toBe(false)
+
+    hook2.unmount()
+    expect(refreshSignals[2]?.aborted).toBe(false)
+    third.resolve(thirdResult)
+    await expect(refresh3).resolves.toEqual(thirdResult)
+    second.resolve(recommendationFixture({ generated_at: '2026-08-16T09:00:00Z' }))
+    first.resolve(recommendationFixture({ generated_at: '2026-08-16T10:00:00Z' }))
+    await expect(refresh2).rejects.toMatchObject({ name: 'AbortError' })
+    await expect(refresh1).rejects.toMatchObject({ name: 'AbortError' })
+    expect(queryClient.getQueryData([
+      'deployment-recommendation',
+      { modelId: 'model-1', runtime: 'vllm', image: 'vllm:test', providerId: null },
+    ])).toEqual(thirdResult)
+  })
+
   it.each(['disable', 'unmount', 'tuple-change'] as const)(
     'invalidates an AI refresh on %s even when transport ignores abort',
     async (transition) => {

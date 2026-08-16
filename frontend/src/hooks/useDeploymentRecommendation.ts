@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { api } from '../api/client'
@@ -25,17 +25,70 @@ interface StableRecommendationTuple {
   tuple: RecommendationTuple
 }
 
-interface RefreshOwnership {
+interface RefreshToken {
   sequence: number
-  controller: AbortController | null
-  tupleKey: string | null
+  owner: symbol
+  controller: AbortController
+  tupleKey: string
 }
+
+const refreshRegistries = new WeakMap<QueryClient, Map<string, RefreshToken>>()
+let refreshSequence = 0
 
 
 function refreshAbortError(controller: AbortController): Error {
   return controller.signal.reason instanceof Error
     ? controller.signal.reason
     : new DOMException('AI recommendation refresh was cancelled', 'AbortError')
+}
+
+
+function refreshRegistry(queryClient: QueryClient): Map<string, RefreshToken> {
+  let registry = refreshRegistries.get(queryClient)
+  if (!registry) {
+    registry = new Map()
+    refreshRegistries.set(queryClient, registry)
+  }
+  return registry
+}
+
+
+function acquireRefreshToken(
+  queryClient: QueryClient,
+  tupleKey: string,
+  owner: symbol,
+): RefreshToken {
+  const registry = refreshRegistry(queryClient)
+  const previous = registry.get(tupleKey)
+  const token: RefreshToken = {
+    sequence: ++refreshSequence,
+    owner,
+    controller: new AbortController(),
+    tupleKey,
+  }
+  registry.set(tupleKey, token)
+  previous?.controller.abort()
+  return token
+}
+
+
+function ownsRefreshToken(queryClient: QueryClient, token: RefreshToken): boolean {
+  const current = refreshRegistries.get(queryClient)?.get(token.tupleKey)
+  return current === token && current.sequence === token.sequence
+}
+
+
+function releaseRefreshToken(
+  queryClient: QueryClient,
+  token: RefreshToken,
+  abort: boolean,
+): boolean {
+  const registry = refreshRegistries.get(queryClient)
+  if (!registry || registry.get(token.tupleKey) !== token) return false
+  if (abort) token.controller.abort()
+  registry.delete(token.tupleKey)
+  if (registry.size === 0) refreshRegistries.delete(queryClient)
+  return true
 }
 
 
@@ -47,18 +100,14 @@ export function useDeploymentRecommendation({
   enabled,
 }: DeploymentRecommendationOptions) {
   const queryClient = useQueryClient()
-  const refreshOwnership = useRef<RefreshOwnership>({
-    sequence: 0,
-    controller: null,
-    tupleKey: null,
-  })
-  const invalidateRefresh = useCallback(() => {
-    const ownership = refreshOwnership.current
-    ownership.sequence += 1
-    ownership.controller?.abort()
-    ownership.controller = null
-    ownership.tupleKey = null
-  }, [])
+  const [refreshOwner] = useState(() => Symbol('deployment-recommendation-refresh'))
+  const ownedRefresh = useRef<RefreshToken | null>(null)
+  const releaseOwnedRefresh = useCallback(() => {
+    const token = ownedRefresh.current
+    if (!token || token.owner !== refreshOwner) return
+    releaseRefreshToken(queryClient, token, true)
+    if (ownedRefresh.current === token) ownedRefresh.current = null
+  }, [queryClient, refreshOwner])
   const normalizedProviderId = providerId ?? null
   const tuple = useMemo<RecommendationTuple>(() => ({
     modelId,
@@ -93,9 +142,9 @@ export function useDeploymentRecommendation({
     committedInput.current = { enabled, tupleKey }
     return () => {
       committedInput.current = { enabled: false, tupleKey: null }
-      invalidateRefresh()
+      releaseOwnedRefresh()
     }
-  }, [enabled, image, invalidateRefresh, modelId, normalizedProviderId, runtime, tupleKey])
+  }, [enabled, image, modelId, normalizedProviderId, releaseOwnedRefresh, runtime, tupleKey])
 
   const activeTuple = eligible && stable?.key === tupleKey ? stable.tuple : null
   const body = useMemo(() => activeTuple ? {
@@ -133,26 +182,18 @@ export function useDeploymentRecommendation({
     ) {
       throw new Error('Recommendation tuple is not stable')
     }
-    const ownership = refreshOwnership.current
-    ownership.controller?.abort()
-    const controller = new AbortController()
-    const sequence = ownership.sequence + 1
     const ownedTupleKey = stable.key
-    ownership.sequence = sequence
-    ownership.controller = controller
-    ownership.tupleKey = ownedTupleKey
+    const token = acquireRefreshToken(queryClient, ownedTupleKey, refreshOwner)
+    ownedRefresh.current = token
 
     const assertOwnership = () => {
-      const current = refreshOwnership.current
       if (
-        controller.signal.aborted
-        || current.sequence !== sequence
-        || current.controller !== controller
-        || current.tupleKey !== ownedTupleKey
+        token.controller.signal.aborted
+        || !ownsRefreshToken(queryClient, token)
         || !committedInput.current.enabled
         || committedInput.current.tupleKey !== ownedTupleKey
       ) {
-        throw refreshAbortError(controller)
+        throw refreshAbortError(token.controller)
       }
     }
 
@@ -162,7 +203,7 @@ export function useDeploymentRecommendation({
       const result = await api.post<DeploymentRecommendation>(
         '/api/deployments/recommendations?refresh_ai=true',
         body,
-        { signal: controller.signal },
+        { signal: token.controller.signal },
       )
       assertOwnership()
       await queryClient.cancelQueries({ queryKey, exact: true })
@@ -170,12 +211,10 @@ export function useDeploymentRecommendation({
       queryClient.setQueryData(queryKey, result)
       return result
     } finally {
-      const current = refreshOwnership.current
-      if (current.sequence === sequence && current.controller === controller) {
-        current.controller = null
-      }
+      releaseRefreshToken(queryClient, token, false)
+      if (ownedRefresh.current === token) ownedRefresh.current = null
     }
-  }, [activeTuple, body, queryClient, queryKey, stable])
+  }, [activeTuple, body, queryClient, queryKey, refreshOwner, stable])
 
   return { ...query, refreshAI }
 }
