@@ -39,7 +39,6 @@ export function ModelsPage() {
   const remove = useMutation({
     mutationFn: (model: ModelAsset) => api.delete<TaskRecord>(`/api/models/${model.id}`, { confirmation: model.name }),
     onSuccess: (_task, model) => {
-      if (deleteTargetRef.current?.id !== model.id) return
       closeDelete(model.id)
       message.success('模型删除任务已创建')
       queryClient.invalidateQueries({ queryKey: ['models'] })

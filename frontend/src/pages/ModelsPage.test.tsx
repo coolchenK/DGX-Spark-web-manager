@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { message } from 'antd'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
@@ -225,7 +226,8 @@ describe('ModelsPage permanent deletion', () => {
 
   it('blocks Escape while pending and ignores a late success after another model is opened', async () => {
     const pending = deferred<TaskRecord>()
-    const { user, deleteSpy } = renderModelsPage()
+    const successMessageSpy = vi.spyOn(message, 'success')
+    const { user, deleteSpy, invalidateSpy } = renderModelsPage()
     deleteSpy.mockReturnValueOnce(pending.promise)
     const secondDeleteButton = await screen.findByRole('button', { name: '删除模型 Local Model' })
     const firstDialog = await openDeleteDialog(user)
@@ -245,11 +247,15 @@ describe('ModelsPage permanent deletion', () => {
     await waitFor(() => expect(permanentDeleteButton).not.toHaveClass('ant-btn-loading'))
     expect(within(secondDialog).getByText('/models/local-model')).toBeInTheDocument()
     expect(screen.queryByText('Primary service')).not.toBeInTheDocument()
+    expect(successMessageSpy).toHaveBeenCalledWith('模型删除任务已创建')
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['models'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['tasks'] })
   })
 
   it('ignores a late model-in-use conflict after another model is opened', async () => {
     const pending = deferred<TaskRecord>()
-    const { user, deleteSpy } = renderModelsPage()
+    const successMessageSpy = vi.spyOn(message, 'success')
+    const { user, deleteSpy, invalidateSpy } = renderModelsPage()
     deleteSpy.mockReturnValueOnce(pending.promise)
     const secondDeleteButton = await screen.findByRole('button', { name: '删除模型 Local Model' })
     const firstDialog = await openDeleteDialog(user)
@@ -271,6 +277,8 @@ describe('ModelsPage permanent deletion', () => {
     expect(within(secondDialog).getByText('/models/local-model')).toBeInTheDocument()
     expect(screen.queryByText('Primary service')).not.toBeInTheDocument()
     expect(secondDialog).toBeInTheDocument()
+    expect(successMessageSpy).not.toHaveBeenCalled()
+    expect(invalidateSpy).not.toHaveBeenCalled()
   })
 })
 
