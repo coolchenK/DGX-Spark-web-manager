@@ -164,6 +164,7 @@ describe('ModelsPage permanent deletion', () => {
       references: [
         { deployment_id: 'deployment-base', deployment_name: 'Primary service', usage: 'base' },
         { deployment_id: 'deployment-draft', deployment_name: 'Draft service', usage: 'draft' },
+        { deployment_id: 'deployment-legacy', deployment_name: 'Legacy service', usage: 'legacy_path' },
       ],
     }))
     const dialog = await openDeleteDialog(user)
@@ -174,6 +175,7 @@ describe('ModelsPage permanent deletion', () => {
     const referenceItems = await within(dialog).findAllByRole('listitem')
     expect(referenceItems[0]).toHaveTextContent('Primary service · 基础模型')
     expect(referenceItems[1]).toHaveTextContent('Draft service · Draft Model')
+    expect(referenceItems[2]).toHaveTextContent('Legacy service · 旧路径引用')
     expect(within(dialog).getByRole('link', { name: 'Primary service' })).toHaveAttribute(
       'href',
       '/deployments?deployment=deployment-base',

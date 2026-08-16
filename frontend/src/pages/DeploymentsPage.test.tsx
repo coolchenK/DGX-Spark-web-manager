@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
@@ -322,6 +322,7 @@ const existingDeployment: Deployment = {
 
 interface ApiFixtureOptions {
   deployments?: Deployment[]
+  initialEntry?: string
   recommendations?: (
     path: string,
     body: Record<string, unknown>,
@@ -380,13 +381,77 @@ function renderDeploymentsPage(options: ApiFixtureOptions = {}) {
 
   render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/deployments']}>
+      <MemoryRouter initialEntries={[options.initialEntry ?? '/deployments']}>
         <DeploymentsPage />
       </MemoryRouter>
     </QueryClientProvider>,
   )
   return { user, getSpy, postSpy, patchSpy, queryClient }
 }
+
+
+describe('DeploymentsPage deployment locator', () => {
+  const secondDeployment: Deployment = {
+    ...existingDeployment,
+    id: 'deployment-2',
+    name: 'draft-production',
+    container_id: 'container-2',
+    container_name: 'dgx-draft-production',
+    endpoint_url: 'http://127.0.0.1:8200',
+    api_model_name: 'draft-production',
+    port: 8200,
+  }
+
+  it('locates a deployment from its direct URL on mobile and can show all deployments', async () => {
+    const { user } = renderDeploymentsPage({
+      deployments: [existingDeployment, secondDeployment],
+      initialEntry: '/deployments?deployment=deployment-1',
+    })
+
+    expect(await screen.findByText('正在定位部署 qwen-production')).toBeInTheDocument()
+    expect(screen.getAllByText('qwen-production')).toHaveLength(2)
+    expect(screen.queryAllByText('draft-production')).toHaveLength(0)
+    expect(screen.queryByText('编辑 qwen-production')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '显示全部部署' }))
+
+    expect(await screen.findAllByText('draft-production')).toHaveLength(2)
+    expect(screen.queryByText('正在定位部署 qwen-production')).not.toBeInTheDocument()
+  })
+
+  it('locates the requested deployment in the desktop table', async () => {
+    vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+      matches: query.includes('min-width'),
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }))
+    renderDeploymentsPage({
+      deployments: [existingDeployment, secondDeployment],
+      initialEntry: '/deployments?deployment=deployment-1',
+    })
+
+    const table = await screen.findByRole('table')
+    expect(within(table).getAllByText('qwen-production')).toHaveLength(2)
+    expect(within(table).queryAllByText('draft-production')).toHaveLength(0)
+    expect(screen.getByText('正在定位部署 qwen-production')).toBeInTheDocument()
+  })
+
+  it('shows a clear warning for an unknown deployment without hiding the list', async () => {
+    renderDeploymentsPage({
+      deployments: [existingDeployment, secondDeployment],
+      initialEntry: '/deployments?deployment=missing-deployment',
+    })
+
+    expect(await screen.findByText('未找到指定部署')).toBeInTheDocument()
+    expect(screen.getAllByText('qwen-production')).toHaveLength(2)
+    expect(screen.getAllByText('draft-production')).toHaveLength(2)
+  })
+})
 
 async function openCreateAndSelectModel(
   user: ReturnType<typeof userEvent.setup>,

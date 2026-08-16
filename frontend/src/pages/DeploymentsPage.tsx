@@ -13,6 +13,7 @@ import {
 } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  Alert,
   Button,
   Drawer,
   Flex,
@@ -268,7 +269,7 @@ function combinedResourceEstimate(
 
 export function DeploymentsPage() {
   const [form] = Form.useForm<DeploymentWizardValues>()
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
   const screens = Grid.useBreakpoint()
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [editingDeployment, setEditingDeployment] = useState<Deployment | null>(null)
@@ -293,6 +294,14 @@ export function DeploymentsPage() {
     queryFn: () => api.get<Deployment[]>('/api/deployments'),
     refetchInterval: 8_000,
   })
+  const deploymentTargetId = searchParams.get('deployment')
+  const locatedDeployment = deployments.data?.find((item) => item.id === deploymentTargetId)
+  const visibleDeployments = locatedDeployment ? [locatedDeployment] : deployments.data ?? []
+  const clearDeploymentLocator = () => {
+    const next = new URLSearchParams(searchParams)
+    next.delete('deployment')
+    setSearchParams(next, { replace: true })
+  }
   const models = useQuery({
     queryKey: ['models'],
     queryFn: () => api.get<ModelAsset[]>('/api/models'),
@@ -994,8 +1003,19 @@ export function DeploymentsPage() {
         description="管理已发现容器，并通过受控适配器创建新服务"
         extra={<Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新建部署</Button>}
       />
-      <QueryState loading={deployments.isLoading} error={deployments.error} empty={!deployments.data?.length}>
-        <ResponsiveDataView data={deployments.data ?? []} rowKey="id" columns={[
+      {deploymentTargetId && !deployments.isLoading && (
+        <Alert
+          type={locatedDeployment ? 'info' : 'warning'}
+          showIcon
+          message={locatedDeployment ? `正在定位部署 ${locatedDeployment.name}` : '未找到指定部署'}
+          description={locatedDeployment
+            ? '当前仅显示该部署实例。'
+            : `未找到 ID 为 ${deploymentTargetId} 的部署，当前显示全部部署。`}
+          action={<Button size="small" onClick={clearDeploymentLocator}>显示全部部署</Button>}
+        />
+      )}
+      <QueryState loading={deployments.isLoading} error={deployments.error} empty={!visibleDeployments.length}>
+        <ResponsiveDataView data={visibleDeployments} rowKey="id" columns={[
           { title: '实例', dataIndex: 'name', render: (_, item) => <div className="primary-cell"><strong>{item.name}</strong><small>{item.api_model_name}</small></div> },
           { title: '运行时', dataIndex: 'runtime', width: 100, render: (value) => <Tag>{value}</Tag> },
           { title: '端点', dataIndex: 'endpoint_url' },

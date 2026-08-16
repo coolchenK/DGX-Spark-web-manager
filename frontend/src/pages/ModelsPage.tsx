@@ -111,7 +111,7 @@ export function ModelsPage() {
                     {references.map((reference) => (
                       <li key={reference.deployment_id}>
                         <Link to={`/deployments?deployment=${reference.deployment_id}`}>{reference.deployment_name}</Link>
-                        {' · '}{reference.usage === 'draft' ? 'Draft Model' : '基础模型'}
+                        {' · '}{modelReferenceUsageLabels[reference.usage]}
                       </li>
                     ))}
                   </ul>
@@ -141,4 +141,10 @@ function isModelInUseDetail(detail: unknown): detail is ModelInUseDetail {
   if (typeof detail !== 'object' || detail === null) return false
   const value = detail as Partial<ModelInUseDetail>
   return value.code === 'model_in_use' && Array.isArray(value.references)
+}
+
+const modelReferenceUsageLabels: Record<ModelReference['usage'], string> = {
+  base: '基础模型',
+  draft: 'Draft Model',
+  legacy_path: '旧路径引用',
 }
