@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { Grid, message } from 'antd'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
@@ -672,6 +672,84 @@ describe('DeploymentsPage lifecycle actions', () => {
     })
     expect(managedUninstall).toHaveTextContent('卸载服务')
     expect(discoveredUninstall).toHaveTextContent('卸载服务')
+  })
+
+  it('tracks concurrent lifecycle actions by deployment until each request settles', async () => {
+    vi.spyOn(Grid, 'useBreakpoint').mockReturnValue({})
+    const stoppedDeployment: Deployment = {
+      ...existingDeployment,
+      id: 'deployment-2',
+      name: 'qwen-staging',
+      container_id: 'container-2',
+      container_name: 'dgx-qwen-staging',
+      endpoint_url: 'http://127.0.0.1:8200',
+      api_model_name: 'qwen-staging',
+      port: 8200,
+      status: 'stopped',
+    }
+    const pendingA = deferred<TaskRecord>()
+    const pendingB = deferred<TaskRecord>()
+    const { postSpy } = renderDeploymentsPage({
+      deployments: [existingDeployment, stoppedDeployment],
+    })
+    postSpy
+      .mockImplementationOnce(() => pendingA.promise)
+      .mockImplementationOnce(() => pendingB.promise)
+
+    const stopA = await screen.findByRole('button', { name: '停止实例 qwen-production' })
+    const rowA = stopA.closest('li') as HTMLElement
+    const restartA = within(rowA).getByRole('button', { name: '重启实例' })
+    const uninstallA = within(rowA).getByRole('button', {
+      name: '卸载服务 qwen-production',
+    })
+
+    act(() => {
+      stopA.click()
+      restartA.click()
+    })
+
+    await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(1))
+    expect(postSpy).toHaveBeenCalledWith('/api/deployments/deployment-1/stop')
+    expect(stopA).toBeDisabled()
+    expect(stopA).toHaveClass('ant-btn-loading')
+    expect(restartA).toBeDisabled()
+    expect(uninstallA).toBeDisabled()
+
+    const startB = screen.getByRole('button', { name: '启动实例 qwen-staging' })
+    const rowB = startB.closest('li') as HTMLElement
+    const restartB = within(rowB).getByRole('button', { name: '重启实例' })
+    const uninstallB = within(rowB).getByRole('button', { name: '卸载服务 qwen-staging' })
+    expect(startB).toBeEnabled()
+    expect(restartB).toBeEnabled()
+    expect(uninstallB).toBeEnabled()
+
+    fireEvent.click(startB)
+    await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(2))
+    expect(postSpy).toHaveBeenLastCalledWith('/api/deployments/deployment-2/start')
+    expect(startB).toHaveClass('ant-btn-loading')
+    expect(startB).toBeDisabled()
+    expect(restartB).toBeDisabled()
+    expect(uninstallB).toBeDisabled()
+    expect(stopA).toHaveClass('ant-btn-loading')
+    expect(stopA).toBeDisabled()
+    expect(restartA).toBeDisabled()
+    expect(uninstallA).toBeDisabled()
+
+    pendingB.resolve(task)
+    await waitFor(() => expect(startB).not.toHaveClass('ant-btn-loading'))
+    expect(startB).toBeEnabled()
+    expect(restartB).toBeEnabled()
+    expect(uninstallB).toBeEnabled()
+    expect(stopA).toHaveClass('ant-btn-loading')
+    expect(stopA).toBeDisabled()
+    expect(restartA).toBeDisabled()
+    expect(uninstallA).toBeDisabled()
+
+    pendingA.resolve(task)
+    await waitFor(() => expect(stopA).not.toHaveClass('ant-btn-loading'))
+    expect(stopA).toBeEnabled()
+    expect(restartA).toBeEnabled()
+    expect(uninstallA).toBeEnabled()
   })
 
   it('clears confirmation on target switches and ignores a late uninstall completion', async () => {

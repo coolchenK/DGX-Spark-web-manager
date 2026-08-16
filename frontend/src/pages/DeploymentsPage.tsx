@@ -269,6 +269,8 @@ function combinedResourceEstimate(
   }
 }
 
+type DeploymentActionName = 'start' | 'stop' | 'restart' | 'delete'
+
 
 export function DeploymentsPage() {
   const [form] = Form.useForm<DeploymentWizardValues>()
@@ -287,9 +289,13 @@ export function DeploymentsPage() {
   const [logsFor, setLogsFor] = useState<Deployment | null>(null)
   const [uninstallTarget, setUninstallTarget] = useState<Deployment | null>(null)
   const [uninstallConfirmation, setUninstallConfirmation] = useState('')
+  const [pendingDeploymentActions, setPendingDeploymentActions] = useState<
+    Map<string, DeploymentActionName>
+  >(new Map())
   const applyingRecommendation = useRef(false)
   const drawerOpenRef = useRef(false)
   const uninstallTargetRef = useRef<Deployment | null>(null)
+  const pendingDeploymentIdsRef = useRef<Set<string>>(new Set())
   const previewSequence = useRef(0)
   const previewController = useRef<AbortController | null>(null)
   const lastAppliedRecommendation = useRef<DeploymentRecommendation | null>(null)
@@ -672,21 +678,33 @@ export function DeploymentsPage() {
     setUninstallConfirmation('')
     setUninstallTarget(deployment)
   }
+  const clearPendingDeploymentAction = (deploymentId: string) => {
+    if (!pendingDeploymentIdsRef.current.delete(deploymentId)) return
+    setPendingDeploymentActions((current) => {
+      const next = new Map(current)
+      next.delete(deploymentId)
+      return next
+    })
+  }
   const action = useMutation({
-    mutationFn: ({
+    mutationFn: async ({
       deployment,
       actionName,
     }: {
       deployment: Deployment
-      actionName: 'start' | 'stop' | 'restart' | 'delete'
+      actionName: DeploymentActionName
     }) => {
       const path = `/api/deployments/${deployment.id}/${actionName}`
-      if (actionName === 'delete' && !deployment.managed) {
-        return api.post<TaskRecord>(path, {
-          confirm_container_name: deployment.container_name,
-        })
+      try {
+        if (actionName === 'delete' && !deployment.managed) {
+          return await api.post<TaskRecord>(path, {
+            confirm_container_name: deployment.container_name,
+          })
+        }
+        return await api.post<TaskRecord>(path)
+      } finally {
+        clearPendingDeploymentAction(deployment.id)
       }
-      return api.post<TaskRecord>(path)
     },
     onSuccess: (_task, { deployment, actionName }) => {
       if (actionName === 'delete' && !deployment.managed) {
@@ -712,10 +730,19 @@ export function DeploymentsPage() {
       message.error(error.message)
     },
   })
-  const discoveredUninstallPending = action.isPending
-    && action.variables?.actionName === 'delete'
-    && !action.variables.deployment.managed
-    && action.variables.deployment.id === uninstallTarget?.id
+  const runDeploymentAction = (
+    deployment: Deployment,
+    actionName: DeploymentActionName,
+  ) => {
+    if (pendingDeploymentIdsRef.current.has(deployment.id)) return
+    pendingDeploymentIdsRef.current.add(deployment.id)
+    setPendingDeploymentActions((current) => new Map(current).set(deployment.id, actionName))
+    action.mutate({ deployment, actionName })
+  }
+  const uninstallTargetPendingAction = uninstallTarget
+    ? pendingDeploymentActions.get(uninstallTarget.id)
+    : undefined
+  const discoveredUninstallPending = uninstallTargetPendingAction === 'delete'
 
   const handleRetryAI = async () => {
     const requestedTupleKey = recommendation.activeTupleKey
@@ -962,12 +989,10 @@ export function DeploymentsPage() {
   const operationButtons = (item: Deployment, mobile = false) => {
     const isRunning = item.status === 'running'
     const primaryAction = isRunning ? 'stop' : 'start'
-    const primaryPending = action.isPending
-      && action.variables?.deployment.id === item.id
-      && action.variables.actionName === primaryAction
-    const deletePending = action.isPending
-      && action.variables?.deployment.id === item.id
-      && action.variables.actionName === 'delete'
+    const pendingAction = pendingDeploymentActions.get(item.id)
+    const rowPending = Boolean(pendingAction)
+    const primaryPending = pendingAction === primaryAction
+    const deletePending = pendingAction === 'delete'
     const uninstallButton = (
       <Tooltip title={item.managed || item.container_name
         ? `卸载服务 ${item.name}`
@@ -978,7 +1003,7 @@ export function DeploymentsPage() {
             danger
             icon={<DeleteOutlined />}
             aria-label={`卸载服务 ${item.name}`}
-            disabled={!item.managed && !item.container_name}
+            disabled={rowPending || (!item.managed && !item.container_name)}
             loading={deletePending}
             onClick={item.managed ? undefined : () => openDiscoveredUninstall(item)}
           >
@@ -997,8 +1022,9 @@ export function DeploymentsPage() {
         <Button
           size={mobile ? 'middle' : 'small'}
           loading={primaryPending}
+          disabled={rowPending}
           icon={isRunning ? <StopOutlined /> : <PlayCircleOutlined />}
-          onClick={() => action.mutate({ deployment: item, actionName: primaryAction })}
+          onClick={() => runDeploymentAction(item, primaryAction)}
           aria-label={`${isRunning ? '停止实例' : '启动实例'} ${item.name}`}
         >
           {isRunning ? '停止实例' : '启动'}
@@ -1008,10 +1034,9 @@ export function DeploymentsPage() {
         <Button
           size={mobile ? 'middle' : 'small'}
           icon={<ReloadOutlined />}
-          loading={action.isPending
-            && action.variables?.deployment.id === item.id
-            && action.variables.actionName === 'restart'}
-          onClick={() => action.mutate({ deployment: item, actionName: 'restart' })}
+          loading={pendingAction === 'restart'}
+          disabled={rowPending}
+          onClick={() => runDeploymentAction(item, 'restart')}
           aria-label="重启实例"
         />
       </Tooltip>
@@ -1028,7 +1053,7 @@ export function DeploymentsPage() {
           okText="确认卸载"
           cancelText="取消"
           okButtonProps={{ danger: true }}
-          onConfirm={() => action.mutate({ deployment: item, actionName: 'delete' })}
+          onConfirm={() => runDeploymentAction(item, 'delete')}
         >
           {uninstallButton}
         </Popconfirm>
@@ -1187,16 +1212,14 @@ export function DeploymentsPage() {
         onCancel={() => {
           if (!discoveredUninstallPending) closeDiscoveredUninstall(uninstallTarget?.id)
         }}
-        onOk={() => uninstallTarget && action.mutate({
-          deployment: uninstallTarget,
-          actionName: 'delete',
-        })}
+        onOk={() => uninstallTarget && runDeploymentAction(uninstallTarget, 'delete')}
         okText="确认卸载"
         cancelText="取消"
         confirmLoading={discoveredUninstallPending}
         okButtonProps={{
           danger: true,
-          disabled: !uninstallTarget?.container_name
+          disabled: Boolean(uninstallTargetPendingAction)
+            || !uninstallTarget?.container_name
             || uninstallConfirmation !== uninstallTarget.container_name,
         }}
         cancelButtonProps={{ disabled: discoveredUninstallPending }}
