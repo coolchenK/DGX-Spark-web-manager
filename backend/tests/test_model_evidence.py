@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -340,7 +341,7 @@ def test_loader_keeps_the_unresolved_absolute_root_for_evidence_boundary_checks(
     assert evidence_roots == [original.absolute()] * 4
 
 
-def test_windows_blob_resolve_runtime_error_is_converted_at_the_read_boundary(
+def test_windows_blob_resolve_runtime_error_is_converted_to_value_error(
     tmp_path, monkeypatch
 ):
     repository, snapshot = _hub_snapshot(tmp_path)
@@ -379,7 +380,22 @@ def test_windows_blob_resolve_runtime_error_is_converted_at_the_read_boundary(
     monkeypatch.setattr(os, "readlink", fake_readlink)
     monkeypatch.setattr(Path, "resolve", fail_blob_resolve)
 
-    assert model_evidence._read_model_file(snapshot, "config.json", 1024) == (
+    with pytest.raises(ValueError, match="resolved safely"):
+        with model_evidence._open_windows_huggingface_blob(
+            snapshot, candidate, fake_link_stat
+        ):
+            pass
+
+
+def test_read_model_file_converts_value_error_to_unreadable(tmp_path, monkeypatch):
+    @contextmanager
+    def fail_open(*_args, **_kwargs):
+        raise ValueError("simulated safe path rejection")
+        yield
+
+    monkeypatch.setattr(model_evidence, "_open_model_file", fail_open)
+
+    assert model_evidence._read_model_file(tmp_path, "config.json", 1024) == (
         None,
         "unreadable",
     )
