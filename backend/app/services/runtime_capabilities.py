@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from threading import Lock
 from typing import Any, Literal
 
 import docker
@@ -90,8 +92,14 @@ PROBE_COMMANDS: dict[RuntimeName, tuple[str, list[str]]] = {
 }
 
 
+def _has_flag(help_text: str, flag: str) -> bool:
+    pattern = rf"(?<!\S){re.escape(flag)}(?=$|[\s=,])"
+    return re.search(pattern, help_text, flags=re.MULTILINE) is not None
+
+
 def _choice_values(help_text: str, flag: str) -> list[str]:
-    match = re.search(rf"{re.escape(flag)}[^\n{{}}]*\{{([^}}]+)\}}", help_text)
+    pattern = rf"(?<!\S){re.escape(flag)}(?=[\s=])[^\n{{}}]*\{{([^}}]+)\}}"
+    match = re.search(pattern, help_text)
     if not match:
         return []
     return [item.strip() for item in match.group(1).split(",") if item.strip()]
@@ -105,34 +113,46 @@ def parse_runtime_help(
     image_digest: str,
 ) -> RuntimeCapabilities:
     manifest = CONSERVATIVE_MANIFESTS[runtime]
-    method_mapping = dict(manifest["method_mapping"])
+    supported_mapping = dict(manifest["method_mapping"])
+    warnings: list[str] = []
 
     if runtime == "vllm":
-        has_speculative_config = "--speculative-config" in help_text
-        choices = _choice_values(help_text, "--speculative-config.method")
+        has_speculative_config = _has_flag(help_text, "--speculative-config")
+        choices = (
+            _choice_values(help_text, "--speculative-config.method")
+            if has_speculative_config
+            else []
+        )
         speculative_methods = [
             method
             for method in ("draft_model", "eagle", "eagle3", "mtp")
             if method in choices
         ]
-        if not choices and has_speculative_config:
-            speculative_methods = list(manifest["speculative_methods"])
         for method in speculative_methods:
-            method_mapping.setdefault(method, method)
+            supported_mapping.setdefault(method, method)
         transport = "json" if has_speculative_config else "none"
     else:
-        has_speculative_flags = "--speculative-" in help_text
-        choices = _choice_values(help_text, "--speculative-algorithm")
+        has_speculative_flags = _has_flag(help_text, "--speculative-algorithm")
+        choices = (
+            _choice_values(help_text, "--speculative-algorithm")
+            if has_speculative_flags
+            else []
+        )
         normalized_choices = {choice.upper() for choice in choices}
         speculative_methods = [
             method
-            for method, runtime_method in method_mapping.items()
+            for method, runtime_method in supported_mapping.items()
             if runtime_method in normalized_choices
         ]
-        if not choices and has_speculative_flags:
-            speculative_methods = list(manifest["speculative_methods"])
         transport = "flags" if has_speculative_flags else "none"
 
+    if transport != "none" and not speculative_methods:
+        warnings.append("Runtime help did not expose any recognized speculative methods")
+    method_mapping = {
+        method: supported_mapping[method]
+        for method in speculative_methods
+        if method in supported_mapping
+    }
     return RuntimeCapabilities(
         runtime=runtime,
         image=image,
@@ -144,6 +164,7 @@ def parse_runtime_help(
         speculative_methods=speculative_methods,
         method_mapping=method_mapping,
         speculative_transport=transport,
+        warnings=warnings,
     )
 
 
@@ -154,15 +175,29 @@ def _read_bounded_logs(logs: bytes | str | Iterable[bytes | str]) -> bytes:
         return logs[:MAX_PROBE_LOG_BYTES]
 
     output = bytearray()
-    for chunk in logs:
-        encoded = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
-        remaining = MAX_PROBE_LOG_BYTES - len(output)
-        if remaining <= 0:
-            break
-        output.extend(encoded[:remaining])
-        if len(output) >= MAX_PROBE_LOG_BYTES:
-            break
-    return bytes(output)
+    primary_error: BaseException | None = None
+    try:
+        for chunk in logs:
+            encoded = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+            remaining = MAX_PROBE_LOG_BYTES - len(output)
+            if remaining <= 0:
+                break
+            output.extend(encoded[:remaining])
+            if len(output) >= MAX_PROBE_LOG_BYTES:
+                break
+        return bytes(output)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        close = getattr(logs, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(f"Runtime probe log stream cleanup failed: {cleanup_error}")
 
 
 def run_runtime_probe(
@@ -173,6 +208,7 @@ def run_runtime_probe(
 ) -> str:
     entrypoint, command = PROBE_COMMANDS[runtime]
     container = None
+    primary_error: BaseException | None = None
     try:
         container = client.containers.run(
             image,
@@ -193,12 +229,26 @@ def run_runtime_probe(
         if status_code != 0:
             raise RuntimeError(f"Runtime capability probe exited with status {status_code}")
         return raw_logs.decode("utf-8", errors="replace")
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         if container is not None:
-            container.remove(force=True)
+            try:
+                container.remove(force=True)
+            except Exception as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(f"Runtime probe container cleanup failed: {cleanup_error}")
 
 
 ProbeRunner = Callable[[RuntimeName, str], str]
+
+
+class _KeyLockEntry:
+    def __init__(self):
+        self.lock = Lock()
+        self.users = 0
 
 
 class RuntimeCapabilityService:
@@ -210,12 +260,36 @@ class RuntimeCapabilityService:
         probe_runner: ProbeRunner | None = None,
     ):
         self.settings = settings
-        self.docker_client = docker_client if docker_client is not None else docker.from_env()
+        if docker_client is None:
+            self.docker_client = docker.from_env()
+        elif callable(docker_client):
+            self.docker_client = docker_client()
+        else:
+            self.docker_client = docker_client
         self.probe_runner = probe_runner or self._run_probe
         self._cache: dict[tuple[RuntimeName, str], RuntimeCapabilities] = {}
+        self._key_locks: dict[tuple[RuntimeName, str], _KeyLockEntry] = {}
+        self._key_locks_guard = Lock()
 
     def _run_probe(self, runtime: RuntimeName, image: str) -> str:
         return run_runtime_probe(self.docker_client, self.settings, runtime, image)
+
+    @contextmanager
+    def _key_lock(self, cache_key: tuple[RuntimeName, str]) -> Iterator[None]:
+        with self._key_locks_guard:
+            entry = self._key_locks.get(cache_key)
+            if entry is None:
+                entry = _KeyLockEntry()
+                self._key_locks[cache_key] = entry
+            entry.users += 1
+        try:
+            with entry.lock:
+                yield
+        finally:
+            with self._key_locks_guard:
+                entry.users -= 1
+                if entry.users == 0 and self._key_locks.get(cache_key) is entry:
+                    del self._key_locks[cache_key]
 
     def get(self, runtime: RuntimeName, image: str) -> RuntimeCapabilities:
         image_digest = str(self.docker_client.images.get(image).id)
@@ -224,23 +298,28 @@ class RuntimeCapabilityService:
         if cached is not None:
             return cached.model_copy(update={"image": image}, deep=True)
 
-        try:
-            help_text = self.probe_runner(runtime, image)
-            capabilities = parse_runtime_help(
-                runtime,
-                help_text,
-                image=image,
-                image_digest=image_digest,
-            )
-        except Exception as exc:
-            capabilities = RuntimeCapabilities(
-                runtime=runtime,
-                image=image,
-                image_digest=image_digest,
-                source="manifest",
-                **CONSERVATIVE_MANIFESTS[runtime],
-                warnings=[f"Runtime capability probe failed: {exc}"],
-            )
+        with self._key_lock(cache_key):
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached.model_copy(update={"image": image}, deep=True)
 
-        self._cache[cache_key] = capabilities.model_copy(deep=True)
-        return capabilities
+            try:
+                help_text = self.probe_runner(runtime, image)
+                capabilities = parse_runtime_help(
+                    runtime,
+                    help_text,
+                    image=image,
+                    image_digest=image_digest,
+                )
+            except Exception as exc:
+                capabilities = RuntimeCapabilities(
+                    runtime=runtime,
+                    image=image,
+                    image_digest=image_digest,
+                    source="manifest",
+                    **CONSERVATIVE_MANIFESTS[runtime],
+                    warnings=[f"Runtime capability probe failed: {exc}"],
+                )
+
+            self._cache[cache_key] = capabilities.model_copy(deep=True)
+            return capabilities

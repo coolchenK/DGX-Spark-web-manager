@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, BrokenBarrierError, Event, Lock
 from typing import Any
 
 import pytest
@@ -8,6 +10,7 @@ from app.services.runtime_capabilities import (
     GENERATION_DEFAULTS,
     MAX_PROBE_LOG_BYTES,
     RuntimeCapabilityService,
+    _read_bounded_logs,
     parse_runtime_help,
     run_runtime_probe,
 )
@@ -48,6 +51,69 @@ def test_parse_vllm_help_reports_known_capabilities():
     assert "modelopt_fp4" in capabilities.quantization_methods
 
 
+def test_vllm_parser_does_not_match_prefixed_flags():
+    capabilities = parse_runtime_help(
+        "vllm",
+        "--speculative-config-extra VALUE\n"
+        "--speculative-config.method-extra {draft_model,eagle3,mtp}",
+        image="vllm:test",
+        image_digest="sha256:vllm",
+    )
+
+    assert capabilities.speculative_transport == "none"
+    assert capabilities.speculative_methods == []
+
+
+def test_vllm_parser_keeps_transport_without_inventing_methods():
+    capabilities = parse_runtime_help(
+        "vllm",
+        "--speculative-config SPECULATIVE_CONFIG",
+        image="vllm:test",
+        image_digest="sha256:vllm",
+    )
+
+    assert capabilities.speculative_transport == "json"
+    assert capabilities.speculative_methods == []
+    assert capabilities.warnings
+
+
+def test_sglang_parser_ignores_unrelated_speculative_flags():
+    capabilities = parse_runtime_help(
+        "sglang",
+        "--speculative-num-steps N",
+        image="sglang:test",
+        image_digest="sha256:sglang",
+    )
+
+    assert capabilities.speculative_transport == "none"
+    assert capabilities.speculative_methods == []
+
+
+def test_sglang_parser_maps_exact_algorithm_choices():
+    capabilities = parse_runtime_help(
+        "sglang",
+        "--speculative-algorithm {EAGLE,EAGLE3,NEXTN,STANDALONE}",
+        image="sglang:test",
+        image_digest="sha256:sglang",
+    )
+
+    assert capabilities.speculative_transport == "flags"
+    assert capabilities.speculative_methods == ["draft_model", "eagle", "eagle3", "mtp"]
+
+
+def test_sglang_parser_keeps_transport_without_inventing_methods():
+    capabilities = parse_runtime_help(
+        "sglang",
+        "--speculative-algorithm ALGORITHM",
+        image="sglang:test",
+        image_digest="sha256:sglang",
+    )
+
+    assert capabilities.speculative_transport == "flags"
+    assert capabilities.speculative_methods == []
+    assert capabilities.warnings
+
+
 def test_capability_service_caches_by_runtime_and_image_digest():
     class Image:
         id = "sha256:shared"
@@ -83,6 +149,29 @@ def test_capability_service_caches_by_runtime_and_image_digest():
     assert second.image_digest == "sha256:shared"
 
 
+def test_capability_service_accepts_a_docker_client_factory():
+    image = type("Image", (), {"id": "sha256:factory"})()
+    images = type("Images", (), {"get": lambda self, _name: image})()
+    client = type("Client", (), {"images": images})()
+    factory_calls = 0
+
+    def client_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return client
+
+    service = RuntimeCapabilityService(
+        settings=make_settings(),
+        docker_client=client_factory,
+        probe_runner=lambda _runtime, _image: "--speculative-config",
+    )
+
+    result = service.get("vllm", "vllm:test")
+
+    assert result.image_digest == "sha256:factory"
+    assert factory_calls == 1
+
+
 def test_capability_service_cache_is_not_mutated_by_callers():
     image = type("Image", (), {"id": "sha256:immutable"})()
     images = type("Images", (), {"get": lambda self, _name: image})()
@@ -99,6 +188,89 @@ def test_capability_service_cache_is_not_mutated_by_callers():
     second = service.get("vllm", "vllm:second")
 
     assert "caller-added" not in second.speculative_methods
+
+
+def test_same_digest_concurrent_misses_run_only_one_probe():
+    image_barrier = Barrier(2)
+
+    class Images:
+        @staticmethod
+        def get(_image: str):
+            image_barrier.wait(timeout=2)
+            return type("Image", (), {"id": "sha256:shared-concurrent"})()
+
+    client = type("Client", (), {"images": Images()})()
+    probe_started = Event()
+    second_probe_started = Event()
+    release_probe = Event()
+    calls_lock = Lock()
+    probe_calls = 0
+
+    def probe_runner(_runtime: str, _image: str) -> str:
+        nonlocal probe_calls
+        with calls_lock:
+            probe_calls += 1
+            if probe_calls == 2:
+                second_probe_started.set()
+        probe_started.set()
+        assert release_probe.wait(timeout=2)
+        return "--speculative-config"
+
+    service = RuntimeCapabilityService(
+        settings=make_settings(),
+        docker_client=client,
+        probe_runner=probe_runner,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(service.get, "vllm", "vllm:first")
+        second = executor.submit(service.get, "vllm", "vllm:second")
+        assert probe_started.wait(timeout=2)
+        try:
+            assert not second_probe_started.wait(timeout=0.5)
+        finally:
+            release_probe.set()
+        results = [first.result(timeout=2), second.result(timeout=2)]
+
+    assert probe_calls == 1
+    assert {result.image for result in results} == {"vllm:first", "vllm:second"}
+    assert service._key_locks == {}
+
+
+def test_different_digest_misses_probe_in_parallel():
+    image_ids = {"vllm:first": "sha256:first", "vllm:second": "sha256:second"}
+
+    class Images:
+        @staticmethod
+        def get(image: str):
+            return type("Image", (), {"id": image_ids[image]})()
+
+    client = type("Client", (), {"images": Images()})()
+    probe_barrier = Barrier(2)
+
+    def probe_runner(_runtime: str, _image: str) -> str:
+        try:
+            probe_barrier.wait(timeout=1)
+        except BrokenBarrierError as exc:
+            raise RuntimeError("probes were serialized") from exc
+        return "--speculative-config"
+
+    service = RuntimeCapabilityService(
+        settings=make_settings(),
+        docker_client=client,
+        probe_runner=probe_runner,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda image: service.get("vllm", image),
+                ("vllm:first", "vllm:second"),
+            )
+        )
+
+    assert [result.source for result in results] == ["probe", "probe"]
+    assert service._key_locks == {}
 
 
 def test_probe_failure_falls_back_to_conservative_manifest():
@@ -230,3 +402,103 @@ def test_production_probe_removes_container_when_wait_fails():
         run_runtime_probe(client, make_settings(), "sglang", "sglang:test")
 
     assert container.removed_force is True
+
+
+def test_bounded_log_reader_closes_stream_after_reaching_limit():
+    class LogStream:
+        closed = False
+
+        def __iter__(self):
+            yield b"x" * MAX_PROBE_LOG_BYTES
+            raise AssertionError("reader consumed beyond its byte limit")
+
+        def close(self):
+            self.closed = True
+
+    stream = LogStream()
+
+    output = _read_bounded_logs(stream)
+
+    assert len(output) == MAX_PROBE_LOG_BYTES
+    assert stream.closed is True
+
+
+def test_bounded_log_reader_closes_stream_when_iteration_fails():
+    class LogStream:
+        closed = False
+
+        def __iter__(self):
+            yield b"partial"
+            raise RuntimeError("stream failed")
+
+        def close(self):
+            self.closed = True
+
+    stream = LogStream()
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        _read_bounded_logs(stream)
+
+    assert stream.closed is True
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("wait", "wait failed"),
+        ("logs", "logs failed"),
+        ("status", "exited with status 7"),
+    ],
+)
+def test_cleanup_failure_does_not_replace_probe_failure(failure: str, message: str):
+    class Container:
+        @staticmethod
+        def wait(*, timeout: int):
+            if failure == "wait":
+                raise RuntimeError("wait failed")
+            return {"StatusCode": 7 if failure == "status" else 0}
+
+        @staticmethod
+        def logs(**_kwargs: Any):
+            if failure == "logs":
+                raise RuntimeError("logs failed")
+            return b"help"
+
+        @staticmethod
+        def remove(*, force: bool):
+            raise RuntimeError("remove failed")
+
+    container = Container()
+    containers = type("Containers", (), {"run": lambda self, *args, **kwargs: container})()
+    client = type("Client", (), {"containers": containers})()
+
+    with pytest.raises(RuntimeError, match=message) as captured:
+        run_runtime_probe(client, make_settings(), "vllm", "vllm:test")
+
+    assert any("remove failed" in note for note in getattr(captured.value, "__notes__", []))
+
+
+def test_cleanup_failure_is_reported_after_successful_probe():
+    cleanup_error = RuntimeError("remove failed")
+
+    class Container:
+        @staticmethod
+        def wait(*, timeout: int):
+            return {"StatusCode": 0}
+
+        @staticmethod
+        def logs(**_kwargs: Any):
+            return b"help"
+
+        @staticmethod
+        def remove(*, force: bool):
+            raise cleanup_error
+
+    container = Container()
+    containers = type("Containers", (), {"run": lambda self, *args, **kwargs: container})()
+    client = type("Client", (), {"containers": containers})()
+
+    with pytest.raises(RuntimeError, match="remove failed") as captured:
+        run_runtime_probe(client, make_settings(), "vllm", "vllm:test")
+
+    assert captured.value is cleanup_error
