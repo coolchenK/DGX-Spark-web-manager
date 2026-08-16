@@ -509,6 +509,47 @@ def test_download_handler_runs_disk_preflight_before_starting_cli(tmp_path, monk
         )
 
 
+def test_download_handler_rejects_successful_cli_without_snapshot(tmp_path, monkeypatch):
+    service = huggingface.HuggingFaceService(tmp_path / "hub")
+    monkeypatch.setattr(
+        service,
+        "info",
+        lambda *_args: {"sha": "abc", "siblings": [], "total_size": 0},
+    )
+    monkeypatch.setattr(huggingface.shutil, "which", lambda _name: "/usr/bin/hf")
+    monkeypatch.setattr(huggingface, "resolve_hf_snapshot", lambda _target: None)
+    monkeypatch.setattr(
+        huggingface,
+        "verify_snapshot_files",
+        lambda *_args, **_kwargs: pytest.fail("invalid snapshot was verified"),
+    )
+
+    class CompletedProcess:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pytest.fail("completed process was terminated")
+
+    monkeypatch.setattr(
+        huggingface.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: CompletedProcess(),
+    )
+
+    class Context:
+        def update(self, **_kwargs):
+            return None
+
+    with pytest.raises(RuntimeError, match="no valid snapshot"):
+        service.download_handler(
+            Context(),
+            {"repository_id": "org/model", "revision": "main"},
+        )
+
+
 def test_snapshot_integrity_check_requires_every_selected_file(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()

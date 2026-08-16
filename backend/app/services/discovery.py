@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ def parse_hf_cache_repository(directory_name: str) -> str | None:
     return "/".join(parts)
 
 
-def resolve_hf_snapshot(repository_path: Path) -> Path:
+def resolve_hf_snapshot(repository_path: Path) -> Path | None:
     main_ref = repository_path / "refs" / "main"
     try:
         commit_hash = main_ref.read_text(encoding="utf-8").strip()
@@ -34,10 +35,20 @@ def resolve_hf_snapshot(repository_path: Path) -> Path:
 
     snapshots = repository_path / "snapshots"
     if snapshots.is_dir():
-        candidates = [path for path in snapshots.iterdir() if path.is_dir()]
+        candidates: list[tuple[int, Path]] = []
+        try:
+            entries = snapshots.iterdir()
+            for path in entries:
+                try:
+                    if path.is_dir():
+                        candidates.append((path.stat().st_mtime_ns, path))
+                except OSError:
+                    continue
+        except OSError:
+            return None
         if candidates:
-            return max(candidates, key=lambda path: path.stat().st_mtime_ns)
-    return repository_path
+            return max(candidates, key=lambda candidate: candidate[0])[1]
+    return None
 
 
 def infer_runtime(image: str, command: list[str]) -> str | None:
@@ -203,6 +214,34 @@ def merge_deployment_config(
     return {**saved, **{key: value for key, value in observed.items() if value is not None}}
 
 
+def _mark_model_unavailable(
+    asset: ModelAsset,
+    *,
+    local_path: Path | None = None,
+    size_bytes: int = 0,
+) -> None:
+    if local_path is not None:
+        asset.local_path = str(local_path)
+    asset.size_bytes = size_bytes
+    asset.status = "unavailable"
+    asset.commit_hash = None
+    asset.revision = None
+    asset.format = None
+    asset.quantization = None
+    asset.parameter_count = None
+    asset.capabilities = []
+    asset.metadata_json = {}
+
+
+def _lexically_within_root(local_path: str, root: Path) -> bool:
+    try:
+        candidate = Path(os.path.abspath(local_path))
+        boundary = Path(os.path.abspath(root))
+    except (OSError, TypeError, ValueError):
+        return False
+    return candidate.is_relative_to(boundary)
+
+
 class DiscoveryService:
     def __init__(self, model_roots: tuple[Path, ...]):
         self.model_roots = model_roots
@@ -278,6 +317,7 @@ class DiscoveryService:
 
     def scan_models(self, db: Session) -> list[ModelAsset]:
         discovered: list[ModelAsset] = []
+        successful_roots: list[Path] = []
         for root in self.model_roots:
             try:
                 if not root.exists() or not root.is_dir():
@@ -285,6 +325,7 @@ class DiscoveryService:
                 children = list(root.iterdir())
             except OSError:
                 continue
+            successful_roots.append(Path(os.path.abspath(root)))
             for child in children:
                 try:
                     is_model_directory = child.is_dir() and not child.name.startswith(".")
@@ -294,7 +335,8 @@ class DiscoveryService:
                     continue
                 repository_id = parse_hf_cache_repository(child.name)
                 source = "huggingface" if repository_id else "local"
-                local_path = resolve_hf_snapshot(child) if repository_id else child
+                snapshot = resolve_hf_snapshot(child) if repository_id else None
+                local_path = snapshot or child
                 if repository_id:
                     existing = db.scalar(
                         select(ModelAsset).where(
@@ -315,6 +357,14 @@ class DiscoveryService:
                         capabilities=[],
                     )
                     db.add(existing)
+                if repository_id and snapshot is None:
+                    _mark_model_unavailable(
+                        existing,
+                        local_path=child,
+                        size_bytes=directory_size(child),
+                    )
+                    discovered.append(existing)
+                    continue
                 metadata = infer_model_metadata(local_path, repository_id or child.name)
                 existing.local_path = str(local_path)
                 existing.size_bytes = directory_size(child)
@@ -337,6 +387,20 @@ class DiscoveryService:
                 existing.parameter_count = metadata["parameter_count"]
                 existing.capabilities = metadata["capabilities"]
                 discovered.append(existing)
+        db.flush()
+        discovered_ids = {asset.id for asset in discovered}
+        if successful_roots:
+            available_assets = db.scalars(
+                select(ModelAsset).where(ModelAsset.status == "available")
+            ).all()
+            for asset in available_assets:
+                if asset.id in discovered_ids:
+                    continue
+                if any(
+                    _lexically_within_root(asset.local_path, root)
+                    for root in successful_roots
+                ):
+                    _mark_model_unavailable(asset)
         db.commit()
         return discovered
 

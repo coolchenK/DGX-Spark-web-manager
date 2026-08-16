@@ -432,6 +432,8 @@ class HuggingFaceService:
                 )
         completed = directory_size(target)
         snapshot = resolve_hf_snapshot(target)
+        if snapshot is None:
+            raise RuntimeError("Downloaded repository has no valid snapshot")
         verified_files = verify_snapshot_files(
             snapshot,
             info["siblings"],

@@ -1,6 +1,8 @@
 import json
 import os
 
+from app.db import Database
+from app.models import ModelAsset
 from app.services import discovery
 from app.services.discovery import (
     DiscoveryService,
@@ -9,6 +11,7 @@ from app.services.discovery import (
     parse_hf_cache_repository,
     resolve_hf_snapshot,
 )
+from sqlalchemy import select
 
 
 def test_parse_hugging_face_cache_repository():
@@ -40,6 +43,131 @@ def test_resolve_hf_snapshot_uses_newest_snapshot_without_main_ref(tmp_path):
     os.utime(newer, (2, 2))
 
     assert resolve_hf_snapshot(repository) == newer
+
+
+def test_resolve_hf_snapshot_returns_none_without_a_valid_snapshot(tmp_path):
+    repository = tmp_path / "models--org--model"
+    repository.mkdir()
+
+    assert resolve_hf_snapshot(repository) is None
+
+
+def test_scan_hf_repository_without_snapshot_creates_unavailable_asset(settings):
+    root = settings.model_root_paths[0]
+    repository = root / "models--org--model"
+    repository.mkdir(parents=True)
+    database = Database(settings.database_url)
+    database.create_schema()
+
+    with database.session_factory() as db:
+        discovered = DiscoveryService((root,)).scan_models(db)
+        asset = db.scalar(select(ModelAsset).where(ModelAsset.repository_id == "org/model"))
+
+    assert discovered == [asset]
+    assert asset is not None
+    assert asset.status == "unavailable"
+    assert asset.local_path == str(repository)
+    assert asset.commit_hash is None
+    assert asset.revision is None
+    assert asset.format is None
+    assert asset.quantization is None
+    assert asset.parameter_count is None
+    assert asset.capabilities == []
+
+
+def test_scan_marks_missing_asset_unavailable_and_recovers_when_snapshot_returns(settings):
+    root = settings.model_root_paths[0]
+    root.mkdir()
+    repository = root / "models--Qwen--Qwen2.5-0.5B-Instruct"
+    missing_snapshot = repository / "snapshots" / "missing"
+    database = Database(settings.database_url)
+    database.create_schema()
+    with database.session_factory() as db:
+        asset = ModelAsset(
+            name="Qwen/Qwen2.5-0.5B-Instruct",
+            source="huggingface",
+            repository_id="Qwen/Qwen2.5-0.5B-Instruct",
+            local_path=str(missing_snapshot),
+            status="available",
+            commit_hash="missing",
+            revision="main",
+            format="safetensors",
+            quantization="awq",
+            parameter_count="0.5B",
+            capabilities=["chat", "completion"],
+            metadata_json={"deployable": True},
+        )
+        db.add(asset)
+        db.commit()
+        asset_id = asset.id
+
+        assert DiscoveryService((root,)).scan_models(db) == []
+        db.refresh(asset)
+        assert asset.status == "unavailable"
+        assert asset.commit_hash is None
+        assert asset.revision is None
+        assert asset.format is None
+        assert asset.quantization is None
+        assert asset.parameter_count is None
+        assert asset.capabilities == []
+        assert asset.metadata_json == {}
+
+        snapshot = repository / "snapshots" / "commit123"
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(
+            '{"architectures":["Qwen2ForCausalLM"]}', encoding="utf-8"
+        )
+        (snapshot / "model.safetensors").write_bytes(b"weights")
+
+        recovered = DiscoveryService((root,)).scan_models(db)
+        restored = db.get(ModelAsset, asset_id)
+
+    assert recovered == [restored]
+    assert restored is not None
+    assert restored.status == "available"
+    assert restored.local_path == str(snapshot)
+    assert restored.commit_hash == "commit123"
+    assert restored.revision == "commit123"
+    assert restored.format == "safetensors"
+    assert restored.capabilities == ["chat", "completion"]
+
+
+def test_scan_does_not_mark_assets_unavailable_when_root_scan_fails(settings, tmp_path):
+    root_path = tmp_path / "inaccessible-models"
+
+    class InaccessibleRoot:
+        def __fspath__(self):
+            return str(root_path)
+
+        def exists(self):
+            return True
+
+        def is_dir(self):
+            return True
+
+        def iterdir(self):
+            raise PermissionError("not readable")
+
+    database = Database(settings.database_url)
+    database.create_schema()
+    with database.session_factory() as db:
+        asset = ModelAsset(
+            name="protected",
+            source="local",
+            local_path=str(root_path / "protected"),
+            status="available",
+            format="safetensors",
+            capabilities=["chat"],
+        )
+        db.add(asset)
+        db.commit()
+
+        assert DiscoveryService((InaccessibleRoot(),)).scan_models(db) == []
+        db.refresh(asset)
+
+    assert asset.status == "available"
+    assert asset.format == "safetensors"
+    assert asset.capabilities == ["chat"]
 
 
 def test_scan_models_skips_inaccessible_roots(settings):
@@ -139,6 +267,31 @@ def test_scan_uses_commit_as_revision_when_no_named_ref_exists(settings):
 
     assert model.commit_hash == "commit123"
     assert model.revision == "commit123"
+
+
+def test_scan_preserves_local_model_discovery_behavior(settings):
+    root = settings.model_root_paths[0]
+    model_path = root / "local-model-7B"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text(
+        '{"architectures":["LocalForCausalLM"]}', encoding="utf-8"
+    )
+    (model_path / "model.safetensors").write_bytes(b"weights")
+    database = Database(settings.database_url)
+    database.create_schema()
+
+    with database.session_factory() as db:
+        discovered = DiscoveryService((root,)).scan_models(db)
+
+    assert len(discovered) == 1
+    model = discovered[0]
+    assert model.source == "local"
+    assert model.repository_id is None
+    assert model.local_path == str(model_path)
+    assert model.status == "available"
+    assert model.format == "safetensors"
+    assert model.parameter_count == "7B"
+    assert model.capabilities == ["chat", "completion"]
 
 
 def test_directory_size_does_not_double_count_linked_blobs(tmp_path):
