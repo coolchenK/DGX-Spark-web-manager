@@ -15,9 +15,11 @@ from sqlalchemy.orm import Session
 
 from app.models import Deployment, ModelAsset
 from app.services.discovery import directory_size
+from app.tasks.engine import TaskCancelled, TaskPaused
 from app.tasks.huggingface import cache_repository_path, validate_repository_id
 
 COMMAND_TIMEOUT_SECONDS = 120
+OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 HF_TARGET_ID_KEYS = {"repository_id", "repo_id", "id", "target"}
 HF_TARGET_LIST_KEYS = {
     "targets",
@@ -58,12 +60,14 @@ class ModelLifecycleService:
         session_factory: Callable[[], Session] | None = None,
         discovery_service: Any | None = None,
         command_runner: Callable[[list[str]], Any] | None = None,
+        local_remover: Callable[[Path, Path], None] | None = None,
     ):
         self.model_roots = model_roots
         self.hf_cache_dir = hf_cache_dir
         self.session_factory = session_factory
         self.discovery_service = discovery_service
         self.command_runner = command_runner or self._default_command_runner
+        self.local_remover = local_remover or self._secure_rmtree
 
     @staticmethod
     def _default_command_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -86,18 +90,67 @@ class ModelLifecycleService:
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         return bool(reparse_flag and attributes & reparse_flag)
 
-    def validate_local_target(self, target: Path) -> Path:
+    @staticmethod
+    def _secure_rmtree(root_lexical: Path, target_lexical: Path) -> None:
+        if (
+            os.name != "posix"
+            or not getattr(shutil.rmtree, "avoids_symlink_attacks", False)
+            or not hasattr(os, "O_DIRECTORY")
+            or not hasattr(os, "O_NOFOLLOW")
+            or not OPEN_SUPPORTS_DIR_FD
+        ):
+            raise RuntimeError("Secure local deletion is unsupported on this platform")
+
+        relative = target_lexical.relative_to(root_lexical)
+        if not relative.parts:
+            raise ValueError("Local model target cannot equal a configured model root")
+
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        opened: list[int] = []
+        try:
+            opened.append(os.open(root_lexical, flags))
+            for component in relative.parts[:-1]:
+                opened.append(os.open(component, flags, dir_fd=opened[-1]))
+            shutil.rmtree(relative.parts[-1], dir_fd=opened[-1])
+        except OSError as exc:
+            raise RuntimeError("Secure local model deletion failed") from exc
+        finally:
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+
+    def _validated_local_paths(self, target: Path) -> tuple[Path, Path, Path]:
         try:
             lexical_target = Path(os.path.abspath(target))
             if not lexical_target.exists() or not lexical_target.is_dir():
                 raise ValueError("Local model target must be an existing directory")
 
+            normalized_roots: list[tuple[Path, Path]] = []
             for configured_root in self.model_roots:
                 lexical_root = Path(os.path.abspath(configured_root))
-                if lexical_target == lexical_root or not lexical_target.is_relative_to(
-                    lexical_root
-                ):
-                    continue
+                if self._is_link_or_reparse(lexical_root):
+                    raise ValueError(
+                        "Local model path cannot contain a symbolic link or reparse point"
+                    )
+                resolved_root = lexical_root.resolve(strict=True)
+                normalized_roots.append((lexical_root, resolved_root))
+
+            resolved_target = lexical_target.resolve(strict=True)
+            if any(
+                lexical_target == lexical_root or resolved_target == resolved_root
+                for lexical_root, resolved_root in normalized_roots
+            ):
+                raise ValueError(
+                    "Local model target must be inside a configured model root"
+                )
+
+            candidates = [
+                (lexical_root, resolved_root)
+                for lexical_root, resolved_root in normalized_roots
+                if lexical_target.is_relative_to(lexical_root)
+                and resolved_target.is_relative_to(resolved_root)
+            ]
+            candidates.sort(key=lambda item: len(item[0].parts), reverse=True)
+            for lexical_root, _resolved_root in candidates:
 
                 relative_target = lexical_target.relative_to(lexical_root)
                 components = [lexical_root]
@@ -109,20 +162,16 @@ class ModelLifecycleService:
                     raise ValueError(
                         "Local model path cannot contain a symbolic link or reparse point"
                     )
-
-                resolved_root = lexical_root.resolve(strict=True)
-                resolved_target = lexical_target.resolve(strict=True)
-                if (
-                    resolved_target != resolved_root
-                    and resolved_target.is_relative_to(resolved_root)
-                ):
-                    return resolved_target
+                return lexical_root, lexical_target, resolved_target
         except ValueError:
             raise
         except (OSError, RuntimeError) as exc:
             raise ValueError("Unable to resolve the local model target") from exc
 
         raise ValueError("Local model target must be inside a configured model root")
+
+    def validate_local_target(self, target: Path) -> Path:
+        return self._validated_local_paths(target)[2]
 
     def references(self, db: Session, model_id: str) -> list[ModelReference]:
         model = db.get(ModelAsset, model_id)
@@ -295,11 +344,21 @@ class ModelLifecycleService:
         ):
             raise RuntimeError("Hugging Face cache deletion result was invalid")
 
-    @staticmethod
-    def _path_is_absent(path: Path) -> bool:
+    @classmethod
+    def _path_is_absent(cls, path: Path) -> bool:
         try:
-            return not path.exists() and not path.is_symlink()
-        except OSError:
+            if path.exists() or path.is_symlink():
+                return False
+            is_junction = getattr(path, "is_junction", None)
+            if callable(is_junction) and is_junction():
+                return False
+            try:
+                attributes = getattr(path.lstat(), "st_file_attributes", 0)
+            except FileNotFoundError:
+                return True
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            return not bool(reparse_flag and attributes & reparse_flag)
+        except (OSError, RuntimeError):
             return False
 
     def _mark_delete_failed(self, model_id: str) -> None:
@@ -311,6 +370,24 @@ class ModelLifecycleService:
                 model.status = "delete_failed"
                 db.commit()
 
+    def _restore_delete_state(self, model_id: str, task_id: str) -> None:
+        if self.session_factory is None:
+            return
+        with self.session_factory() as db:
+            model = db.get(ModelAsset, model_id)
+            if model is None:
+                return
+            metadata = dict(model.metadata_json or {})
+            if metadata.get("_delete_task_id") != task_id:
+                return
+            original_status = metadata.pop("_delete_original_status", "available")
+            if original_status not in {"available", "unavailable"}:
+                original_status = "available"
+            metadata.pop("_delete_task_id", None)
+            model.metadata_json = metadata
+            model.status = original_status
+            db.commit()
+
     def _remove_database_record(self, model_id: str) -> None:
         if self.session_factory is None:
             raise RuntimeError("session_factory is required for model deletion")
@@ -320,25 +397,67 @@ class ModelLifecycleService:
                 db.delete(model)
                 db.commit()
 
-    def _scan_inventory(self) -> int:
+    def _scan_inventory(self) -> tuple[int | None, str | None]:
         if self.discovery_service is None:
-            return 0
+            return None, None
         if self.session_factory is None:
             raise RuntimeError("session_factory is required for model deletion")
-        with self.session_factory() as db:
-            return len(self.discovery_service.scan_models(db))
+        try:
+            with self.session_factory() as db:
+                return len(self.discovery_service.scan_models(db)), None
+        except Exception:
+            return None, "Inventory refresh failed"
+
+    @staticmethod
+    def _disk_free(path: Path) -> int | None:
+        try:
+            return shutil.disk_usage(path).free
+        except (OSError, RuntimeError):
+            return None
+
+    def _deletion_result(
+        self,
+        *,
+        model_id: str,
+        source: str,
+        released_bytes: int,
+        estimated_bytes: int,
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        inventory_models, inventory_warning = self._scan_inventory()
+        return {
+            "model_id": model_id,
+            "source": source,
+            "released_bytes": released_bytes,
+            "estimated_bytes": estimated_bytes,
+            "inventory_models": inventory_models,
+            "inventory_warning": inventory_warning,
+            "warnings": warnings,
+        }
 
     def delete_handler(self, context: Any, payload: dict[str, Any]) -> dict[str, Any]:
         if self.session_factory is None:
             raise RuntimeError("session_factory is required for model deletion")
 
         model_id = str(payload.get("model_id") or "")
+        task_id = getattr(context, "task_id", None)
+        if not isinstance(task_id, str) or not task_id:
+            raise RuntimeError("Task context must provide a task_id")
+
         with self.session_factory() as db:
             model = db.get(ModelAsset, model_id)
             if model is None:
                 raise ValueError("Model was not found")
+            metadata = dict(model.metadata_json or {})
+            original_status = model.status
+            reentry = model.status == "deleting"
+            failed_retry = model.status == "delete_failed"
             if model.status == "deleting":
-                raise ValueError("Model is already being deleted")
+                if metadata.get("_delete_task_id") != task_id:
+                    raise ValueError("Model deletion is owned by another task")
+                original_status = metadata.get(
+                    "_delete_original_status", "available"
+                )
             references = self.references(db, model_id)
             if references:
                 raise ModelInUseError(references)
@@ -346,23 +465,53 @@ class ModelLifecycleService:
             source = model.source
             local_path = model.local_path
             repository_id = model.repository_id
-            unavailable = model.status == "unavailable"
+            if not reentry:
+                if model.status == "delete_failed":
+                    original_status = metadata.get(
+                        "_delete_original_status", "available"
+                    )
+                if original_status not in {"available", "unavailable"}:
+                    original_status = "available"
+                metadata["_delete_task_id"] = task_id
+                metadata["_delete_original_status"] = original_status
+                model.metadata_json = metadata
+            unavailable = original_status == "unavailable"
             model.status = "deleting"
             db.commit()
 
         estimated_bytes = 0
         released_bytes = 0
+        warnings: list[str] = []
+        destructive_started = False
+        trusted_target: Path | None = None
+        usage_path: Path | None = None
+        free_before: int | None = None
+
+        def complete_deletion() -> dict[str, Any]:
+            self._remove_database_record(model_id)
+            return self._deletion_result(
+                model_id=model_id,
+                source=source,
+                released_bytes=released_bytes,
+                estimated_bytes=estimated_bytes,
+                warnings=warnings,
+            )
+
         try:
             if source == "huggingface":
                 repository_id = validate_repository_id(repository_id or "")
                 target = cache_repository_path(self.hf_cache_dir, repository_id)
-                if unavailable and self._path_is_absent(target):
-                    context.check_control()
+                trusted_target = target
+                missing_can_reconcile = unavailable or reentry or failed_retry
+                if missing_can_reconcile and self._path_is_absent(target):
+                    if not reentry:
+                        context.check_control()
+                    return complete_deletion()
                 else:
                     estimated_bytes = directory_size(target)
                     usage_path = self.hf_cache_dir
                     usage_path.mkdir(parents=True, exist_ok=True)
-                    free_before = shutil.disk_usage(usage_path).free
+                    free_before = self._disk_free(usage_path)
                     base_argv = [
                         "hf",
                         "cache",
@@ -376,37 +525,68 @@ class ModelLifecycleService:
                     )
                     self._validate_hf_preview(preview, f"model/{repository_id}")
                     context.check_control()
+                    destructive_started = True
                     result = self._run_hf_json([*base_argv, "--yes", "--json"])
                     self._validate_hf_result(result)
-                    free_after = shutil.disk_usage(usage_path).free
-                    released_bytes = max(0, free_after - free_before)
+                    if not self._path_is_absent(target):
+                        raise RuntimeError("Hugging Face cache deletion did not remove the target")
             else:
                 target = Path(local_path)
-                if unavailable and self._path_is_absent(target):
-                    context.check_control()
+                trusted_target = target
+                missing_can_reconcile = unavailable or reentry or failed_retry
+                if missing_can_reconcile and self._path_is_absent(target):
+                    if not reentry:
+                        context.check_control()
+                    return complete_deletion()
                 else:
-                    resolved_target = self.validate_local_target(target)
+                    root_lexical, target_lexical, resolved_target = (
+                        self._validated_local_paths(target)
+                    )
                     estimated_bytes = directory_size(resolved_target)
-                    free_before = shutil.disk_usage(resolved_target.parent).free
+                    usage_path = resolved_target.parent
+                    free_before = self._disk_free(usage_path)
                     context.check_control()
-                    self.validate_local_target(target)
+                    root_lexical, target_lexical, _resolved_target = (
+                        self._validated_local_paths(target)
+                    )
+                    destructive_started = True
                     try:
-                        shutil.rmtree(target)
+                        self.local_remover(root_lexical, target_lexical)
                     except OSError as exc:
                         raise RuntimeError("Local model deletion failed") from exc
-                    free_after = shutil.disk_usage(resolved_target.parent).free
-                    released_bytes = max(0, free_after - free_before)
+                    if not self._path_is_absent(target_lexical):
+                        raise RuntimeError("Local model deletion did not remove the target")
 
-            inventory_models = self._scan_inventory()
             self._remove_database_record(model_id)
-        except Exception:
+            if usage_path is not None:
+                free_after = self._disk_free(usage_path)
+                if free_before is None or free_after is None:
+                    warnings.append("Disk usage could not be measured")
+                else:
+                    released_bytes = max(0, free_after - free_before)
+            return self._deletion_result(
+                model_id=model_id,
+                source=source,
+                released_bytes=released_bytes,
+                estimated_bytes=estimated_bytes,
+                warnings=warnings,
+            )
+        except (TaskCancelled, TaskPaused):
+            if not destructive_started:
+                self._restore_delete_state(model_id, task_id)
+                raise
+            if trusted_target is not None and self._path_is_absent(trusted_target):
+                warnings.append("Model files were removed before completion")
+                return complete_deletion()
             self._mark_delete_failed(model_id)
             raise
-
-        return {
-            "model_id": model_id,
-            "source": source,
-            "released_bytes": released_bytes,
-            "estimated_bytes": estimated_bytes,
-            "inventory_models": inventory_models,
-        }
+        except Exception:
+            if (
+                destructive_started
+                and trusted_target is not None
+                and self._path_is_absent(trusted_target)
+            ):
+                warnings.append("Model files were removed before completion")
+                return complete_deletion()
+            self._mark_delete_failed(model_id)
+            raise
