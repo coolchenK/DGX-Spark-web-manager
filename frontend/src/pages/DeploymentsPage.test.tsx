@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { Grid, message } from 'antd'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
@@ -320,6 +321,31 @@ const existingDeployment: Deployment = {
   last_checked_at: '2026-08-16T00:00:00Z',
 }
 
+const discoveredDeployment: Deployment = {
+  ...existingDeployment,
+  id: 'deployment-discovered',
+  name: 'discovered-production',
+  model_id: null,
+  container_id: 'container-discovered',
+  container_name: 'external-inference',
+  endpoint_url: 'http://127.0.0.1:8200',
+  api_model_name: 'discovered-production',
+  managed: false,
+  image: 'vllm/vllm-openai:v0.27.1-external',
+  port: 8200,
+  config: {},
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, reject, resolve }
+}
+
 interface ApiFixtureOptions {
   deployments?: Deployment[]
   cachedDeployments?: Deployment[]
@@ -388,6 +414,7 @@ function renderDeploymentsPage(options: ApiFixtureOptions = {}) {
   if (options.cachedDeployments) {
     queryClient.setQueryData(['deployments'], options.cachedDeployments)
   }
+  const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries')
 
   render(
     <QueryClientProvider client={queryClient}>
@@ -396,7 +423,7 @@ function renderDeploymentsPage(options: ApiFixtureOptions = {}) {
       </MemoryRouter>
     </QueryClientProvider>,
   )
-  return { user, getSpy, postSpy, patchSpy, queryClient }
+  return { user, getSpy, postSpy, patchSpy, queryClient, invalidateSpy }
 }
 
 
@@ -506,6 +533,249 @@ describe('DeploymentsPage deployment locator', () => {
 
     expect(await screen.findAllByText('qwen-production')).toHaveLength(2)
     expect(getSpy.mock.calls.filter(([path]) => path === '/api/deployments')).toHaveLength(0)
+  })
+})
+
+
+describe('DeploymentsPage lifecycle actions', () => {
+  it('explains that stopping releases runtime resources while preserving service assets', async () => {
+    const successMessageSpy = vi.spyOn(message, 'success')
+    const { user, postSpy, invalidateSpy } = renderDeploymentsPage({
+      deployments: [existingDeployment],
+    })
+
+    const stop = await screen.findByRole('button', { name: '停止实例 qwen-production' })
+    expect(stop).toHaveTextContent('停止实例')
+    await user.hover(stop)
+    expect(await screen.findByText(
+      '释放 GPU/统一内存，但保留容器配置、网关别名和模型文件。',
+    )).toBeInTheDocument()
+
+    await user.click(stop)
+
+    await waitFor(() => expect(postSpy).toHaveBeenCalledWith(
+      '/api/deployments/deployment-1/stop',
+    ))
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['deployments'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['gateway-stats'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['tasks'] })
+    expect(successMessageSpy).toHaveBeenCalledWith('停止实例任务已创建')
+  })
+
+  it('uses a managed-service confirmation and uninstalls without deleting model files', async () => {
+    const successMessageSpy = vi.spyOn(message, 'success')
+    const { user, postSpy, invalidateSpy } = renderDeploymentsPage({
+      deployments: [existingDeployment],
+    })
+
+    const uninstall = await screen.findByRole('button', { name: '卸载服务 qwen-production' })
+    expect(uninstall).toHaveTextContent('卸载服务')
+    await user.click(uninstall)
+
+    expect(await screen.findByText('卸载服务 qwen-production')).toBeInTheDocument()
+    expect(screen.getByText(
+      '将删除服务容器、部署记录和网关路由，但保留模型文件。',
+    )).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '确认卸载' }))
+
+    await waitFor(() => expect(postSpy).toHaveBeenCalledWith(
+      '/api/deployments/deployment-1/delete',
+    ))
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['deployments'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['gateway-stats'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['tasks'] })
+    expect(successMessageSpy).toHaveBeenCalledWith('卸载服务任务已创建')
+  })
+
+  it('requires the exact discovered container name and submits it in the uninstall body', async () => {
+    const { user, postSpy, invalidateSpy } = renderDeploymentsPage({
+      deployments: [discoveredDeployment],
+    })
+
+    await user.click(await screen.findByRole('button', {
+      name: '卸载服务 discovered-production',
+    }))
+    const dialog = screen.getByRole('dialog', { name: '卸载服务 discovered-production' })
+    expect(within(dialog).getByText('external-inference')).toBeInTheDocument()
+    expect(within(dialog).getByText('vllm/vllm-openai:v0.27.1-external')).toBeInTheDocument()
+    expect(within(dialog).getByText('http://127.0.0.1:8200')).toBeInTheDocument()
+    expect(within(dialog).getByText(/高风险/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/模型文件仍会保留/)).toBeInTheDocument()
+    const confirmation = within(dialog).getByLabelText('输入容器名称确认')
+    const submit = within(dialog).getByRole('button', { name: '确认卸载' })
+    expect(submit).toBeDisabled()
+
+    await user.type(confirmation, 'external-inferenc')
+    expect(submit).toBeDisabled()
+    await user.type(confirmation, 'e')
+    expect(submit).toBeEnabled()
+    await user.click(submit)
+
+    await waitFor(() => expect(postSpy).toHaveBeenCalledWith(
+      '/api/deployments/deployment-discovered/delete',
+      { confirm_container_name: 'external-inference' },
+    ))
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['deployments'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['gateway-stats'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['tasks'] })
+  })
+
+  it('safely disables uninstall for a discovered service without a container name', async () => {
+    const missingContainerName = {
+      ...discoveredDeployment,
+      id: 'deployment-missing-container-name',
+      name: 'unsafe-discovery',
+      container_name: null,
+    }
+    const { user } = renderDeploymentsPage({ deployments: [missingContainerName] })
+
+    const uninstall = await screen.findByRole('button', { name: '卸载服务 unsafe-discovery' })
+    expect(uninstall).toBeDisabled()
+    await user.hover(uninstall)
+    expect(await screen.findByText(
+      '缺少容器名称，无法安全确认卸载。',
+    )).toBeInTheDocument()
+  })
+
+  it('offers visible instance-specific stop and uninstall controls in the mobile list', async () => {
+    vi.spyOn(Grid, 'useBreakpoint').mockReturnValue({})
+    renderDeploymentsPage({ deployments: [existingDeployment, discoveredDeployment] })
+
+    const managedStop = await screen.findByRole('button', {
+      name: '停止实例 qwen-production',
+    })
+    const managedUninstall = screen.getByRole('button', {
+      name: '卸载服务 qwen-production',
+    })
+    const discoveredUninstall = screen.getByRole('button', {
+      name: '卸载服务 discovered-production',
+    })
+    expect(managedStop).toHaveTextContent('停止实例')
+    expect(managedUninstall).toHaveTextContent('卸载服务')
+    expect(discoveredUninstall).toHaveTextContent('卸载服务')
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
+  it('offers instance-specific stop and uninstall controls in the desktop table', async () => {
+    vi.spyOn(Grid, 'useBreakpoint').mockReturnValue({ md: true })
+    renderDeploymentsPage({ deployments: [existingDeployment, discoveredDeployment] })
+
+    const table = await screen.findByRole('table')
+    expect(within(table).getByRole('button', {
+      name: '停止实例 qwen-production',
+    })).toBeInTheDocument()
+    const managedUninstall = within(table).getByRole('button', {
+      name: '卸载服务 qwen-production',
+    })
+    const discoveredUninstall = within(table).getByRole('button', {
+      name: '卸载服务 discovered-production',
+    })
+    expect(managedUninstall).toHaveTextContent('卸载服务')
+    expect(discoveredUninstall).toHaveTextContent('卸载服务')
+  })
+
+  it('clears confirmation on target switches and ignores a late uninstall completion', async () => {
+    const secondDiscovered = {
+      ...discoveredDeployment,
+      id: 'deployment-discovered-2',
+      name: 'second-discovery',
+      container_id: 'container-discovered-2',
+      container_name: 'second-external-inference',
+      endpoint_url: 'http://127.0.0.1:8300',
+      port: 8300,
+    }
+    const pending = deferred<TaskRecord>()
+    const successMessageSpy = vi.spyOn(message, 'success')
+    const { user, postSpy } = renderDeploymentsPage({
+      deployments: [discoveredDeployment, secondDiscovered],
+    })
+    postSpy.mockImplementationOnce(() => pending.promise)
+    await user.click(await screen.findByRole('button', {
+      name: '卸载服务 discovered-production',
+    }))
+    const firstDialog = screen.getByRole('dialog', { name: '卸载服务 discovered-production' })
+    await user.type(
+      within(firstDialog).getByLabelText('输入容器名称确认'),
+      'external-inference',
+    )
+    await user.click(within(firstDialog).getByRole('button', { name: '确认卸载' }))
+    await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(1))
+
+    await user.keyboard('{Escape}')
+    expect(screen.getByRole('dialog', { name: '卸载服务 discovered-production' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '卸载服务 second-discovery' }))
+    const secondDialog = screen.getByRole('dialog', { name: '卸载服务 second-discovery' })
+    expect(within(secondDialog).getByLabelText('输入容器名称确认')).toHaveValue('')
+
+    pending.resolve(task)
+
+    const confirmUninstall = within(secondDialog).getByText('确认卸载').closest('button')
+    await waitFor(() => expect(confirmUninstall).not.toHaveClass('ant-btn-loading'))
+    expect(screen.getByRole('dialog', { name: '卸载服务 second-discovery' })).toBeInTheDocument()
+    expect(within(secondDialog).getByLabelText('输入容器名称确认')).toHaveValue('')
+    expect(successMessageSpy).toHaveBeenCalledWith('卸载服务任务已创建')
+  })
+
+  it('ignores a late uninstall error after another discovered service is opened', async () => {
+    const secondDiscovered = {
+      ...discoveredDeployment,
+      id: 'deployment-discovered-2',
+      name: 'second-discovery',
+      container_name: 'second-external-inference',
+    }
+    const pending = deferred<TaskRecord>()
+    const errorMessageSpy = vi.spyOn(message, 'error')
+    const { user, postSpy, invalidateSpy } = renderDeploymentsPage({
+      deployments: [discoveredDeployment, secondDiscovered],
+    })
+    postSpy.mockImplementationOnce(() => pending.promise)
+    await user.click(await screen.findByRole('button', {
+      name: '卸载服务 discovered-production',
+    }))
+    const firstDialog = screen.getByRole('dialog', { name: '卸载服务 discovered-production' })
+    await user.type(
+      within(firstDialog).getByLabelText('输入容器名称确认'),
+      'external-inference',
+    )
+    await user.click(within(firstDialog).getByRole('button', { name: '确认卸载' }))
+    await waitFor(() => expect(postSpy).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByRole('button', { name: '卸载服务 second-discovery' }))
+    const secondDialog = screen.getByRole('dialog', { name: '卸载服务 second-discovery' })
+
+    pending.reject(new Error('container removal failed'))
+
+    const confirmUninstall = within(secondDialog).getByText('确认卸载').closest('button')
+    await waitFor(() => expect(confirmUninstall).not.toHaveClass('ant-btn-loading'))
+    expect(secondDialog).toBeInTheDocument()
+    expect(within(secondDialog).getByLabelText('输入容器名称确认')).toHaveValue('')
+    expect(errorMessageSpy).not.toHaveBeenCalled()
+    expect(invalidateSpy).not.toHaveBeenCalled()
+  })
+
+  it('does not lock discovered uninstall behind an unrelated pending stop', async () => {
+    const pending = deferred<TaskRecord>()
+    const successMessageSpy = vi.spyOn(message, 'success')
+    const { user, postSpy } = renderDeploymentsPage({
+      deployments: [existingDeployment, discoveredDeployment],
+    })
+    postSpy.mockImplementationOnce(() => pending.promise)
+    await user.click(await screen.findByRole('button', { name: '停止实例 qwen-production' }))
+    await waitFor(() => expect(postSpy).toHaveBeenCalledWith(
+      '/api/deployments/deployment-1/stop',
+    ))
+
+    await user.click(screen.getByRole('button', { name: '卸载服务 discovered-production' }))
+    const hasDiscoveredUninstallDialog = () => screen
+      .queryAllByText('卸载服务 discovered-production')
+      .some((element) => Boolean(element.closest('[role="dialog"]')))
+    expect(hasDiscoveredUninstallDialog()).toBe(true)
+    const dialog = screen.getAllByText('卸载服务 discovered-production')
+      .map((element) => element.closest('[role="dialog"]'))
+      .find(Boolean)
+    const cancel = within(dialog as HTMLElement).getByRole('button', { name: /取\s*消/ })
+    expect(cancel).toBeEnabled()
+    pending.resolve(task)
+    await waitFor(() => expect(successMessageSpy).toHaveBeenCalledWith('停止实例任务已创建'))
   })
 })
 

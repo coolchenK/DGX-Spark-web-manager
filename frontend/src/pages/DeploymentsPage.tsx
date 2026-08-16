@@ -4,21 +4,24 @@ import {
   EditOutlined,
   FileTextOutlined,
   LeftOutlined,
-  PauseCircleOutlined,
   PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
   RightOutlined,
   RocketOutlined,
+  StopOutlined,
 } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Alert,
   Button,
+  Descriptions,
   Drawer,
   Flex,
   Form,
   Grid,
+  Input,
+  Modal,
   Popconfirm,
   Space,
   Steps,
@@ -282,8 +285,11 @@ export function DeploymentsPage() {
   const [preview, setPreview] = useState<DeploymentPreview | null>(null)
   const [previewedPayload, setPreviewedPayload] = useState<DeploymentFormValues | null>(null)
   const [logsFor, setLogsFor] = useState<Deployment | null>(null)
+  const [uninstallTarget, setUninstallTarget] = useState<Deployment | null>(null)
+  const [uninstallConfirmation, setUninstallConfirmation] = useState('')
   const applyingRecommendation = useRef(false)
   const drawerOpenRef = useRef(false)
+  const uninstallTargetRef = useRef<Deployment | null>(null)
   const previewSequence = useRef(0)
   const previewController = useRef<AbortController | null>(null)
   const lastAppliedRecommendation = useRef<DeploymentRecommendation | null>(null)
@@ -654,15 +660,61 @@ export function DeploymentsPage() {
       if (!isAbortError(error)) message.error(error.message)
     },
   })
+  const closeDiscoveredUninstall = (targetId?: string) => {
+    if (targetId && uninstallTargetRef.current?.id !== targetId) return
+    uninstallTargetRef.current = null
+    setUninstallTarget(null)
+    setUninstallConfirmation('')
+  }
+  const openDiscoveredUninstall = (deployment: Deployment) => {
+    if (!deployment.container_name) return
+    uninstallTargetRef.current = deployment
+    setUninstallConfirmation('')
+    setUninstallTarget(deployment)
+  }
   const action = useMutation({
-    mutationFn: ({ id, actionName }: { id: string; actionName: string }) =>
-      api.post(`/api/deployments/${id}/${actionName}`),
-    onSuccess: () => {
-      message.success('操作已加入任务队列')
-      queryClient.invalidateQueries()
+    mutationFn: ({
+      deployment,
+      actionName,
+    }: {
+      deployment: Deployment
+      actionName: 'start' | 'stop' | 'restart' | 'delete'
+    }) => {
+      const path = `/api/deployments/${deployment.id}/${actionName}`
+      if (actionName === 'delete' && !deployment.managed) {
+        return api.post<TaskRecord>(path, {
+          confirm_container_name: deployment.container_name,
+        })
+      }
+      return api.post<TaskRecord>(path)
     },
-    onError: (error: Error) => message.error(error.message),
+    onSuccess: (_task, { deployment, actionName }) => {
+      if (actionName === 'delete' && !deployment.managed) {
+        closeDiscoveredUninstall(deployment.id)
+      }
+      const successMessages = {
+        start: '启动实例任务已创建',
+        stop: '停止实例任务已创建',
+        restart: '重启实例任务已创建',
+        delete: '卸载服务任务已创建',
+      }
+      message.success(successMessages[actionName])
+      queryClient.invalidateQueries({ queryKey: ['deployments'] })
+      queryClient.invalidateQueries({ queryKey: ['gateway-stats'] })
+      queryClient.invalidateQueries({ queryKey: ['tasks'] })
+    },
+    onError: (error: Error, { deployment, actionName }) => {
+      if (
+        actionName === 'delete'
+        && !deployment.managed
+        && uninstallTargetRef.current?.id !== deployment.id
+      ) return
+      message.error(error.message)
+    },
   })
+  const discoveredUninstallPending = action.isPending
+    && action.variables?.actionName === 'delete'
+    && !action.variables.deployment.managed
 
   const handleRetryAI = async () => {
     const requestedTupleKey = recommendation.activeTupleKey
@@ -906,25 +958,59 @@ export function DeploymentsPage() {
     }
   }
 
-  const operationButtons = (item: Deployment, mobile = false) => (
-    <Space wrap>
+  const operationButtons = (item: Deployment, mobile = false) => {
+    const isRunning = item.status === 'running'
+    const primaryAction = isRunning ? 'stop' : 'start'
+    const primaryPending = action.isPending
+      && action.variables?.deployment.id === item.id
+      && action.variables.actionName === primaryAction
+    const deletePending = action.isPending
+      && action.variables?.deployment.id === item.id
+      && action.variables.actionName === 'delete'
+    const uninstallButton = (
+      <Tooltip title={item.managed || item.container_name
+        ? `卸载服务 ${item.name}`
+        : '缺少容器名称，无法安全确认卸载。'}>
+        <span>
+          <Button
+            size={mobile ? 'middle' : 'small'}
+            danger
+            icon={<DeleteOutlined />}
+            aria-label={`卸载服务 ${item.name}`}
+            disabled={!item.managed && !item.container_name}
+            loading={deletePending}
+            onClick={item.managed ? undefined : () => openDiscoveredUninstall(item)}
+          >
+            卸载服务
+          </Button>
+        </span>
+      </Tooltip>
+    )
+    return <Space wrap>
       <Button size={mobile ? 'middle' : 'small'} icon={<FileTextOutlined />} onClick={() => setLogsFor(item)}>
         {mobile ? '日志' : null}
       </Button>
-      <Button
-        size={mobile ? 'middle' : 'small'}
-        loading={action.isPending}
-        icon={item.status === 'running' ? <PauseCircleOutlined /> : <PlayCircleOutlined />}
-        onClick={() => action.mutate({ id: item.id, actionName: item.status === 'running' ? 'stop' : 'start' })}
-      >
-        {item.status === 'running' ? '停止' : '启动'}
-      </Button>
+      <Tooltip title={isRunning
+        ? '释放 GPU/统一内存，但保留容器配置、网关别名和模型文件。'
+        : `启动实例 ${item.name}`}>
+        <Button
+          size={mobile ? 'middle' : 'small'}
+          loading={primaryPending}
+          icon={isRunning ? <StopOutlined /> : <PlayCircleOutlined />}
+          onClick={() => action.mutate({ deployment: item, actionName: primaryAction })}
+          aria-label={`${isRunning ? '停止实例' : '启动实例'} ${item.name}`}
+        >
+          {isRunning ? '停止实例' : '启动'}
+        </Button>
+      </Tooltip>
       <Tooltip title="重启实例">
         <Button
           size={mobile ? 'middle' : 'small'}
           icon={<ReloadOutlined />}
-          loading={action.isPending}
-          onClick={() => action.mutate({ id: item.id, actionName: 'restart' })}
+          loading={action.isPending
+            && action.variables?.deployment.id === item.id
+            && action.variables.actionName === 'restart'}
+          onClick={() => action.mutate({ deployment: item, actionName: 'restart' })}
           aria-label="重启实例"
         />
       </Tooltip>
@@ -936,15 +1022,19 @@ export function DeploymentsPage() {
           <Button size={mobile ? 'middle' : 'small'} icon={<CopyOutlined />} onClick={() => openFromDeployment(item, 'clone')} aria-label="克隆部署" />
         </Tooltip>
         <Popconfirm
-          title={`删除部署 ${item.name}`}
-          description="容器会被删除，模型文件保留。"
-          onConfirm={() => action.mutate({ id: item.id, actionName: 'delete' })}
+          title={`卸载服务 ${item.name}`}
+          description="将删除服务容器、部署记录和网关路由，但保留模型文件。"
+          okText="确认卸载"
+          cancelText="取消"
+          okButtonProps={{ danger: true }}
+          onConfirm={() => action.mutate({ deployment: item, actionName: 'delete' })}
         >
-          <Button size={mobile ? 'middle' : 'small'} danger icon={<DeleteOutlined />} aria-label="删除部署" />
+          {uninstallButton}
         </Popconfirm>
       </>}
+      {!item.managed && uninstallButton}
     </Space>
-  )
+  }
 
   const stepContent = [
     <DeploymentBasicsStep
@@ -1090,6 +1180,60 @@ export function DeploymentsPage() {
       <Drawer title={`${logsFor?.name ?? ''} 日志`} width={760} open={Boolean(logsFor)} onClose={() => setLogsFor(null)}>
         <QueryState loading={logs.isLoading} error={logs.error}><LogViewer value={logs.data?.logs ?? ''} filename={`${logsFor?.name}.log`} /></QueryState>
       </Drawer>
+      <Modal
+        title={`卸载服务 ${uninstallTarget?.name ?? ''}`}
+        open={Boolean(uninstallTarget)}
+        onCancel={() => {
+          if (!discoveredUninstallPending) closeDiscoveredUninstall()
+        }}
+        onOk={() => uninstallTarget && action.mutate({
+          deployment: uninstallTarget,
+          actionName: 'delete',
+        })}
+        okText="确认卸载"
+        cancelText="取消"
+        confirmLoading={discoveredUninstallPending}
+        okButtonProps={{
+          danger: true,
+          disabled: !uninstallTarget?.container_name
+            || uninstallConfirmation !== uninstallTarget.container_name,
+        }}
+        cancelButtonProps={{ disabled: discoveredUninstallPending }}
+        destroyOnHidden
+        keyboard={!discoveredUninstallPending}
+        closable={!discoveredUninstallPending}
+        maskClosable={!discoveredUninstallPending}
+      >
+        {uninstallTarget && (
+          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+            <Alert
+              type="error"
+              showIcon
+              message="高风险操作"
+              description="将删除此已发现服务的容器、部署记录和网关路由；保存的部署参数无法重建此服务。模型文件仍会保留。"
+            />
+            <Descriptions size="small" column={1}>
+              <Descriptions.Item label="容器名称">
+                {uninstallTarget.container_name}
+              </Descriptions.Item>
+              <Descriptions.Item label="镜像">
+                {uninstallTarget.image ?? '未知'}
+              </Descriptions.Item>
+              <Descriptions.Item label="端点">
+                {uninstallTarget.endpoint_url}
+              </Descriptions.Item>
+            </Descriptions>
+            <label htmlFor="deployment-uninstall-confirmation">输入容器名称确认</label>
+            <Input
+              id="deployment-uninstall-confirmation"
+              value={uninstallConfirmation}
+              autoComplete="off"
+              placeholder={uninstallTarget.container_name ?? ''}
+              onChange={(event) => setUninstallConfirmation(event.target.value)}
+            />
+          </Space>
+        )}
+      </Modal>
     </div>
   )
 }
