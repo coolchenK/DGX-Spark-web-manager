@@ -182,6 +182,36 @@ describe('recommendation client and hook', () => {
     expect(post.mock.calls[0][2]?.signal).toBeInstanceOf(AbortSignal)
   })
 
+  it('does not restart the debounce when provider id changes from undefined to null', async () => {
+    vi.useFakeTimers()
+    try {
+      const post = vi.spyOn(api, 'post').mockResolvedValue(recommendationFixture())
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      let providerId: string | null | undefined
+      const rendered = renderHook(
+        () => useDeploymentRecommendation({
+          modelId: 'model-1',
+          runtime: 'vllm',
+          image: 'vllm:test',
+          providerId,
+          enabled: true,
+        }),
+        { wrapper: wrapper(queryClient) },
+      )
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(151) })
+      providerId = null
+      rendered.rerender()
+      await act(async () => { await vi.advanceTimersByTimeAsync(150) })
+
+      expect(post).toHaveBeenCalledOnce()
+      expect(post.mock.calls[0][1]).toMatchObject({ provider_id: null })
+      rendered.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('cancels an old tuple immediately and ignores its late response', async () => {
     const pending: Array<{
       signal: AbortSignal
