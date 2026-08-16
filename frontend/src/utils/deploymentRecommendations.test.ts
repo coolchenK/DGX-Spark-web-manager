@@ -42,6 +42,12 @@ function recommendationFixture(
       total_bytes: 128,
       available_bytes: 96,
       reserved_bytes: 16,
+      deployments: [{
+        id: 'deployment-1',
+        runtime: 'vllm',
+        status: 'running',
+        memory_bytes: 24,
+      }],
     },
     resource_estimate: {
       total_bytes: 128,
@@ -197,6 +203,7 @@ describe('recommendation client and hook', () => {
     input = { ...input, modelId: 'model-2' }
     rerender()
     expect(pending[0].signal.aborted).toBe(true)
+    expect(result.current.data).toBeUndefined()
 
     await act(async () => {
       pending[0].resolve(recommendationFixture({ model_id: 'model-1' }))
@@ -206,6 +213,33 @@ describe('recommendation client and hook', () => {
       pending[1].resolve(recommendationFixture({ model_id: 'model-2' }))
     })
     await waitFor(() => expect(result.current.data?.model_id).toBe('model-2'))
+  })
+
+  it('debounces every A-B-A activation without exposing cached A data', async () => {
+    const responseA = recommendationFixture({ model_id: 'model-a' })
+    const responseB = recommendationFixture({ model_id: 'model-b' })
+    const post = vi.spyOn(api, 'post').mockImplementation((_path, body) => Promise.resolve(
+      (body as { model_id: string }).model_id === 'model-a' ? responseA : responseB,
+    ))
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let modelId = 'model-a'
+    const { rerender, result } = renderHook(
+      () => useDeploymentRecommendation({
+        modelId, runtime: 'vllm', image: 'vllm:test', enabled: true,
+      }),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(result.current.data).toEqual(responseA))
+    modelId = 'model-b'
+    rerender()
+    expect(result.current.data).toBeUndefined()
+    modelId = 'model-a'
+    rerender()
+
+    expect(result.current.data).toBeUndefined()
+    expect(post).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(result.current.data).toEqual(responseA))
   })
 
   it('cancels an in-flight query when recommendations are disabled', async () => {
@@ -228,6 +262,100 @@ describe('recommendation client and hook', () => {
     rerender()
 
     expect(requestSignal?.aborted).toBe(true)
+  })
+
+  it('waits for a new debounce interval when the same tuple is re-enabled', async () => {
+    const response = recommendationFixture()
+    vi.spyOn(api, 'post').mockResolvedValue(response)
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let enabled = true
+    const { rerender, result } = renderHook(
+      () => useDeploymentRecommendation({
+        modelId: 'model-1', runtime: 'vllm', image: 'vllm:test', enabled,
+      }),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(result.current.data).toEqual(response))
+    const callsBeforeDisable = vi.mocked(api.post).mock.calls.length
+    enabled = false
+    rerender()
+    expect(result.current.data).toBeUndefined()
+    await expect(result.current.refreshAI()).rejects.toThrow('Recommendation tuple is not stable')
+    expect(api.post).toHaveBeenCalledTimes(callsBeforeDisable)
+    enabled = true
+    rerender()
+
+    expect(result.current.data).toBeUndefined()
+    await waitFor(() => expect(result.current.data).toEqual(response))
+  })
+
+  it('aborts on unmount and does not cache a late response', async () => {
+    let signal: AbortSignal | null | undefined
+    let resolveRequest: ((value: DeploymentRecommendation) => void) | undefined
+    vi.spyOn(api, 'post').mockImplementation((_path, _body, options) => {
+      signal = options?.signal
+      return new Promise((resolve) => { resolveRequest = resolve })
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const tuple = {
+      modelId: 'model-1', runtime: 'vllm' as const, image: 'vllm:test', providerId: null,
+    }
+    const { unmount } = renderHook(
+      () => useDeploymentRecommendation({ ...tuple, enabled: true }),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(signal).toBeInstanceOf(AbortSignal))
+    unmount()
+    expect(signal?.aborted).toBe(true)
+    await act(async () => { resolveRequest?.(recommendationFixture()) })
+
+    expect(queryClient.getQueryData(['deployment-recommendation', tuple])).toBeUndefined()
+  })
+
+  it('does not abort a shared exact query while another consumer remains active', async () => {
+    let signal: AbortSignal | null | undefined
+    vi.spyOn(api, 'post').mockImplementation((_path, _body, options) => {
+      signal = options?.signal
+      return new Promise(() => {})
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let firstEnabled = true
+    const first = renderHook(
+      () => useDeploymentRecommendation({
+        modelId: 'model-1', runtime: 'vllm', image: 'vllm:test', enabled: firstEnabled,
+      }),
+      { wrapper: wrapper(queryClient) },
+    )
+    const second = renderHook(
+      () => useDeploymentRecommendation({
+        modelId: 'model-1', runtime: 'vllm', image: 'vllm:test', enabled: true,
+      }),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(signal).toBeInstanceOf(AbortSignal))
+    firstEnabled = false
+    first.rerender()
+    expect(signal?.aborted).toBe(false)
+
+    second.unmount()
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it('rejects AI refresh until an enabled tuple has completed its debounce', async () => {
+    const post = vi.spyOn(api, 'post').mockResolvedValue(recommendationFixture())
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { result } = renderHook(
+      () => useDeploymentRecommendation({
+        modelId: 'model-1', runtime: 'vllm', image: 'vllm:test', enabled: true,
+      }),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await expect(result.current.refreshAI()).rejects.toThrow('Recommendation tuple is not stable')
+    expect(post).not.toHaveBeenCalled()
   })
 
   it('refreshes AI once and stores the result under the ordinary base key', async () => {

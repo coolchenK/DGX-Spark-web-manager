@@ -115,4 +115,52 @@ describe('deploymentToFormValues', () => {
       sources: { 'generation_defaults.temperature': 'model_card' },
     })
   })
+
+  it('omits Pydantic null defaults while preserving valid falsy values', () => {
+    const pydanticDeployment: Deployment = {
+      ...deployment,
+      config: {
+        spec: {
+          ...(deployment.config.spec as Record<string, unknown>),
+          generation_defaults: {
+            temperature: 0,
+            top_p: null,
+            top_k: null,
+            min_p: null,
+            repetition_penalty: null,
+            presence_penalty: null,
+            frequency_penalty: null,
+            max_tokens: null,
+            stop: [],
+          },
+          speculative: {
+            draft_model_id: 'draft-1',
+            method: 'eagle3',
+            num_speculative_tokens: null,
+            num_steps: null,
+            eagle_top_k: null,
+            num_draft_tokens: null,
+            manual_review_acknowledged: true,
+          },
+          resource_warning_acknowledged: false,
+        },
+      },
+    }
+
+    const edited = deploymentToFormValues(pydanticDeployment, model, 'edit')
+    expect(edited.generation_defaults).toEqual({ temperature: 0, stop: [] })
+    expect(edited.speculative).toEqual({
+      draft_model_id: 'draft-1',
+      method: 'eagle3',
+      manual_review_acknowledged: true,
+    })
+    expect(edited.resource_warning_acknowledged).toBe(false)
+
+    const cloned = deploymentToFormValues(pydanticDeployment, model, 'clone')
+    expect(cloned.speculative).toEqual({
+      draft_model_id: 'draft-1',
+      method: 'eagle3',
+      manual_review_acknowledged: false,
+    })
+  })
 })

@@ -211,6 +211,24 @@ export interface ResourceSnapshot {
   total_bytes: number
   available_bytes: number
   reserved_bytes: number
+  deployments?: DeploymentResourceSnapshot[]
+}
+
+export interface DeploymentResourceSnapshot {
+  id?: string
+  runtime?: string
+  status?: string
+  health?: string
+  total_bytes?: number
+  available_bytes?: number
+  reserved_bytes?: number
+  weight_bytes?: number
+  draft_weight_bytes?: number
+  kv_cache_bytes?: number
+  runtime_overhead_bytes?: number
+  required_bytes?: number
+  memory_bytes?: number
+  size_bytes?: number
 }
 
 export interface ResourceEstimate {
@@ -272,7 +290,7 @@ export interface RecommendationProvenance {
   generated_at: string
   evidence_hash: string
   provider_id: string | null
-  resource_snapshot: ResourceSnapshot
+  resource_snapshot: Omit<ResourceSnapshot, 'deployments'>
   modified_fields: string[]
   sources: Record<string, RecommendationSource>
 }

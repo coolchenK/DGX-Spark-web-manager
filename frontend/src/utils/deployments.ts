@@ -71,6 +71,57 @@ function finiteNumber(value: unknown, fallback: number): number {
 }
 
 
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+
+function normalizeGenerationDefaults(value: unknown): GenerationDefaults {
+  const saved = objectValue(value)
+  if (!saved) return {}
+  const normalized: GenerationDefaults = {}
+  if (saved.temperature != null) normalized.temperature = saved.temperature as number
+  if (saved.top_p != null) normalized.top_p = saved.top_p as number
+  if (saved.top_k != null) normalized.top_k = saved.top_k as number
+  if (saved.min_p != null) normalized.min_p = saved.min_p as number
+  if (saved.repetition_penalty != null) {
+    normalized.repetition_penalty = saved.repetition_penalty as number
+  }
+  if (saved.presence_penalty != null) {
+    normalized.presence_penalty = saved.presence_penalty as number
+  }
+  if (saved.frequency_penalty != null) {
+    normalized.frequency_penalty = saved.frequency_penalty as number
+  }
+  if (saved.max_tokens != null) normalized.max_tokens = saved.max_tokens as number
+  if (saved.stop != null) normalized.stop = saved.stop as string | string[]
+  return normalized
+}
+
+
+function normalizeSpeculativeSettings(value: unknown): SpeculativeSettings | null {
+  const saved = objectValue(value)
+  if (!saved || typeof saved.draft_model_id !== 'string') return null
+  if (!['draft_model', 'eagle', 'eagle3', 'mtp'].includes(String(saved.method))) return null
+  const normalized: SpeculativeSettings = {
+    draft_model_id: saved.draft_model_id,
+    method: saved.method as SpeculativeSettings['method'],
+    manual_review_acknowledged: saved.manual_review_acknowledged === true,
+  }
+  if (saved.num_speculative_tokens != null) {
+    normalized.num_speculative_tokens = saved.num_speculative_tokens as number
+  }
+  if (saved.num_steps != null) normalized.num_steps = saved.num_steps as number
+  if (saved.eagle_top_k != null) normalized.eagle_top_k = saved.eagle_top_k as number
+  if (saved.num_draft_tokens != null) {
+    normalized.num_draft_tokens = saved.num_draft_tokens as number
+  }
+  return normalized
+}
+
+
 export function deploymentToFormValues(
   deployment: Deployment,
   model: ModelAsset,
@@ -112,8 +163,8 @@ export function deploymentToFormValues(
     quantization: saved.quantization
       ?? commandValue(command, '--quantization') as DeploymentFormValues['quantization'],
     trust_remote_code: saved.trust_remote_code ?? command.includes('--trust-remote-code'),
-    generation_defaults: { ...(saved.generation_defaults ?? {}) },
-    speculative: saved.speculative ? { ...saved.speculative } : null,
+    generation_defaults: normalizeGenerationDefaults(saved.generation_defaults),
+    speculative: normalizeSpeculativeSettings(saved.speculative),
     recommendation: saved.recommendation ? { ...saved.recommendation } : null,
     resource_warning_acknowledged: saved.resource_warning_acknowledged ?? false,
   }
