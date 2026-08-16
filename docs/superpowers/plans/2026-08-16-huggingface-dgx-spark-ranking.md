@@ -4,7 +4,7 @@
 
 **Goal:** Prioritize NVFP4 and other DGX Spark-friendly Hugging Face models while keeping all search results visible and explaining each compatibility decision in the Ant Design UI.
 
-**Architecture:** The Hugging Face service enriches and stably sorts a 50-result candidate pool using deterministic repository metadata. The frontend consumes the new compatibility object, maps levels to consistent Ant Design tags, and renders short reasons without duplicating ranking logic.
+**Architecture:** The Hugging Face service enriches a 50-result candidate pool using deterministic repository metadata, then stably sorts by compatibility level, score, and Hub order. The frontend consumes the new compatibility object, maps levels to consistent Ant Design tags, and renders short reasons without duplicating ranking logic.
 
 **Tech Stack:** Python 3.12, FastAPI, huggingface_hub, pytest, React 19, TypeScript 6, Ant Design 5, Vitest, Docker Compose
 
@@ -18,7 +18,8 @@
 - Modify `frontend/src/utils/huggingface.ts`: compatibility level presentation mapping.
 - Modify `frontend/src/utils/huggingface.test.ts`: presentation mapping tests.
 - Modify `frontend/src/pages/HuggingFacePage.tsx`: compatibility tags and reasons.
-- Modify `frontend/src/styles.css`: stable responsive layout for model names and reasons.
+- Create `frontend/src/pages/HuggingFacePage.test.tsx`: search-result rendering and stable class regression test.
+- Modify `frontend/src/styles.css`: stable responsive layout and theme-safe accessible contrast.
 - Modify `docs/API.md`: document the additive search response fields.
 
 ### Task 1: Backend compatibility ranking
@@ -117,10 +118,26 @@ def test_search_scores_a_wider_pool_before_applying_limit(tmp_path, monkeypatch)
 
 - [ ] **Step 4: Implement deterministic scoring and sorting**
 
-In `backend/app/tasks/huggingface.py`, add helpers that normalize metadata, detect NVFP4 from either tags or repository ID, detect explicit `B`/`T` scale tokens, and return this contract:
+In `backend/app/tasks/huggingface.py`, add helpers that normalize metadata, detect bounded and non-negated quantization tokens, and detect explicit `B`/`T` plus MoE `NxMB/T` scale tokens. Capacity risk and GGUF-only results are always `review`; risk reasons are kept in the three visible reasons.
 
 ```python
-MODEL_SCALE_PATTERN = re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)([BT])(?:[-_]|$)", re.IGNORECASE)
+MODEL_SCALE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*([BT])(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+MOE_MODEL_SCALE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*([BT])"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+QUANTIZATION_PATTERNS = {
+    token: re.compile(rf"(?<![A-Za-z0-9]){token}(?![A-Za-z0-9])", re.IGNORECASE)
+    for token in ("nvfp4", "fp8", "awq", "gptq")
+}
+NEGATED_QUANTIZATION_PREFIX = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:not|no|non)[^A-Za-z0-9]+$",
+    re.IGNORECASE,
+)
 
 
 def repository_parameter_billions(repository_id: str) -> float | None:
@@ -128,16 +145,31 @@ def repository_parameter_billions(repository_id: str) -> float | None:
         float(value) * (1_000 if unit.upper() == "T" else 1)
         for value, unit in MODEL_SCALE_PATTERN.findall(repository_id)
     ]
+    values.extend(
+        float(experts) * float(value) * (1_000 if unit.upper() == "T" else 1)
+        for experts, value, unit in MOE_MODEL_SCALE_PATTERN.findall(repository_id)
+    )
     return max(values, default=None)
+
+
+def has_quantization_token(repository_id: str, tags: list[str], token: str) -> bool:
+    pattern = QUANTIZATION_PATTERNS[token]
+    for value in (repository_id, *tags):
+        for match in pattern.finditer(value):
+            if not NEGATED_QUANTIZATION_PREFIX.search(value[:match.start()]):
+                return True
+    return False
 
 
 def spark_compatibility(model: Any) -> dict[str, Any]:
     repository_id = str(model.id)
-    tags = {str(tag).casefold() for tag in (model.tags or [])}
-    searchable = {repository_id.casefold(), *tags}
-    has_nvfp4 = any("nvfp4" in value for value in searchable)
-    has_fp8 = any("fp8" in value for value in searchable)
-    has_awq_or_gptq = bool({"awq", "gptq"} & tags)
+    model_tags = [str(tag) for tag in (model.tags or [])]
+    tags = {tag.casefold() for tag in model_tags}
+    has_nvfp4 = has_quantization_token(repository_id, model_tags, "nvfp4")
+    has_fp8 = has_quantization_token(repository_id, model_tags, "fp8")
+    has_awq_or_gptq = has_quantization_token(
+        repository_id, model_tags, "awq"
+    ) or has_quantization_token(repository_id, model_tags, "gptq")
     has_compressed = "compressed-tensors" in tags
     has_safetensors = "safetensors" in tags
     has_runtime = bool({"vllm", "sglang"} & tags)
@@ -154,6 +186,11 @@ def spark_compatibility(model: Any) -> dict[str, Any]:
     elif has_awq_or_gptq:
         score += 30
         reasons.append("低比特量化")
+    parameter_billions = repository_parameter_billions(repository_id)
+    capacity_risk = parameter_billions is not None and parameter_billions > 180
+    if capacity_risk:
+        score -= 120
+        reasons.append("模型规模需评估")
     if has_compressed:
         score += 30
         reasons.append("压缩权重格式")
@@ -170,22 +207,18 @@ def spark_compatibility(model: Any) -> dict[str, Any]:
         score -= 40
         reasons.append("需要额外运行时")
 
-    parameter_billions = repository_parameter_billions(repository_id)
-    capacity_risk = parameter_billions is not None and parameter_billions > 180
-    if capacity_risk:
-        score -= 120
-        reasons.append("模型规模需评估")
-
-    if has_nvfp4 and (has_compressed or has_runtime or has_safetensors) and not capacity_risk:
+    if capacity_risk or gguf_only:
+        level = "review"
+    elif has_nvfp4 and (has_compressed or has_runtime or has_safetensors):
         level = "recommended"
-    elif score >= 20 and not gguf_only:
+    elif score >= 20:
         level = "compatible"
     else:
         level = "review"
     return {"level": level, "score": score, "reasons": reasons[:3]}
 ```
 
-Update `HuggingFaceService.search()` to request `limit=50`, enrich each serialized result, perform Python's stable descending score sort, and return only `safe_limit` entries:
+Update `HuggingFaceService.search()` to request `limit=50`, enrich each serialized result, perform a stable descending level-and-score sort, and return only `safe_limit` entries:
 
 ```python
 def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -206,9 +239,13 @@ def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
                 "spark_compatibility": spark_compatibility(model),
             }
         )
+    level_rank = {"review": 0, "compatible": 1, "recommended": 2}
     return sorted(
         results,
-        key=lambda item: item["spark_compatibility"]["score"],
+        key=lambda item: (
+            level_rank[item["spark_compatibility"]["level"]],
+            item["spark_compatibility"]["score"],
+        ),
         reverse=True,
     )[:safe_limit]
 ```
@@ -299,7 +336,13 @@ renderItem={(model) => {
         title={(
           <div className="hf-result-title">
             <strong>{model.id}</strong>
-            <Tag icon={<ThunderboltOutlined />} color={presentation.color}>{presentation.label}</Tag>
+            <Tag
+              className={`hf-spark-tag hf-spark-tag-${model.spark_compatibility.level}`}
+              icon={<ThunderboltOutlined />}
+              color={presentation.color}
+            >
+              {presentation.label}
+            </Tag>
             {model.gated && <Tag icon={<LockOutlined />} color="warning">需授权</Tag>}
           </div>
         )}
@@ -325,8 +368,16 @@ Use these stable classes in `frontend/src/styles.css`:
 .hf-result-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
 .hf-result-title strong { overflow-wrap: anywhere; }
 .hf-result-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 4px; }
-.hf-compatibility-reason { flex-basis: 100%; overflow-wrap: anywhere; }
+.hf-spark-tag { color: var(--color-ink) !important; }
+.hf-spark-tag-recommended { background: var(--color-primary-soft) !important; border-color: var(--color-primary) !important; }
+.hf-spark-tag-compatible { background: color-mix(in oklch, var(--color-info) 14%, var(--color-bg)) !important; border-color: var(--color-info) !important; }
+.hf-spark-tag-review { background: var(--color-surface) !important; border-color: var(--color-border) !important; }
+.hf-compatibility-reason { flex-basis: 100%; color: var(--color-muted) !important; overflow-wrap: anywhere; }
 ```
+
+Add a Testing Library page test that performs a search against a mocked result, verifies the
+`hf-spark-tag-recommended` class and compatibility reason text, and restores global mocks in
+`afterEach`.
 
 - [ ] **Step 5: Run frontend tests, lint, and build**
 
@@ -343,7 +394,7 @@ Expected: Vitest passes, Oxlint reports zero errors, and Vite produces `frontend
 - [ ] **Step 6: Commit frontend behavior**
 
 ```powershell
-git add frontend/src/api/types.ts frontend/src/utils/huggingface.ts frontend/src/utils/huggingface.test.ts frontend/src/pages/HuggingFacePage.tsx frontend/src/styles.css
+git add frontend/src/api/types.ts frontend/src/utils/huggingface.ts frontend/src/utils/huggingface.test.ts frontend/src/pages/HuggingFacePage.tsx frontend/src/pages/HuggingFacePage.test.tsx frontend/src/styles.css
 git commit -m "feat: show DGX Spark model compatibility"
 ```
 

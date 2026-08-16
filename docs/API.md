@@ -48,6 +48,29 @@ Authorization: Bearer dgx_...
 | GET | `/api/settings` | Non-secret manager configuration |
 | PATCH | `/api/settings/huggingface` | Set or clear encrypted HF token |
 
+### Hugging Face Spark compatibility
+
+`GET /api/huggingface/search?query=Qwen&limit=20` evaluates up to 50 Hub candidates for
+DGX Spark suitability before applying the requested result limit. NVFP4 receives the strongest
+positive signal. Results are ordered by compatibility level, then score; Hub relevance remains
+the tie-breaker for candidates with the same level and score.
+
+Each search result includes an additive compatibility object:
+
+```json
+{
+  "id": "unsloth/Qwen3.8-27B-NVFP4",
+  "spark_compatibility": {
+    "level": "recommended",
+    "score": 180,
+    "reasons": ["NVFP4 量化", "压缩权重格式", "Safetensors 权重"]
+  }
+}
+```
+
+`level` is one of `recommended`, `compatible`, or `review`. Compatibility metadata controls
+search order and presentation only; it does not block repository inspection or download.
+
 ## OpenAI-Compatible Endpoints
 
 - `GET /v1/models`
