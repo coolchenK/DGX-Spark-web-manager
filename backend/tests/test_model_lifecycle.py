@@ -443,6 +443,63 @@ def test_validate_local_target_rejects_target_equal_to_any_nested_root(
         service.validate_local_target(child)
 
 
+@pytest.mark.parametrize("nested_exists", [False, True])
+@pytest.mark.parametrize("reverse_roots", [False, True])
+def test_validate_local_target_rejects_parent_of_nested_root(
+    tmp_path, nested_exists, reverse_roots
+):
+    outer_root = tmp_path / "models"
+    target = outer_root / "target"
+    nested_root = target / "nested-root"
+    target.mkdir(parents=True)
+    if nested_exists:
+        nested_root.mkdir()
+    roots = (outer_root, nested_root)
+    if reverse_roots:
+        roots = tuple(reversed(roots))
+    service = ModelLifecycleService(roots, tmp_path / "hf-cache")
+
+    with pytest.raises(ValueError, match="configured model root"):
+        service.validate_local_target(target)
+
+
+@pytest.mark.parametrize("resolved_relation", ["equal", "inside"])
+def test_validate_local_target_rejects_unrelated_reparse_root_resolved_inside_target(
+    tmp_path, monkeypatch, resolved_relation
+):
+    outer_root = tmp_path / "models"
+    target = outer_root / "target"
+    target.mkdir(parents=True)
+    resolved_alias = target
+    if resolved_relation == "inside":
+        resolved_alias = target / "nested-root"
+        resolved_alias.mkdir()
+    alias_root = tmp_path / "alias-root"
+    alias_root.mkdir()
+    original_is_symlink = Path.is_symlink
+    original_resolve = Path.resolve
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda self: self == alias_root or original_is_symlink(self),
+    )
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda self, strict=False: (
+            resolved_alias
+            if self == alias_root
+            else original_resolve(self, strict=strict)
+        ),
+    )
+    service = ModelLifecycleService(
+        (outer_root, alias_root), tmp_path / "hf-cache"
+    )
+
+    with pytest.raises(ValueError, match="configured model root"):
+        service.validate_local_target(target)
+
+
 def test_local_delete_ignores_unrelated_missing_model_root(database, tmp_path):
     valid_root = tmp_path / "models"
     target = valid_root / "target"

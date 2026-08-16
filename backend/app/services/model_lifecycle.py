@@ -125,7 +125,11 @@ class ModelLifecycleService:
                 Path(os.path.abspath(configured_root))
                 for configured_root in self.model_roots
             ]
-            if any(lexical_target == lexical_root for lexical_root in lexical_roots):
+            if any(
+                lexical_root == lexical_target
+                or lexical_root.is_relative_to(lexical_target)
+                for lexical_root in lexical_roots
+            ):
                 raise ValueError(
                     "Local model target must be inside a configured model root"
                 )
@@ -135,19 +139,38 @@ class ModelLifecycleService:
             resolved_target = lexical_target.resolve(strict=True)
             normalized_roots: list[tuple[Path, Path]] = []
             for lexical_root in lexical_roots:
-                relevant = lexical_target.is_relative_to(lexical_root)
+                target_within_root = lexical_target.is_relative_to(lexical_root)
+                inspection_error: Exception | None = None
                 try:
                     invalid_root = self._is_link_or_reparse(lexical_root)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    invalid_root = True
+                    inspection_error = exc
+                try:
                     resolved_root = lexical_root.resolve(strict=True)
                 except (OSError, RuntimeError, ValueError) as exc:
-                    if relevant:
+                    if target_within_root:
                         raise ValueError(
                             "Unable to resolve the configured model root"
                         ) from exc
                     continue
+
+                if resolved_root == resolved_target or resolved_root.is_relative_to(
+                    resolved_target
+                ):
+                    raise ValueError(
+                        "Local model target must be inside a configured model root"
+                    )
+                resolved_target_within_root = resolved_target.is_relative_to(
+                    resolved_root
+                )
                 if invalid_root:
-                    if not relevant:
+                    if not target_within_root and not resolved_target_within_root:
                         continue
+                    if inspection_error is not None:
+                        raise ValueError(
+                            "Unable to inspect the configured model root"
+                        ) from inspection_error
                     raise ValueError(
                         "Local model path cannot contain a symbolic link or reparse point"
                     )
