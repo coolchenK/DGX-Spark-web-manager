@@ -158,7 +158,11 @@ def test_kv_overflow_lowers_estimate_confidence() -> None:
     assert estimate.confidence == "low"
     assert estimate.decision == "blocked"
     assert any("overflow" in reason.lower() for reason in estimate.reasons)
-    assert any("physical" in reason.lower() for reason in estimate.reasons)
+    assert any(
+        "physical" in reason.lower() and "total" in reason.lower()
+        for reason in estimate.reasons
+    )
+    assert estimate.reasons[0] == "physical memory requirement exceeds total memory"
 
 
 def test_reserve_bytes_uses_floor_and_minimum() -> None:

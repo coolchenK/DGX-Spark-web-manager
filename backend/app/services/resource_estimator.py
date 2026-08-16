@@ -243,6 +243,7 @@ class ResourceEstimator:
         decision: Literal["ok", "warning", "blocked"]
         if kv_result.status == "overflow":
             decision = "blocked"
+            reasons.insert(0, "physical memory requirement exceeds total memory")
         elif required > total:
             decision = "blocked"
             reasons.insert(0, "physical memory requirement exceeds total memory")
