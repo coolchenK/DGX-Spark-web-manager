@@ -25,6 +25,8 @@ from app.services.draft_models import DraftCandidate
 from app.services.model_evidence import ModelEvidenceLoader
 from app.services.resource_estimator import ResourceEstimate, ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilities
+from app.tasks.engine import TaskCancelled
+from sqlalchemy.orm import Session
 
 
 def valid_spec_payload(tmp_path):
@@ -95,6 +97,7 @@ def valid_recommendation_payload():
 
 class StaticRuntimeCapabilities:
     def __init__(self, *, methods=None, mapping=None):
+        self.calls = 0
         self.value = RuntimeCapabilities(
             runtime="vllm",
             image="vllm:test",
@@ -126,6 +129,7 @@ class StaticRuntimeCapabilities:
         )
 
     def get(self, runtime, image):
+        self.calls += 1
         return self.value.model_copy(update={"runtime": runtime, "image": image})
 
 
@@ -157,6 +161,19 @@ class StaticEstimator:
             confidence="high",
             reasons=[f"resource decision is {self.decision}"],
         )
+
+
+class HandlerContext:
+    def __init__(self, task_id="task-1", *, update_error=None):
+        self.task_id = task_id
+        self.update_error = update_error
+
+    def update(self, **_kwargs):
+        if self.update_error is not None:
+            raise self.update_error
+
+    def check_control(self):
+        return None
 
 
 def add_model_asset(db, path, *, name="Base", status="available", **values):
@@ -630,6 +647,58 @@ def test_resolve_spec_rejects_unsupported_speculative_capabilities(
         service.resolve_spec(db, spec)
 
 
+def test_disallowed_image_is_rejected_without_capability_probe(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'disallowed-image.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    capabilities = StaticRuntimeCapabilities()
+    service = build_preflight_service(database, (root,), capabilities=capabilities)
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:not-allowed",
+        port=8100,
+    )
+
+    with database.session_factory() as db, pytest.raises(
+        ValueError, match="Image is not allowed"
+    ):
+        service.preview(db, spec)
+
+    assert capabilities.calls == 0
+
+
+def test_preflight_gets_runtime_capabilities_once(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'single-capability.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    capabilities = StaticRuntimeCapabilities()
+    service = build_preflight_service(database, (root,), capabilities=capabilities)
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with database.session_factory() as db:
+        service.preview(db, spec)
+
+    assert capabilities.calls == 1
+
+
 def test_run_container_rejects_public_browser_spec(tmp_path):
     database = Database(f"sqlite:///{tmp_path / 'public-run.db'}")
     database.create_schema()
@@ -737,6 +806,130 @@ def test_preview_excludes_current_deployment_from_shared_route_check(tmp_path):
         preview = service.preview(db, spec, exclude_deployment_id=deployment_id)
 
     assert preview["spec"]["generation_defaults"]["temperature"] == 0.7
+
+
+@pytest.mark.parametrize(
+    ("existing_api_name", "existing_config", "new_api_name", "new_route_alias"),
+    [
+        (
+            "shared",
+            {"spec": {"generation_defaults": {"temperature": 0.2}}},
+            "replica-b",
+            "shared",
+        ),
+        (
+            "replica-a",
+            {
+                "route_alias": "shared",
+                "spec": {"generation_defaults": {"temperature": 0.2}},
+            },
+            "shared",
+            None,
+        ),
+        (
+            "replica-a",
+            {
+                "route_alias": "shared",
+                "generation_defaults": {"temperature": 0.2},
+            },
+            "shared",
+            None,
+        ),
+    ],
+)
+def test_preview_compares_effective_routes_and_legacy_generation_defaults(
+    tmp_path,
+    existing_api_name,
+    existing_config,
+    new_api_name,
+    new_route_alias,
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'effective-route.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        db.add(
+            Deployment(
+                name="replica-a",
+                model_id=target.id,
+                runtime="vllm",
+                endpoint_url="http://127.0.0.1:8100",
+                api_model_name=existing_api_name,
+                status="running",
+                health="healthy",
+                managed=True,
+                image="vllm:test",
+                port=8100,
+                config=existing_config,
+            )
+        )
+        db.commit()
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="replica-b",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name=new_api_name,
+        route_alias=new_route_alias,
+        runtime="vllm",
+        image="vllm:test",
+        port=8101,
+        generation_defaults={"temperature": 0.7},
+    )
+
+    with database.session_factory() as db, pytest.raises(
+        ValueError, match="Shared route generation defaults must match"
+    ):
+        service.preview(db, spec)
+
+
+def test_preview_allows_effective_route_with_matching_generation_defaults(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'matching-route.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        db.add(
+            Deployment(
+                name="replica-a",
+                model_id=target.id,
+                runtime="vllm",
+                endpoint_url="http://127.0.0.1:8100",
+                api_model_name="shared",
+                status="running",
+                health="healthy",
+                managed=True,
+                image="vllm:test",
+                port=8100,
+                config={
+                    "generation_defaults": {
+                        "temperature": 0.2,
+                        "top_p": None,
+                    }
+                },
+            )
+        )
+        db.commit()
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="replica-b",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="replica-b",
+        route_alias="shared",
+        runtime="vllm",
+        image="vllm:test",
+        port=8101,
+        generation_defaults={"temperature": 0.2},
+    )
+
+    with database.session_factory() as db:
+        preview = service.preview(db, spec)
+
+    assert preview["route_alias"] == "shared"
 
 
 @pytest.mark.parametrize("decision", ["blocked", "warning"])
@@ -1488,6 +1681,241 @@ def test_create_handler_rechecks_resources_before_any_docker_call(tmp_path):
     assert docker_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("existing_name", "existing_api"),
+    [("base", "other-api"), ("other-name", "base")],
+)
+def test_create_handler_rejects_partial_name_or_api_conflicts(
+    tmp_path, existing_name, existing_api
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'partial-conflict.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        db.add(
+            Deployment(
+                name=existing_name,
+                model_id=target.id,
+                runtime="vllm",
+                container_id="existing-container",
+                container_name="dgx-existing",
+                endpoint_url="http://127.0.0.1:8100",
+                api_model_name=existing_api,
+                status="running",
+                health="healthy",
+                managed=True,
+                image="vllm:test",
+                port=8100,
+                config={},
+            )
+        )
+        db.commit()
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with pytest.raises(ValueError, match="conflicts with an existing deployment"):
+        service.create_handler(HandlerContext(), spec.model_dump(mode="json"))
+
+
+def test_create_handler_rejects_same_identity_with_different_spec(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'spec-conflict.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    original = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+    with database.session_factory() as db:
+        preview = service.preview(db, original)
+        db.add(
+            Deployment(
+                name="base",
+                model_id=model_id,
+                runtime="vllm",
+                container_id="existing-container",
+                container_name="dgx-base",
+                endpoint_url="http://127.0.0.1:8100",
+                api_model_name="base",
+                status="running",
+                health="healthy",
+                managed=True,
+                image="vllm:test",
+                port=8100,
+                config=preview,
+            )
+        )
+        db.commit()
+
+    changed = original.model_copy(update={"port": 8101})
+    idempotent = service.create_handler(
+        HandlerContext(), original.model_dump(mode="json")
+    )
+    assert idempotent["idempotent"] is True
+
+    with pytest.raises(ValueError, match="different deployment spec"):
+        service.create_handler(HandlerContext(), changed.model_dump(mode="json"))
+
+
+def test_create_handler_rejects_orphan_container_with_incomplete_labels(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'orphan-labels.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+
+    class ExistingContainer:
+        id = "orphan"
+        name = "dgx-base"
+        status = "running"
+        attrs = {
+            "Config": {"Labels": {"com.dgx-spark-manager.managed": "true"}}
+        }
+
+        def reload(self):
+            return None
+
+    existing_container = ExistingContainer()
+    containers = type(
+        "Containers", (), {"get": lambda _self, _name: existing_container}
+    )()
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": containers})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with pytest.raises(ValueError, match="container labels do not match"):
+        service.create_handler(HandlerContext(), spec.model_dump(mode="json"))
+
+    with database.session_factory() as db:
+        resolved, preview = service._preflight(db, spec)
+    existing_container.attrs["Config"]["Labels"] = service._expected_container_labels(
+        resolved,
+        task_id="task-1",
+        spec_fingerprint=preview["spec_fingerprint"],
+    )
+    result = service.create_handler(HandlerContext(), spec.model_dump(mode="json"))
+
+    assert result["container_name"] == "dgx-base"
+
+
+@pytest.mark.parametrize("failure_stage", ["cancel", "health", "commit"])
+def test_create_handler_removes_new_container_for_all_pre_persist_failures(
+    tmp_path, monkeypatch, failure_stage
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / f'cleanup-{failure_stage}.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+
+    class NewContainer:
+        id = "new-container"
+        name = "dgx-base"
+        status = "running"
+        attrs = {"Config": {"Labels": {}}}
+        removed = False
+        force = None
+
+        def reload(self):
+            return None
+
+        def remove(self, **kwargs):
+            self.removed = True
+            self.force = kwargs.get("force")
+
+        def logs(self, **_kwargs):
+            return b"startup"
+
+    container = NewContainer()
+
+    class Containers:
+        def get(self, _name):
+            raise docker.errors.NotFound("missing")
+
+        def run(self, _image, **_kwargs):
+            return container
+
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": Containers()})(),
+    )
+    context = HandlerContext(
+        update_error=TaskCancelled() if failure_stage == "cancel" else None
+    )
+    if failure_stage == "health":
+        monkeypatch.setattr(
+            service,
+            "wait_for_health",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("health probe failed")
+            ),
+        )
+    else:
+        monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+    if failure_stage == "commit":
+        original_commit = Session.commit
+
+        def fail_deployment_commit(session):
+            if any(isinstance(value, Deployment) for value in session.new):
+                raise RuntimeError("deployment commit failed")
+            return original_commit(session)
+
+        monkeypatch.setattr(Session, "commit", fail_deployment_commit)
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    expected = TaskCancelled if failure_stage == "cancel" else RuntimeError
+    with pytest.raises(expected):
+        service.create_handler(context, spec.model_dump(mode="json"))
+
+    assert container.removed is True
+    assert container.force is True
+
+
 def test_update_handler_blocked_preflight_does_not_touch_old_container(tmp_path):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'update-preflight.db'}")
@@ -1731,6 +2159,15 @@ def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):
         "Type": "json-file",
         "Config": {"max-size": "10m", "max-file": "5"},
     }
+    labels = captured["labels"]
+    assert labels["com.dgx-spark-manager.task-id"] == "manual"
+    assert labels["com.dgx-spark-manager.runtime"] == "vllm"
+    assert labels["com.dgx-spark-manager.model-id"] == model_id
+    assert labels["com.dgx-spark-manager.route"] == "test-model"
+    assert labels["com.dgx-spark-manager.image"] == "vllm/vllm-openai:v0.27.1"
+    assert labels["com.dgx-spark-manager.port"] == "8100"
+    assert len(labels["com.dgx-spark-manager.spec-fingerprint"]) == 64
+    assert all(str(model_path) not in value for value in labels.values())
 
 
 def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path, monkeypatch):
@@ -1762,6 +2199,7 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
         status = "running"
         stopped = False
         removed = False
+        remove_force = None
 
         def logs(self, **_kwargs):
             return b"engine failed while allocating memory"
@@ -1769,8 +2207,9 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
         def stop(self, **_kwargs):
             self.stopped = True
 
-        def remove(self):
+        def remove(self, **kwargs):
             self.removed = True
+            self.remove_force = kwargs.get("force")
 
     container = FakeContainer()
 
@@ -1812,8 +2251,8 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
             ).model_dump(),
         )
 
-    assert container.stopped is True
     assert container.removed is True
+    assert container.remove_force is True
 
 
 def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
@@ -1954,8 +2393,9 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
 
     class FakeContainers:
         def get(self, identifier):
-            assert identifier == "old-container"
-            return old
+            if identifier in {"old-container", "dgx-managed"}:
+                return old
+            raise docker.errors.NotFound("missing")
 
         def run(self, _image, **_kwargs):
             return new
@@ -2055,14 +2495,16 @@ def test_update_handler_restores_old_container_when_replacement_is_unhealthy(
 
     old = Container("old-container", "dgx-base")
     new = Container("new-container", "dgx-base")
-    containers = type(
-        "Containers",
-        (),
-        {
-            "get": lambda _self, _identifier: old,
-            "run": lambda _self, _image, **_kwargs: new,
-        },
-    )()
+    class Containers:
+        def get(self, identifier):
+            if identifier == "old-container":
+                return old
+            raise docker.errors.NotFound("missing")
+
+        def run(self, _image, **_kwargs):
+            return new
+
+    containers = Containers()
     monkeypatch.setattr(
         service,
         "docker_client",
@@ -2097,4 +2539,184 @@ def test_update_handler_restores_old_container_when_replacement_is_unhealthy(
         unchanged = db.get(Deployment, deployment_id)
         assert unchanged.container_id == "old-container"
         assert unchanged.config == {"before": True}
+
+
+@pytest.mark.parametrize(
+    "crash_stage", ["renamed", "replacement", "committed", "mismatched"]
+)
+def test_update_handler_reconciles_interrupted_replacement_stages(
+    tmp_path, monkeypatch, crash_stage
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / f'reconcile-{crash_stage}.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        deployment = Deployment(
+            name="old-name",
+            model_id=target.id,
+            runtime="vllm",
+            container_id="old-container",
+            container_name="dgx-old-name",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="old-api",
+            status="running",
+            health="healthy",
+            managed=True,
+            image="vllm:test",
+            port=8100,
+            config={"before": True},
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id, model_id = deployment.id, target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="new-name",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="new-api",
+        runtime="vllm",
+        image="vllm:test",
+        port=8101,
+    )
+    with database.session_factory() as db:
+        resolved, preview = service._preflight(
+            db, spec, exclude_deployment_id=deployment_id
+        )
+    fingerprint = preview["spec_fingerprint"]
+    target_name = deterministic_container_name(spec.name)
+    backup_name = f"dgx-backup-{deployment_id}"[:63]
+    labels = service._expected_container_labels(
+        resolved,
+        task_id="task-1",
+        spec_fingerprint=fingerprint,
+        deployment_id=deployment_id,
+    )
+
+    class Container:
+        def __init__(self, container_id, name, *, labels=None):
+            self.id = container_id
+            self.name = name
+            self.status = "running"
+            self.attrs = {"Config": {"Labels": labels or {}}}
+            self.removed = False
+            self.renames = []
+
+        def reload(self):
+            return None
+
+        def stop(self, **_kwargs):
+            self.status = "exited"
+
+        def start(self):
+            self.status = "running"
+
+        def rename(self, name):
+            self.renames.append(name)
+            self.name = name
+
+        def remove(self, **_kwargs):
+            self.removed = True
+
+        def logs(self, **_kwargs):
+            return b"ready"
+
+    old = Container("old-container", backup_name)
+    replacement = (
+        None
+        if crash_stage == "renamed"
+        else Container(
+            "new-container",
+            target_name,
+            labels=(
+                {"com.dgx-spark-manager.managed": "true"}
+                if crash_stage == "mismatched"
+                else labels
+            ),
+        )
+    )
+    if crash_stage == "committed":
+        with database.session_factory() as db:
+            deployment = db.get(Deployment, deployment_id)
+            deployment.name = spec.name
+            deployment.api_model_name = spec.api_model_name
+            deployment.container_id = replacement.id
+            deployment.container_name = target_name
+            deployment.endpoint_url = "http://127.0.0.1:8101"
+            deployment.port = spec.port
+            deployment.config = preview
+            db.commit()
+
+    class Containers:
+        run_calls = 0
+
+        def get(self, identifier):
+            if identifier in {"old-container", backup_name}:
+                return old
+            if replacement is not None and identifier in {
+                "new-container",
+                target_name,
+            }:
+                return replacement
+            raise docker.errors.NotFound("missing")
+
+        def run(self, _image, **kwargs):
+            self.run_calls += 1
+            if replacement is not None:
+                raise AssertionError("replacement must not be created twice")
+            created = Container(
+                "new-container",
+                kwargs["name"],
+                labels=kwargs["labels"],
+            )
+            nonlocal_replacement[0] = created
+            return created
+
+    nonlocal_replacement = [replacement]
+    containers = Containers()
+
+    def get_with_created(identifier):
+        current = nonlocal_replacement[0]
+        if identifier in {"old-container", backup_name}:
+            return old
+        if current is not None and identifier in {"new-container", target_name}:
+            return current
+        raise docker.errors.NotFound("missing")
+
+    monkeypatch.setattr(containers, "get", get_with_created)
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": containers})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+
+    if crash_stage == "mismatched":
+        with pytest.raises(ValueError, match="container labels do not match"):
+            service.update_handler(
+                HandlerContext(),
+                {
+                    "deployment_id": deployment_id,
+                    "spec": spec.model_dump(mode="json"),
+                },
+            )
+        assert old.name == "dgx-old-name"
+        assert old.status == "running"
+        assert replacement.removed is False
+        return
+
+    result = service.update_handler(
+        HandlerContext(),
+        {"deployment_id": deployment_id, "spec": spec.model_dump(mode="json")},
+    )
+
+    assert result["deployment_id"] == deployment_id
+    assert containers.run_calls == (1 if crash_stage == "renamed" else 0)
+    assert old.renames == []
+    assert old.removed is True
+    with database.session_factory() as db:
+        updated = db.get(Deployment, deployment_id)
+        assert updated.container_id == "new-container"
+        assert updated.config["spec_fingerprint"] == fingerprint
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -25,8 +27,10 @@ from app.services.diagnostics import redact_log
 from app.services.draft_models import DraftCompatibilityService
 from app.services.model_evidence import ModelEvidenceLoader
 from app.services.resource_estimator import ResourceEstimator
-from app.services.runtime_capabilities import RuntimeCapabilityService
+from app.services.runtime_capabilities import RuntimeCapabilities, RuntimeCapabilityService
 from app.tasks.engine import TaskContext
+
+LABEL_PREFIX = "com.dgx-spark-manager."
 
 
 def resolve_host_model_mount(
@@ -42,6 +46,19 @@ def resolve_host_model_mount(
         if resolved_model == resolved_root or resolved_model.is_relative_to(resolved_root):
             return host_root
     raise ValueError("Model path is outside configured model roots")
+
+
+def deployment_spec_fingerprint(spec: DeploymentSpec) -> str:
+    public = spec.public_dump() if isinstance(spec, ResolvedDeploymentSpec) else spec.model_dump(
+        mode="json"
+    )
+    canonical = json.dumps(
+        public,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class DeploymentService:
@@ -101,7 +118,16 @@ class DeploymentService:
         suffix = "/".join(relative.parts)
         return f"{bind}/{suffix}" if suffix else bind
 
-    def resolve_spec(self, db: Session, spec: DeploymentSpec) -> ResolvedDeploymentSpec:
+    def _resolve_spec_with_capabilities(
+        self, db: Session, spec: DeploymentSpec
+    ) -> tuple[ResolvedDeploymentSpec, RuntimeCapabilities]:
+        adapter = self.adapter(spec.runtime)
+        if spec.runtime != adapter.runtime:
+            raise ValueError(
+                f"Adapter {adapter.runtime} cannot deploy runtime {spec.runtime}"
+            )
+        if spec.image not in adapter.allowed_images:
+            raise ValueError(f"Image is not allowed for {spec.runtime}")
         target = db.get(ModelAsset, spec.model_id) if spec.model_id else None
         if target is None or target.status != "available" or not target.local_path:
             raise ValueError("Base model is missing or unavailable")
@@ -153,9 +179,14 @@ class DeploymentService:
                     "speculative_runtime_method": runtime_method,
                 }
             )
-        return ResolvedDeploymentSpec.model_validate(
+        resolved = ResolvedDeploymentSpec.model_validate(
             {**spec.model_dump(mode="json"), **internal}
         )
+        return resolved, capabilities
+
+    def resolve_spec(self, db: Session, spec: DeploymentSpec) -> ResolvedDeploymentSpec:
+        resolved, _ = self._resolve_spec_with_capabilities(db, spec)
+        return resolved
 
     def preview(
         self,
@@ -189,21 +220,27 @@ class DeploymentService:
         *,
         exclude_deployment_id: str | None,
     ) -> None:
-        if spec.route_alias is None:
-            return
+        effective_route = spec.route_alias or spec.api_model_name
         current = spec.generation_defaults.model_dump(mode="json", exclude_none=True)
         for deployment in db.scalars(select(Deployment)).all():
             if deployment.id == exclude_deployment_id:
                 continue
             config = deployment.config if isinstance(deployment.config, Mapping) else {}
-            stored_spec = config.get("spec")
-            if not isinstance(stored_spec, Mapping):
-                continue
-            if stored_spec.get("route_alias") != spec.route_alias:
-                continue
-            stored = self._normalized_generation_defaults(
-                stored_spec.get("generation_defaults")
+            stored_spec_value = config.get("spec")
+            stored_spec = (
+                stored_spec_value if isinstance(stored_spec_value, Mapping) else {}
             )
+            stored_route = (
+                config.get("route_alias")
+                or stored_spec.get("route_alias")
+                or deployment.api_model_name
+            )
+            if stored_route != effective_route:
+                continue
+            stored_generation = stored_spec.get("generation_defaults")
+            if not isinstance(stored_generation, Mapping):
+                stored_generation = config.get("generation_defaults")
+            stored = self._normalized_generation_defaults(stored_generation)
             if stored != current:
                 raise ValueError("Shared route generation defaults must match")
 
@@ -245,6 +282,77 @@ class DeploymentService:
             }
         return mounts
 
+    @staticmethod
+    def _expected_container_labels(
+        spec: ResolvedDeploymentSpec,
+        *,
+        task_id: str,
+        spec_fingerprint: str,
+        deployment_id: str | None = None,
+    ) -> dict[str, str]:
+        labels = {
+            f"{LABEL_PREFIX}managed": "true",
+            f"{LABEL_PREFIX}task-id": task_id,
+            f"{LABEL_PREFIX}spec-fingerprint": spec_fingerprint,
+            f"{LABEL_PREFIX}runtime": spec.runtime,
+            f"{LABEL_PREFIX}model-id": spec.model_id or "",
+            f"{LABEL_PREFIX}route": spec.route_alias or spec.api_model_name,
+            f"{LABEL_PREFIX}image": spec.image,
+            f"{LABEL_PREFIX}port": str(spec.port),
+        }
+        if deployment_id is not None:
+            labels[f"{LABEL_PREFIX}deployment-id"] = deployment_id
+        return labels
+
+    @staticmethod
+    def _validate_container_labels(
+        container: Any,
+        expected: Mapping[str, str],
+        *,
+        require_task: bool = True,
+        require_deployment: bool = True,
+    ) -> None:
+        labels = (container.attrs.get("Config") or {}).get("Labels") or {}
+        for key, value in expected.items():
+            if not require_task and key == f"{LABEL_PREFIX}task-id":
+                continue
+            if not require_deployment and key == f"{LABEL_PREFIX}deployment-id":
+                continue
+            if labels.get(key) != value:
+                raise ValueError("Existing container labels do not match this task and spec")
+
+    @staticmethod
+    def _get_container_optional(client: Any, identifier: str) -> Any | None:
+        try:
+            return client.containers.get(identifier)
+        except docker.errors.NotFound:
+            return None
+
+    @staticmethod
+    def _backup_container_name(deployment_id: str) -> str:
+        return f"dgx-backup-{deployment_id}"[:63]
+
+    @staticmethod
+    def _stored_spec_fingerprint(deployment: Deployment) -> str | None:
+        config = deployment.config if isinstance(deployment.config, Mapping) else {}
+        value = config.get("spec_fingerprint")
+        if isinstance(value, str) and len(value) == 64:
+            return value
+        stored_spec = config.get("spec")
+        if not isinstance(stored_spec, Mapping):
+            return None
+        try:
+            return deployment_spec_fingerprint(DeploymentSpec.model_validate(stored_spec))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _remove_owned_container(container: Any) -> None:
+        try:
+            container.remove(force=True)
+        except BaseException:
+            pass
+
     def _preflight(
         self,
         db: Session,
@@ -252,19 +360,12 @@ class DeploymentService:
         *,
         exclude_deployment_id: str | None = None,
     ) -> tuple[ResolvedDeploymentSpec, dict[str, Any]]:
-        resolved = self.resolve_spec(db, spec)
+        resolved, capabilities = self._resolve_spec_with_capabilities(db, spec)
         adapter = self.adapter(resolved.runtime)
         model_path = adapter.validate(resolved)
         compatibility = adapter.check_model_compatibility(model_path)
         if not compatibility.get("compatible"):
             raise ValueError("Base model is incompatible")
-        try:
-            capabilities = self.runtime_capability_service.get(
-                resolved.runtime, resolved.image
-            )
-        except Exception as exc:
-            raise ValueError("Runtime capabilities could not be verified") from exc
-
         self._validate_route_defaults(
             db,
             resolved,
@@ -356,6 +457,7 @@ class DeploymentService:
                     else None
                 ),
                 "warnings": warnings,
+                "spec_fingerprint": deployment_spec_fingerprint(resolved),
             }
         )
         return resolved, preview
@@ -394,6 +496,10 @@ class DeploymentService:
         spec: ResolvedDeploymentSpec,
         adapter: RuntimeAdapter,
         name: str,
+        *,
+        task_id: str = "manual",
+        spec_fingerprint: str | None = None,
+        deployment_id: str | None = None,
     ) -> Any:
         if not isinstance(spec, ResolvedDeploymentSpec):
             raise ValueError("Resolved deployment spec is required")
@@ -412,6 +518,7 @@ class DeploymentService:
                 "bind": "/draft-models",
                 "mode": "ro",
             }
+        fingerprint = spec_fingerprint or deployment_spec_fingerprint(spec)
         return client.containers.run(
             spec.image,
             command=adapter.command(spec),
@@ -419,12 +526,12 @@ class DeploymentService:
             detach=True,
             ports={"8000/tcp": spec.port},
             volumes=volumes,
-            labels={
-                "com.dgx-spark-manager.managed": "true",
-                "com.dgx-spark-manager.model": spec.api_model_name,
-                "com.dgx-spark-manager.route": spec.route_alias or spec.api_model_name,
-                "com.dgx-spark-manager.runtime": spec.runtime,
-            },
+            labels=self._expected_container_labels(
+                spec,
+                task_id=task_id,
+                spec_fingerprint=fingerprint,
+                deployment_id=deployment_id,
+            ),
             restart_policy={"Name": "unless-stopped"},
             log_config=LogConfig(
                 type=LogConfig.types.JSON,
@@ -444,73 +551,109 @@ class DeploymentService:
     def create_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         spec = DeploymentSpec.model_validate(payload)
         with self.session_factory() as db:
-            existing = db.scalar(
+            matches = list(
+                db.scalars(
                 select(Deployment).where(
                     or_(
                         Deployment.name == spec.name,
                         Deployment.api_model_name == spec.api_model_name,
                     )
                 )
+                ).all()
             )
-            if existing:
+            resolved, preview = self._preflight(db, spec)
+            fingerprint = preview["spec_fingerprint"]
+            if matches:
+                if len(matches) != 1:
+                    raise ValueError("Deployment identity conflicts with existing deployments")
+                existing = matches[0]
+                if (
+                    existing.name != spec.name
+                    or existing.api_model_name != spec.api_model_name
+                ):
+                    raise ValueError("Deployment identity conflicts with an existing deployment")
+                if self._stored_spec_fingerprint(existing) != fingerprint:
+                    raise ValueError("Existing deployment uses a different deployment spec")
                 return {
                     "deployment_id": existing.id,
                     "container_name": existing.container_name,
                     "endpoint_url": existing.endpoint_url,
                     "idempotent": True,
                 }
-            resolved, preview = self._preflight(db, spec)
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
         name = deterministic_container_name(resolved.name)
+        task_id = str(getattr(context, "task_id", "manual"))
+        expected_labels = self._expected_container_labels(
+            resolved,
+            task_id=task_id,
+            spec_fingerprint=fingerprint,
+        )
         created_container = False
+        persisted = False
+        container = None
         try:
-            container = client.containers.get(name)
-            labels = (container.attrs.get("Config") or {}).get("Labels") or {}
-            if labels.get("com.dgx-spark-manager.managed") != "true":
-                raise RuntimeError(f"Container name {name} is already used by an unmanaged service")
-            if container.status != "running":
-                adapter.start(container)
-        except docker.errors.NotFound:
-            container = self._run_container(client, resolved, adapter, name)
-            created_container = True
-        endpoint = f"http://127.0.0.1:{resolved.port}"
-        context.update(progress=25, message=f"Container {name} started; waiting for health")
-        healthy = self.wait_for_health(context, endpoint, adapter=adapter)
-        if not healthy:
-            logs = self._startup_logs(adapter, container)
-            context.update(message=f"Startup failed. Last container logs:\n{logs}")
-            if created_container:
-                adapter.stop(container, timeout=15)
-                container.remove()
-            detail = f" Last container logs:\n{logs}" if logs else ""
-            raise RuntimeError(
-                f"Deployment did not become healthy within "
-                f"{self.startup_timeout_seconds} seconds.{detail}"
+            try:
+                container = client.containers.get(name)
+                self._validate_container_labels(container, expected_labels)
+                if container.status != "running":
+                    adapter.start(container)
+            except docker.errors.NotFound:
+                container = self._run_container(
+                    client,
+                    resolved,
+                    adapter,
+                    name,
+                    task_id=task_id,
+                    spec_fingerprint=fingerprint,
+                )
+                created_container = True
+            endpoint = f"http://127.0.0.1:{resolved.port}"
+            context.update(
+                progress=25,
+                message=f"Container {name} started; waiting for health",
             )
-        container.reload()
-        with self.session_factory() as db:
-            deployment = Deployment(
-                name=resolved.name,
-                model_id=resolved.model_id,
-                runtime=resolved.runtime,
-                container_id=container.id,
-                container_name=name,
-                endpoint_url=endpoint,
-                api_model_name=resolved.api_model_name,
-                status="running",
-                health="healthy",
-                managed=True,
-                image=resolved.image,
-                port=resolved.port,
-                config=preview,
-                capabilities=adapter.openai_capabilities(),
-            )
-            db.add(deployment)
-            db.commit()
-            db.refresh(deployment)
-            deployment_id = deployment.id
-        return {"deployment_id": deployment_id, "container_name": name, "endpoint_url": endpoint}
+            healthy = self.wait_for_health(context, endpoint, adapter=adapter)
+            if not healthy:
+                logs = self._startup_logs(adapter, container)
+                context.update(message=f"Startup failed. Last container logs:\n{logs}")
+                detail = f" Last container logs:\n{logs}" if logs else ""
+                raise RuntimeError(
+                    f"Deployment did not become healthy within "
+                    f"{self.startup_timeout_seconds} seconds.{detail}"
+                )
+            container.reload()
+            with self.session_factory() as db:
+                deployment = Deployment(
+                    name=resolved.name,
+                    model_id=resolved.model_id,
+                    runtime=resolved.runtime,
+                    container_id=container.id,
+                    container_name=name,
+                    endpoint_url=endpoint,
+                    api_model_name=resolved.api_model_name,
+                    status="running",
+                    health="healthy",
+                    managed=True,
+                    image=resolved.image,
+                    port=resolved.port,
+                    config=preview,
+                    capabilities=adapter.openai_capabilities(),
+                )
+                db.add(deployment)
+                db.commit()
+                persisted = True
+                db.refresh(deployment)
+                deployment_id = deployment.id
+            return {
+                "deployment_id": deployment_id,
+                "container_name": name,
+                "endpoint_url": endpoint,
+            }
+        except BaseException:
+            if created_container and not persisted and container is not None:
+                self._remove_owned_container(container)
+            raise
 
     def update_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         deployment_id = str(payload["deployment_id"])
@@ -537,25 +680,95 @@ class DeploymentService:
                 spec,
                 exclude_deployment_id=deployment_id,
             )
-            old_container_id = deployment.container_id
+            current_container_id = deployment.container_id
+            current_container_name = deployment.container_name or deterministic_container_name(
+                deployment.name
+            )
+            current_status = deployment.status
+            stored_fingerprint = self._stored_spec_fingerprint(deployment)
+            current_matches_target = (
+                deployment.name == resolved.name
+                and deployment.model_id == resolved.model_id
+                and deployment.runtime == resolved.runtime
+                and deployment.api_model_name == resolved.api_model_name
+                and deployment.image == resolved.image
+                and deployment.port == resolved.port
+            )
 
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
-        old_container = client.containers.get(old_container_id)
-        old_container.reload()
-        old_name = old_container.name
-        was_running = old_container.status == "running"
-        backup_name = f"{old_name[:43]}-backup-{deployment_id[:8]}"
+        task_id = str(getattr(context, "task_id", "manual"))
+        fingerprint = preview["spec_fingerprint"]
         new_name = deterministic_container_name(resolved.name)
+        backup_name = self._backup_container_name(deployment_id)
+        endpoint = f"http://127.0.0.1:{resolved.port}"
+        expected_labels = self._expected_container_labels(
+            resolved,
+            task_id=task_id,
+            spec_fingerprint=fingerprint,
+            deployment_id=deployment_id,
+        )
+
+        if stored_fingerprint == fingerprint and current_matches_target:
+            target = self._get_container_optional(client, current_container_id)
+            if target is None:
+                raise ValueError("Persisted replacement container was not found")
+            self._validate_container_labels(
+                target,
+                expected_labels,
+                require_task=False,
+                require_deployment=False,
+            )
+            if target.status != "running":
+                adapter.start(target)
+            if not self.wait_for_health(context, endpoint, adapter=adapter):
+                raise RuntimeError("Persisted replacement container is unhealthy")
+            backup = self._get_container_optional(client, backup_name)
+            if backup is not None and backup.id != target.id:
+                self._remove_owned_container(backup)
+            return {
+                "deployment_id": deployment_id,
+                "container_name": current_container_name,
+                "endpoint_url": endpoint,
+                "idempotent": True,
+            }
+
+        old_container = client.containers.get(current_container_id)
+        old_container.reload()
+        restore_running = current_status == "running"
+        replacement = self._get_container_optional(client, new_name)
+        if replacement is not None and replacement.id == old_container.id:
+            replacement = None
         new_container = None
         record_updated = False
         try:
-            if was_running:
-                adapter.stop(old_container, timeout=30)
-            old_container.rename(backup_name)
-            context.update(progress=20, message=f"Creating replacement container {new_name}")
-            new_container = self._run_container(client, resolved, adapter, new_name)
-            endpoint = f"http://127.0.0.1:{resolved.port}"
+            if replacement is not None:
+                self._validate_container_labels(replacement, expected_labels)
+            if old_container.name == current_container_name:
+                if old_container.status == "running":
+                    adapter.stop(old_container, timeout=30)
+                old_container.rename(backup_name)
+            elif old_container.name != backup_name:
+                raise ValueError("Existing backup container state is invalid")
+
+            if replacement is None:
+                context.update(
+                    progress=20,
+                    message=f"Creating replacement container {new_name}",
+                )
+                new_container = self._run_container(
+                    client,
+                    resolved,
+                    adapter,
+                    new_name,
+                    task_id=task_id,
+                    spec_fingerprint=fingerprint,
+                    deployment_id=deployment_id,
+                )
+            else:
+                new_container = replacement
+                if new_container.status != "running":
+                    adapter.start(new_container)
             if not self.wait_for_health(
                 context,
                 endpoint,
@@ -587,9 +800,9 @@ class DeploymentService:
                 deployment.config = preview
                 deployment.capabilities = adapter.openai_capabilities()
                 db.commit()
-            record_updated = True
+                record_updated = True
             try:
-                old_container.remove()
+                old_container.remove(force=True)
             except Exception as exc:
                 context.update(message=f"Old stopped container cleanup deferred: {exc}")
             return {
@@ -597,18 +810,16 @@ class DeploymentService:
                 "container_name": new_name,
                 "endpoint_url": endpoint,
             }
-        except Exception:
+        except BaseException:
             if not record_updated:
                 if new_container is not None:
-                    try:
-                        new_container.remove(force=True)
-                    except Exception:
-                        pass
+                    self._remove_owned_container(new_container)
                 try:
-                    old_container.rename(old_name)
-                    if was_running:
+                    if old_container.name == backup_name:
+                        old_container.rename(current_container_name)
+                    if restore_running and old_container.status != "running":
                         adapter.start(old_container)
-                except Exception:
+                except BaseException:
                     pass
             raise
 
