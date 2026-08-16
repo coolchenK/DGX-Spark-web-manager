@@ -108,19 +108,35 @@ export function DraftModelStep({
             label: '推测解码高级参数',
             children: (
               runtime === 'vllm' ? (
-                <Form.Item name={['speculative', 'num_speculative_tokens']} label="每轮推测 Token">
-                  <InputNumber min={1} max={64} />
+                <Form.Item
+                  name={['speculative', 'num_speculative_tokens']}
+                  label="每轮推测 Token"
+                  rules={[{ required: false, type: 'number', min: 1, max: 64, message: '每轮推测 Token 必须在 1-64 之间' }]}
+                >
+                  <InputNumber />
                 </Form.Item>
               ) : (
                 <div className="form-grid">
-                  <Form.Item name={['speculative', 'num_steps']} label="推测步数">
-                    <InputNumber min={1} max={32} />
+                  <Form.Item
+                    name={['speculative', 'num_steps']}
+                    label="推测步数"
+                    rules={[{ required: false, type: 'number', min: 1, max: 32, message: '推测步数必须在 1-32 之间' }]}
+                  >
+                    <InputNumber />
                   </Form.Item>
-                  <Form.Item name={['speculative', 'eagle_top_k']} label="EAGLE Top K">
-                    <InputNumber min={1} max={32} />
+                  <Form.Item
+                    name={['speculative', 'eagle_top_k']}
+                    label="EAGLE Top K"
+                    rules={[{ required: false, type: 'number', min: 1, max: 32, message: 'EAGLE Top K 必须在 1-32 之间' }]}
+                  >
+                    <InputNumber />
                   </Form.Item>
-                  <Form.Item name={['speculative', 'num_draft_tokens']} label="Draft Token 数">
-                    <InputNumber min={1} max={256} />
+                  <Form.Item
+                    name={['speculative', 'num_draft_tokens']}
+                    label="Draft Token 数"
+                    rules={[{ required: false, type: 'number', min: 1, max: 256, message: 'Draft Token 数必须在 1-256 之间' }]}
+                  >
+                    <InputNumber />
                   </Form.Item>
                 </div>
               )

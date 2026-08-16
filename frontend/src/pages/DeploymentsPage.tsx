@@ -719,6 +719,17 @@ export function DeploymentsPage() {
         return
       }
       const speculative = form.getFieldValue('speculative') as SpeculativeSettings | null
+      try {
+        await form.validateFields(runtime === 'vllm'
+          ? [['speculative', 'num_speculative_tokens']]
+          : [
+              ['speculative', 'num_steps'],
+              ['speculative', 'eagle_top_k'],
+              ['speculative', 'num_draft_tokens'],
+            ])
+      } catch {
+        return
+      }
       if (speculative) {
         const grouped = [speculative.num_steps, speculative.eagle_top_k, speculative.num_draft_tokens]
         if (runtime === 'vllm' && grouped.some((value) => value != null)) {

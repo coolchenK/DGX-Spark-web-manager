@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
@@ -724,6 +724,20 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     })
   })
 
+  it('rejects an out-of-range vLLM speculative token value before preview', async () => {
+    const { user, postSpy } = renderDeploymentsPage()
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+    const tokens = screen.getByLabelText('每轮推测 Token')
+    await user.clear(tokens)
+    await user.type(tokens, '65')
+    fireEvent.click(screen.getByRole('button', { name: '生成部署预览' }))
+
+    expect(await screen.findByText('每轮推测 Token 必须在 1-64 之间')).toBeInTheDocument()
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
+  })
+
   it('submits only the complete SGLang grouped speculative tuning fields', async () => {
     const { user, postSpy } = renderDeploymentsPage()
     await openCreateAndSelectModel(user)
@@ -747,6 +761,22 @@ describe('DeploymentsPage assisted deployment wizard', () => {
       num_draft_tokens: 8,
       manual_review_acknowledged: false,
     })
+  })
+
+  it('rejects an out-of-range SGLang grouped tuning value before preview', async () => {
+    const { user, postSpy } = renderDeploymentsPage()
+    await openCreateAndSelectModel(user)
+    await user.click(screen.getByText('SGLang'))
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /Target-EAGLE3/ }))
+    const steps = screen.getByLabelText('推测步数')
+    await user.type(steps, '33')
+    await user.type(screen.getByLabelText('EAGLE Top K'), '4')
+    await user.type(screen.getByLabelText('Draft Token 数'), '8')
+    fireEvent.click(screen.getByRole('button', { name: '生成部署预览' }))
+
+    expect(await screen.findByText('推测步数必须在 1-32 之间')).toBeInTheDocument()
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
   })
 
   it('rejects a partial SGLang grouped tuning set before preview', async () => {
