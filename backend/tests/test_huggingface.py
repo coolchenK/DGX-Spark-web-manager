@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from app.tasks import huggingface
@@ -8,6 +9,35 @@ from app.tasks.huggingface import (
     validate_repository_id,
 )
 from huggingface_hub import ModelCardData
+
+
+def model_result(
+    repository_id,
+    *,
+    tags=None,
+    downloads=0,
+    pipeline_tag=None,
+):
+    return SimpleNamespace(
+        id=repository_id,
+        downloads=downloads,
+        likes=0,
+        pipeline_tag=pipeline_tag,
+        private=False,
+        gated=False,
+        last_modified=None,
+        tags=tags or [],
+    )
+
+
+class FakeHuggingFaceApi:
+    def __init__(self, models):
+        self.models = models
+        self.calls = []
+
+    def list_models(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.models[: kwargs["limit"]]
 
 
 @pytest.mark.parametrize(
@@ -32,6 +62,318 @@ def test_model_card_data_uses_hub_serialization_contract():
     assert serialize_card_data(card)["license"] == "apache-2.0"
     assert serialize_card_data({"license": "mit"}) == {"license": "mit"}
     assert serialize_card_data(None) == {}
+
+
+def test_search_ranks_nvfp4_ahead_of_more_downloaded_model(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [
+            model_result("org/popular-model", downloads=1_000_000),
+            model_result(
+                "nvidia/model-NVFP4",
+                tags=["compressed-tensors", "safetensors"],
+                downloads=10,
+                pipeline_tag="text-generation",
+            ),
+        ]
+    )
+
+    results = service.search("model", limit=2)
+
+    assert [result["id"] for result in results] == [
+        "nvidia/model-NVFP4",
+        "org/popular-model",
+    ]
+    assert results[0]["spark_compatibility"] == {
+        "level": "recommended",
+        "score": 180,
+        "reasons": ["NVFP4 量化", "压缩权重格式", "Safetensors 权重"],
+    }
+
+
+def test_search_preserves_hugging_face_order_for_equal_scores(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [
+            model_result("org/first", tags=["safetensors"], downloads=1),
+            model_result("org/second", tags=["safetensors"], downloads=999),
+        ]
+    )
+
+    results = service.search("model", limit=2)
+
+    assert [result["id"] for result in results] == ["org/first", "org/second"]
+
+
+def test_search_marks_gguf_only_model_for_review(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi([model_result("org/model-7B", tags=["gguf"])])
+
+    result = service.search("model", limit=1)[0]
+
+    assert result["spark_compatibility"] == {
+        "level": "review",
+        "score": -40,
+        "reasons": ["需要额外运行时"],
+    }
+
+
+def test_search_scores_fifty_candidates_before_applying_safe_limit(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    candidates = [model_result(f"org/ordinary-{index}") for index in range(49)]
+    candidates.append(model_result("org/best-NVFP4", tags=["safetensors"]))
+    candidates.append(model_result("org/not-in-pool-NVFP4", tags=["compressed-tensors"]))
+    api = FakeHuggingFaceApi(candidates)
+    service.api = api
+
+    results = service.search("model", limit=0)
+
+    assert api.calls == [{"search": "model", "limit": 50, "full": True}]
+    assert [result["id"] for result in results] == ["org/best-NVFP4"]
+
+
+def test_search_does_not_recommend_oversized_nvfp4_model(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [
+            model_result(
+                "org/model-27B-2.4T-NVFP4",
+                tags=["compressed-tensors"],
+            )
+        ]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "review",
+        "score": 30,
+        "reasons": ["NVFP4 量化", "模型规模需评估", "压缩权重格式"],
+    }
+
+
+def test_search_ranks_compatible_model_before_higher_scoring_review_model(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [
+            model_result("org/review-NVFP4", tags=["vllm", "gguf"]),
+            model_result("org/compatible-AWQ"),
+        ]
+    )
+
+    results = service.search("model", limit=2)
+
+    assert [result["id"] for result in results] == [
+        "org/compatible-AWQ",
+        "org/review-NVFP4",
+    ]
+    assert [result["spark_compatibility"]["score"] for result in results] == [30, 100]
+
+
+@pytest.mark.parametrize("quantization", ["AWQ", "GPTQ"])
+def test_search_scores_low_bit_quantization_signals(tmp_path, quantization):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [model_result(f"org/model-{quantization}", tags=[quantization.lower()])]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "compatible",
+        "score": 30,
+        "reasons": ["低比特量化"],
+    }
+
+
+def test_search_prefers_fp8_over_other_low_bit_signal(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [model_result("org/model-FP8-AWQ", tags=["fp8", "awq"])]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "compatible",
+        "score": 35,
+        "reasons": ["FP8 量化"],
+    }
+
+
+def test_search_puts_fp8_before_format_reasons_and_truncates_to_three(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [
+            model_result(
+                "org/model",
+                tags=["fp8", "compressed-tensors", "safetensors", "vllm"],
+            )
+        ]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "compatible",
+        "score": 105,
+        "reasons": ["FP8 量化", "压缩权重格式", "Safetensors 权重"],
+    }
+
+
+def test_search_only_counts_nvfp4_when_multiple_quantization_signals_exist(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [model_result("org/model-NVFP4-FP8-AWQ", tags=["nvfp4", "fp8", "awq"])]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "compatible",
+        "score": 120,
+        "reasons": ["NVFP4 量化"],
+    }
+
+
+@pytest.mark.parametrize("negative_prefix", ["not", "no", "non"])
+def test_search_ignores_negated_and_inexact_compatibility_signals(tmp_path, negative_prefix):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [
+            model_result(
+                f"org/{negative_prefix}-nvfp4-ready",
+                tags=[
+                    f"{negative_prefix}-fp8",
+                    f"{negative_prefix}-awq",
+                    f"{negative_prefix}-gptq",
+                    "not-vllm-compatible",
+                    "compressed-tensors-ready",
+                    "not-safetensors",
+                    "gguf-ready",
+                ],
+            )
+        ]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {"level": "review", "score": 0, "reasons": []}
+
+
+@pytest.mark.parametrize(
+    ("repository_id", "tags"),
+    [
+        ("org/not_nvfp4", []),
+        ("org/not.nvfp4", []),
+        ("org/model", ["no_fp8"]),
+        ("org/model", ["non.gptq"]),
+    ],
+)
+def test_search_ignores_negated_quantization_with_non_alphanumeric_separator(
+    tmp_path,
+    repository_id,
+    tags,
+):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi([model_result(repository_id, tags=tags)])
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {"level": "review", "score": 0, "reasons": []}
+
+
+@pytest.mark.parametrize(
+    ("repository_id", "expected_score", "expected_reason"),
+    [
+        ("org/model-NVFP4", 120, "NVFP4 量化"),
+        ("org/model_nvfp4", 120, "NVFP4 量化"),
+        ("org/block-fp8", 35, "FP8 量化"),
+        ("org/model.fp8", 35, "FP8 量化"),
+        ("org/model-AWQ", 30, "低比特量化"),
+    ],
+)
+def test_search_recognizes_bounded_quantization_tokens(
+    tmp_path,
+    repository_id,
+    expected_score,
+    expected_reason,
+):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi([model_result(repository_id)])
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "compatible",
+        "score": expected_score,
+        "reasons": [expected_reason],
+    }
+
+
+def test_search_forces_positive_scoring_gguf_only_model_to_review(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [model_result("org/model-NVFP4", tags=["vllm", "gguf"])]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "review",
+        "score": 100,
+        "reasons": ["NVFP4 量化", "适配当前推理运行时", "需要额外运行时"],
+    }
+
+
+def test_search_treats_moe_total_parameter_count_as_capacity_risk(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [model_result("org/16x21B-NVFP4", tags=["compressed-tensors"])]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "review",
+        "score": 30,
+        "reasons": ["NVFP4 量化", "模型规模需评估", "压缩权重格式"],
+    }
+
+
+def test_search_ignores_parameter_size_embedded_in_alphanumeric_token(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi([model_result("org/modelx200B-NVFP4")])
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "compatible",
+        "score": 120,
+        "reasons": ["NVFP4 量化"],
+    }
+
+
+@pytest.mark.parametrize("runtime", ["vllm", "sglang"])
+def test_search_scores_runtime_and_generation_task(tmp_path, runtime):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [
+            model_result(
+                "org/model",
+                tags=[runtime],
+                pipeline_tag="image-text-to-text",
+            )
+        ]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "compatible",
+        "score": 30,
+        "reasons": ["适配当前推理运行时", "生成任务"],
+    }
 
 
 def test_download_size_only_counts_selected_files():

@@ -18,6 +18,27 @@ from app.tasks.engine import TaskCancelled, TaskContext, TaskPaused
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 HF_TOKEN_PATTERN = re.compile(r"hf_[A-Za-z0-9]{10,}", re.IGNORECASE)
+PARAMETER_SIZE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*([BT])(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+MOE_PARAMETER_SIZE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*([BT])"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+QUANTIZATION_PATTERNS = {
+    token: re.compile(
+        rf"(?<![A-Za-z0-9]){token}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    for token in ("nvfp4", "fp8", "awq", "gptq")
+}
+NEGATED_QUANTIZATION_PREFIX = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:not|no|non)[^A-Za-z0-9]+$",
+    re.IGNORECASE,
+)
+SPARK_LEVEL_RANK = {"review": 0, "compatible": 1, "recommended": 2}
 
 
 def validate_repository_id(value: str) -> str:
@@ -151,6 +172,86 @@ def sanitize_cli_output(value: str) -> str:
     return sanitized.strip()[-4000:]
 
 
+def has_quantization_token(repository_id: str, tags: list[str], token: str) -> bool:
+    pattern = QUANTIZATION_PATTERNS[token]
+    for value in (repository_id, *tags):
+        for match in pattern.finditer(value):
+            if not NEGATED_QUANTIZATION_PREFIX.search(value[: match.start()]):
+                return True
+    return False
+
+
+def spark_compatibility(
+    repository_id: str,
+    tags: list[str],
+    pipeline_tag: str | None,
+) -> dict[str, Any]:
+    normalized_tags = {tag.casefold() for tag in tags}
+    has_nvfp4 = has_quantization_token(repository_id, tags, "nvfp4")
+    has_compressed_tensors = "compressed-tensors" in normalized_tags
+    has_safetensors = "safetensors" in normalized_tags
+    has_runtime = bool({"vllm", "sglang"} & normalized_tags)
+    has_fp8 = has_quantization_token(repository_id, tags, "fp8")
+    has_low_bit = has_quantization_token(
+        repository_id, tags, "awq"
+    ) or has_quantization_token(repository_id, tags, "gptq")
+    has_gguf = "gguf" in normalized_tags
+    gguf_only = has_gguf and not has_compressed_tensors and not has_safetensors
+
+    parameter_sizes = [
+        float(value) * (1000 if unit.casefold() == "t" else 1)
+        for value, unit in PARAMETER_SIZE_PATTERN.findall(repository_id)
+    ]
+    parameter_sizes.extend(
+        float(experts) * float(value) * (1000 if unit.casefold() == "t" else 1)
+        for experts, value, unit in MOE_PARAMETER_SIZE_PATTERN.findall(repository_id)
+    )
+    has_capacity_risk = bool(parameter_sizes and max(parameter_sizes) > 180)
+
+    score = 0
+    reasons: list[str] = []
+    if has_nvfp4:
+        score += 120
+        reasons.append("NVFP4 量化")
+    elif has_fp8:
+        score += 35
+        reasons.append("FP8 量化")
+    elif has_low_bit:
+        score += 30
+        reasons.append("低比特量化")
+    if has_capacity_risk:
+        score -= 120
+        reasons.append("模型规模需评估")
+    if has_compressed_tensors:
+        score += 30
+        reasons.append("压缩权重格式")
+    if has_safetensors:
+        score += 20
+        reasons.append("Safetensors 权重")
+    if has_runtime:
+        score += 20
+        reasons.append("适配当前推理运行时")
+    if (pipeline_tag or "").casefold() in {"text-generation", "image-text-to-text"}:
+        score += 10
+        reasons.append("生成任务")
+    if gguf_only:
+        score -= 40
+        reasons.append("需要额外运行时")
+
+    if has_capacity_risk or gguf_only:
+        level = "review"
+    elif (
+        has_nvfp4
+        and (has_compressed_tensors or has_runtime or has_safetensors)
+    ):
+        level = "recommended"
+    elif score >= 20:
+        level = "compatible"
+    else:
+        level = "review"
+    return {"level": level, "score": score, "reasons": reasons[:3]}
+
+
 class HuggingFaceService:
     def __init__(self, cache_dir: Path, token: str | None = None):
         self.cache_dir = cache_dir
@@ -162,20 +263,36 @@ class HuggingFaceService:
         self.api = HfApi(token=token)
 
     def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
-        models = self.api.list_models(search=query, limit=min(max(limit, 1), 50), full=True)
-        return [
-            {
-                "id": model.id,
-                "downloads": model.downloads or 0,
-                "likes": model.likes or 0,
-                "pipeline_tag": model.pipeline_tag,
-                "private": bool(model.private),
-                "gated": bool(model.gated),
-                "last_modified": model.last_modified,
-                "tags": list(model.tags or [])[:20],
-            }
-            for model in models
-        ]
+        safe_limit = min(max(limit, 1), 50)
+        models = self.api.list_models(search=query, limit=50, full=True)
+        results = []
+        for model in models:
+            tags = list(model.tags or [])
+            results.append(
+                {
+                    "id": model.id,
+                    "downloads": model.downloads or 0,
+                    "likes": model.likes or 0,
+                    "pipeline_tag": model.pipeline_tag,
+                    "private": bool(model.private),
+                    "gated": bool(model.gated),
+                    "last_modified": model.last_modified,
+                    "tags": tags[:20],
+                    "spark_compatibility": spark_compatibility(
+                        model.id,
+                        tags,
+                        model.pipeline_tag,
+                    ),
+                }
+            )
+        results.sort(
+            key=lambda item: (
+                SPARK_LEVEL_RANK[item["spark_compatibility"]["level"]],
+                item["spark_compatibility"]["score"],
+            ),
+            reverse=True,
+        )
+        return results[:safe_limit]
 
     def info(self, repository_id: str, revision: str = "main") -> dict[str, Any]:
         repository_id = validate_repository_id(repository_id)
