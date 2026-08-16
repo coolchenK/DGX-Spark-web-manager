@@ -12,6 +12,40 @@ from sqlalchemy.orm import sessionmaker
 
 from app.models import Deployment, RequestMetric
 
+GENERATION_KEYS = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+    "max_tokens",
+    "stop",
+}
+GENERATION_ENDPOINTS = {"/v1/chat/completions", "/v1/completions"}
+
+
+def merge_generation_defaults(
+    endpoint: str,
+    body: dict[str, Any],
+    defaults: dict[str, Any],
+    *,
+    supported: set[str],
+) -> tuple[dict[str, Any], list[str]]:
+    merged = dict(body)
+    if endpoint not in GENERATION_ENDPOINTS:
+        return merged, []
+    applied: list[str] = []
+    for key in sorted(GENERATION_KEYS & supported):
+        if key not in defaults or key in merged:
+            continue
+        if key == "max_tokens" and "max_completion_tokens" in merged:
+            continue
+        merged[key] = defaults[key]
+        applied.append(key)
+    return merged, applied
+
 
 def openai_error(message: str, *, status_code: int, code: str | None = None) -> JSONResponse:
     return JSONResponse(

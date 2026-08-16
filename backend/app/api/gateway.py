@@ -1,4 +1,5 @@
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from threading import Lock
 from typing import Annotated, Any
@@ -7,9 +8,16 @@ from fastapi import APIRouter, Depends, Header, Request
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.audit import record_audit
 from app.dependencies import Admin, get_db
-from app.gateway.proxy import openai_error, proxy_openai_request
+from app.gateway.proxy import (
+    GENERATION_KEYS,
+    merge_generation_defaults,
+    openai_error,
+    proxy_openai_request,
+)
 from app.models import ApiKey, Deployment, RequestMetric
+from app.runtime.base import GenerationDefaults
 from app.security import hash_api_key
 
 router = APIRouter(tags=["openai-gateway"])
@@ -105,6 +113,35 @@ def select_routed_deployment(
     return candidates[position % len(candidates)]
 
 
+def deployment_generation_settings(
+    deployment: Deployment,
+) -> tuple[dict[str, Any], set[str]]:
+    config = deployment.config
+    if not isinstance(config, Mapping):
+        return {}, set()
+    spec = config.get("spec")
+    capability_snapshot = config.get("runtime_capabilities")
+    if not isinstance(spec, Mapping) or not isinstance(capability_snapshot, Mapping):
+        return {}, set()
+    defaults = spec.get("generation_defaults")
+    supported = capability_snapshot.get("generation_defaults")
+    if not isinstance(defaults, Mapping) or not isinstance(supported, list):
+        return {}, set()
+    validated: dict[str, Any] = {}
+    for key in GENERATION_KEYS:
+        if key not in defaults:
+            continue
+        try:
+            parsed = GenerationDefaults.model_validate({key: defaults[key]}).model_dump(
+                mode="json", exclude_none=True
+            )
+        except (TypeError, ValueError):
+            continue
+        if key in parsed:
+            validated[key] = parsed[key]
+    return validated, {key for key in supported if isinstance(key, str)}
+
+
 @router.get("/v1/models")
 def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
     deployments = list(db.scalars(
@@ -157,6 +194,27 @@ async def _proxy(
     deployment = select_routed_deployment(db, str(model), required_capability)
     if not deployment:
         return openai_error(f"Model '{model}' was not found or is not healthy", status_code=404)
+    defaults, supported = deployment_generation_settings(deployment)
+    merged_body, applied = merge_generation_defaults(
+        endpoint,
+        dict(body),
+        defaults,
+        supported=supported,
+    )
+    if applied:
+        record_audit(
+            db,
+            actor="gateway",
+            action="gateway.defaults.apply",
+            resource_type="deployment",
+            resource_id=deployment.id,
+            details={
+                "endpoint": endpoint,
+                "model": str(model),
+                "applied_fields": applied,
+            },
+        )
+        db.commit()
     activity: GatewayActivity = request.app.state.gateway_activity
     activity.start()
     finished = False
@@ -175,7 +233,7 @@ async def _proxy(
             request,
             deployment,
             endpoint,
-            dict(body),
+            merged_body,
             on_finished=finish_request,
         )
     except Exception:
