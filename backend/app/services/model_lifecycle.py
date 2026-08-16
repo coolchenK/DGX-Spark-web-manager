@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import shutil
+import stat
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,7 +19,14 @@ from app.services.discovery import directory_size
 from app.tasks.huggingface import cache_repository_path, validate_repository_id
 
 COMMAND_TIMEOUT_SECONDS = 120
-PREVIEW_ID_KEYS = {"repository_id", "repo_id", "id", "target"}
+HF_TARGET_ID_KEYS = {"repository_id", "repo_id", "id", "target"}
+HF_TARGET_LIST_KEYS = {
+    "targets",
+    "repositories",
+    "repository_ids",
+    "repo_ids",
+    "ids",
+}
 
 
 @dataclass(frozen=True)
@@ -66,25 +76,54 @@ class ModelLifecycleService:
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
 
+    @staticmethod
+    def _is_link_or_reparse(path: Path) -> bool:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(reparse_flag and attributes & reparse_flag)
+
     def validate_local_target(self, target: Path) -> Path:
         try:
-            if target.is_symlink():
-                raise ValueError("Local model target cannot be a symbolic link")
-            if not target.exists() or not target.is_dir():
+            lexical_target = Path(os.path.abspath(target))
+            if not lexical_target.exists() or not lexical_target.is_dir():
                 raise ValueError("Local model target must be an existing directory")
-            resolved_target = target.resolve(strict=True)
-            resolved_roots = [root.resolve(strict=False) for root in self.model_roots]
+
+            for configured_root in self.model_roots:
+                lexical_root = Path(os.path.abspath(configured_root))
+                if lexical_target == lexical_root or not lexical_target.is_relative_to(
+                    lexical_root
+                ):
+                    continue
+
+                relative_target = lexical_target.relative_to(lexical_root)
+                components = [lexical_root]
+                current = lexical_root
+                for part in relative_target.parts:
+                    current /= part
+                    components.append(current)
+                if any(self._is_link_or_reparse(component) for component in components):
+                    raise ValueError(
+                        "Local model path cannot contain a symbolic link or reparse point"
+                    )
+
+                resolved_root = lexical_root.resolve(strict=True)
+                resolved_target = lexical_target.resolve(strict=True)
+                if (
+                    resolved_target != resolved_root
+                    and resolved_target.is_relative_to(resolved_root)
+                ):
+                    return resolved_target
         except ValueError:
             raise
         except (OSError, RuntimeError) as exc:
             raise ValueError("Unable to resolve the local model target") from exc
 
-        if not any(
-            resolved_target != root and resolved_target.is_relative_to(root)
-            for root in resolved_roots
-        ):
-            raise ValueError("Local model target must be inside a configured model root")
-        return resolved_target
+        raise ValueError("Local model target must be inside a configured model root")
 
     def references(self, db: Session, model_id: str) -> list[ModelReference]:
         model = db.get(ModelAsset, model_id)
@@ -134,27 +173,7 @@ class ModelLifecycleService:
 
         return list(references.values())
 
-    @staticmethod
-    def _preview_identifies_repository(value: Any, repository_id: str) -> bool:
-        expected = {repository_id, f"model/{repository_id}"}
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key in PREVIEW_ID_KEYS and isinstance(item, str) and item in expected:
-                    return True
-                if ModelLifecycleService._preview_identifies_repository(
-                    item, repository_id
-                ):
-                    return True
-        elif isinstance(value, list):
-            return any(
-                ModelLifecycleService._preview_identifies_repository(
-                    item, repository_id
-                )
-                for item in value
-            )
-        return False
-
-    def _run_hf_command(self, argv: list[str], repository_id: str) -> None:
+    def _run_hf_json(self, argv: list[str]) -> dict[str, Any]:
         try:
             completed = self.command_runner(argv)
         except (
@@ -172,11 +191,111 @@ class ModelLifecycleService:
         if not isinstance(stdout, str):
             raise RuntimeError("Hugging Face cache command returned invalid JSON")
         try:
-            preview = json.loads(stdout)
-        except (json.JSONDecodeError, TypeError) as exc:
+            payload = json.loads(stdout)
+        except (json.JSONDecodeError, RecursionError) as exc:
             raise RuntimeError("Hugging Face cache command returned invalid JSON") from exc
-        if not self._preview_identifies_repository(preview, repository_id):
-            raise RuntimeError("Hugging Face cache preview did not identify the target")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Hugging Face cache command returned invalid JSON")
+        return payload
+
+    @staticmethod
+    def _is_non_negative_number(value: Any) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+        )
+
+    @staticmethod
+    def _normalize_hf_target(value: Any) -> str:
+        if not isinstance(value, str):
+            raise RuntimeError("Hugging Face cache preview target was invalid")
+        candidate = value.strip()
+        repository_id = (
+            candidate.removeprefix("model/")
+            if candidate.startswith("model/")
+            else candidate
+        )
+        try:
+            validated = validate_repository_id(repository_id)
+        except ValueError as exc:
+            raise RuntimeError("Hugging Face cache preview target was invalid") from exc
+        return f"model/{validated}"
+
+    @classmethod
+    def _collect_hf_targets(cls, value: Any) -> tuple[bool, set[str]]:
+        present = False
+        targets: set[str] = set()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in HF_TARGET_ID_KEYS:
+                    present = True
+                    targets.add(cls._normalize_hf_target(item))
+                elif key in HF_TARGET_LIST_KEYS:
+                    present = True
+                    if not isinstance(item, list):
+                        raise RuntimeError("Hugging Face cache preview target was invalid")
+                    for target in item:
+                        if isinstance(target, dict):
+                            nested_present, nested_targets = cls._collect_hf_targets(
+                                target
+                            )
+                            if not nested_present:
+                                raise RuntimeError(
+                                    "Hugging Face cache preview target was invalid"
+                                )
+                            targets.update(nested_targets)
+                        else:
+                            targets.add(cls._normalize_hf_target(target))
+                else:
+                    nested_present, nested_targets = cls._collect_hf_targets(item)
+                    present = present or nested_present
+                    targets.update(nested_targets)
+        elif isinstance(value, list):
+            for item in value:
+                nested_present, nested_targets = cls._collect_hf_targets(item)
+                present = present or nested_present
+                targets.update(nested_targets)
+        return present, targets
+
+    @classmethod
+    def _validate_hf_preview(
+        cls, payload: dict[str, Any], expected_target: str
+    ) -> None:
+        repos = payload.get("repos")
+        if (
+            payload.get("dry_run") is not True
+            or not isinstance(repos, int)
+            or isinstance(repos, bool)
+            or repos != 1
+            or any(
+                key in payload and not cls._is_non_negative_number(payload[key])
+                for key in ("revisions", "size")
+            )
+        ):
+            raise RuntimeError("Hugging Face cache preview schema was invalid")
+
+        normalized_expected = cls._normalize_hf_target(expected_target)
+        targets_present, targets = cls._collect_hf_targets(payload)
+        if targets_present and targets != {normalized_expected}:
+            raise RuntimeError(
+                "Hugging Face cache preview did not identify only the target"
+            )
+
+    @classmethod
+    def _validate_hf_result(cls, payload: dict[str, Any]) -> None:
+        repos_deleted = payload.get("repos_deleted")
+        if (
+            not isinstance(repos_deleted, int)
+            or isinstance(repos_deleted, bool)
+            or repos_deleted != 1
+            or any(
+                key in payload and not cls._is_non_negative_number(payload[key])
+                for key in ("revisions_deleted", "freed")
+            )
+        ):
+            raise RuntimeError("Hugging Face cache deletion result was invalid")
 
     @staticmethod
     def _path_is_absent(path: Path) -> bool:
@@ -254,11 +373,13 @@ class ModelLifecycleService:
                         "--cache-dir",
                         str(self.hf_cache_dir),
                     ]
-                    self._run_hf_command(
-                        [*base_argv, "--dry-run", "--json"], repository_id
+                    preview = self._run_hf_json(
+                        [*base_argv, "--dry-run", "--json"]
                     )
+                    self._validate_hf_preview(preview, f"model/{repository_id}")
                     context.check_control()
-                    self._run_hf_command([*base_argv, "--yes", "--json"], repository_id)
+                    result = self._run_hf_json([*base_argv, "--yes", "--json"])
+                    self._validate_hf_result(result)
                     free_after = shutil.disk_usage(usage_path).free
                     released_bytes = max(0, free_after - free_before)
             else:
@@ -270,6 +391,7 @@ class ModelLifecycleService:
                     estimated_bytes = directory_size(resolved_target)
                     free_before = shutil.disk_usage(resolved_target.parent).free
                     context.check_control()
+                    self.validate_local_target(target)
                     try:
                         shutil.rmtree(target)
                     except OSError as exc:

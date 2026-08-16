@@ -430,6 +430,77 @@ def test_validate_local_target_rejects_symlinks(tmp_path, destination, monkeypat
         service.validate_local_target(link)
 
 
+@pytest.mark.parametrize("destination", ["inside", "outside"])
+def test_validate_local_target_rejects_intermediate_symlink(
+    tmp_path, destination, monkeypatch
+):
+    root = tmp_path / "models"
+    real_parent = (root / "real") if destination == "inside" else (tmp_path / "outside")
+    target = real_parent / "target"
+    target.mkdir(parents=True)
+    link = root / "link"
+    try:
+        link.symlink_to(real_parent, target_is_directory=True)
+        linked_target = link / "target"
+    except OSError:
+        linked_target = root / "link" / "target"
+        linked_target.mkdir(parents=True)
+        original_is_symlink = Path.is_symlink
+        monkeypatch.setattr(
+            Path,
+            "is_symlink",
+            lambda self: self == link or original_is_symlink(self),
+        )
+    service = ModelLifecycleService((root,), tmp_path / "hf-cache")
+
+    with pytest.raises(ValueError, match="symbolic link|reparse point"):
+        service.validate_local_target(linked_target)
+
+
+def test_validate_local_target_rejects_symlink_model_root(tmp_path, monkeypatch):
+    real_root = tmp_path / "real-models"
+    target = real_root / "target"
+    target.mkdir(parents=True)
+    root = tmp_path / "models"
+    try:
+        root.symlink_to(real_root, target_is_directory=True)
+        linked_target = root / "target"
+    except OSError:
+        linked_target = root / "target"
+        linked_target.mkdir(parents=True)
+        original_is_symlink = Path.is_symlink
+        monkeypatch.setattr(
+            Path,
+            "is_symlink",
+            lambda self: self == root or original_is_symlink(self),
+        )
+    service = ModelLifecycleService((root,), tmp_path / "hf-cache")
+
+    with pytest.raises(ValueError, match="symbolic link|reparse point"):
+        service.validate_local_target(linked_target)
+
+
+def test_validate_local_target_rejects_junction_component_when_supported(
+    tmp_path, monkeypatch
+):
+    if not hasattr(Path, "is_junction"):
+        pytest.skip("Path.is_junction is unavailable")
+    root = tmp_path / "models"
+    junction = root / "junction"
+    target = junction / "target"
+    target.mkdir(parents=True)
+    original_is_junction = Path.is_junction
+    monkeypatch.setattr(
+        Path,
+        "is_junction",
+        lambda self: self == junction or original_is_junction(self),
+    )
+    service = ModelLifecycleService((root,), tmp_path / "hf-cache")
+
+    with pytest.raises(ValueError, match="reparse point"):
+        service.validate_local_target(target)
+
+
 def test_delete_local_directory_and_database_record(database, tmp_path):
     target = tmp_path / "models" / "target"
     target.mkdir(parents=True)
@@ -468,7 +539,10 @@ def test_delete_huggingface_runs_validated_dry_run_before_yes(database, tmp_path
             for child in sorted(repository_root.rglob("*"), reverse=True):
                 child.unlink() if child.is_file() else child.rmdir()
             repository_root.rmdir()
-        return SimpleNamespace(stdout=json.dumps({"repos": [{"repo_id": "org/model"}]}))
+            payload = {"repos_deleted": 1, "revisions_deleted": 1, "freed": 6}
+        else:
+            payload = {"dry_run": True, "repos": 1, "revisions": 1, "size": 6}
+        return SimpleNamespace(stdout=json.dumps(payload))
 
     service = _deletion_service(database, tmp_path, command_runner=runner)
 
@@ -504,7 +578,15 @@ def test_huggingface_mismatched_dry_run_stops_before_delete(database, tmp_path):
 
     def runner(argv):
         calls.append(argv)
-        return SimpleNamespace(stdout='{"repos":[{"repo_id":"org/other"}]}')
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "dry_run": True,
+                    "repos": 1,
+                    "targets": ["model/org/other"],
+                }
+            )
+        )
 
     service = _deletion_service(database, tmp_path, command_runner=runner)
 
@@ -514,6 +596,69 @@ def test_huggingface_mismatched_dry_run_stops_before_delete(database, tmp_path):
     assert len(calls) == 1
     assert "--dry-run" in calls[0]
     assert repository_root.exists()
+    assert _model_status(database) == "delete_failed"
+
+
+def test_huggingface_dry_run_rejects_target_plus_extra_target(database, tmp_path):
+    repository_root = tmp_path / "hf-cache" / "models--org--model"
+    snapshot = repository_root / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    _add_asset(
+        database,
+        snapshot,
+        source="huggingface",
+        repository_id="org/model",
+    )
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "dry_run": True,
+                    "repos": 1,
+                    "targets": ["model/org/model", "model/org/other"],
+                }
+            )
+        )
+
+    service = _deletion_service(database, tmp_path, command_runner=runner)
+
+    with pytest.raises(RuntimeError, match="preview did not identify only the target"):
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert len(calls) == 1
+    assert _model_status(database) == "delete_failed"
+
+
+def test_huggingface_malformed_yes_json_preserves_database_record(database, tmp_path):
+    repository_root = tmp_path / "hf-cache" / "models--org--model"
+    snapshot = repository_root / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    _add_asset(
+        database,
+        snapshot,
+        source="huggingface",
+        repository_id="org/model",
+    )
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        stdout = (
+            "not-json"
+            if "--yes" in argv
+            else json.dumps({"dry_run": True, "repos": 1})
+        )
+        return SimpleNamespace(stdout=stdout)
+
+    service = _deletion_service(database, tmp_path, command_runner=runner)
+
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert len(calls) == 2
     assert _model_status(database) == "delete_failed"
 
 
@@ -625,6 +770,38 @@ def test_cancellation_is_checked_before_local_destructive_action(database, tmp_p
         )
 
     assert target.exists()
+    assert _model_status(database) == "delete_failed"
+
+
+def test_local_delete_revalidates_target_after_control_check(
+    database, tmp_path, monkeypatch
+):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target)
+    service = _deletion_service(database, tmp_path)
+    replaced = False
+    original_is_symlink = Path.is_symlink
+
+    class ReplacingContext(HandlerContext):
+        def check_control(self):
+            nonlocal replaced
+            replaced = True
+
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda self: (self == target and replaced) or original_is_symlink(self),
+    )
+    deleted = []
+    monkeypatch.setattr(
+        "app.services.model_lifecycle.shutil.rmtree", lambda path: deleted.append(path)
+    )
+
+    with pytest.raises(ValueError, match="symbolic link|reparse point"):
+        service.delete_handler(ReplacingContext(), {"model_id": "target"})
+
+    assert deleted == []
     assert _model_status(database) == "delete_failed"
 
 
