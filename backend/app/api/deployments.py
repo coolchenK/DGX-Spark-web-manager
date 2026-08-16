@@ -1,6 +1,7 @@
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 
 from app.api.tasks import serialize_task
@@ -11,6 +12,15 @@ from app.runtime.base import DeploymentSpec
 from app.services.deployment_recommendations import RecommendationRequest
 
 router = APIRouter(prefix="/api/deployments", tags=["deployments"])
+
+DISCOVERED_DELETE_CONFIRMATION_ERROR = (
+    "To uninstall a discovered service, confirm_container_name must exactly "
+    "match its container name"
+)
+
+
+class DeploymentActionRequest(BaseModel):
+    confirm_container_name: str | None = Field(default=None, max_length=255)
 
 
 @router.post("/recommendations")
@@ -189,16 +199,29 @@ def deployment_action(
     request: Request,
     db: DbSession,
     admin: CsrfAdmin,
+    payload: DeploymentActionRequest | None = None,
 ) -> dict[str, Any]:
     deployment = db.get(Deployment, deployment_id)
     if not deployment:
         raise HTTPException(status_code=404, detail="Deployment not found")
-    if action == "delete" and not deployment.managed:
-        raise HTTPException(status_code=409, detail="Discovered containers cannot be deleted")
+    if (
+        action == "delete"
+        and not deployment.managed
+        and (
+            payload is None
+            or payload.confirm_container_name is None
+            or payload.confirm_container_name != deployment.container_name
+        )
+    ):
+        raise HTTPException(status_code=422, detail=DISCOVERED_DELETE_CONFIRMATION_ERROR)
     task = request.app.state.task_engine.create_task(
         db,
         task_type="deployment.action",
-        title=f"{action} {deployment.name}",
+        title=(
+            f"卸载服务 {deployment.name}"
+            if action == "delete"
+            else f"{action} {deployment.name}"
+        ),
         input_json={"deployment_id": deployment_id, "action": action},
         idempotency_key=f"deployment:{deployment_id}:{action}",
     )

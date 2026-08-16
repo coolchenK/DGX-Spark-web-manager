@@ -8,7 +8,7 @@ import pytest
 from app.config import Settings
 from app.db import Database
 from app.main import create_app
-from app.models import Deployment, ModelAsset, TaskRecord
+from app.models import AuditEvent, Deployment, ModelAsset, TaskRecord
 from app.runtime.base import (
     DeploymentSpec,
     GenerationDefaults,
@@ -193,6 +193,36 @@ class HandlerContext:
         return None
 
 
+class ActionContainer:
+    def __init__(self, container_id, name, *, status="running"):
+        self.id = container_id
+        self.name = name
+        self.status = status
+        self.reloads = 0
+        self.stops = 0
+        self.starts = 0
+        self.restarts = 0
+        self.removed = False
+
+    def reload(self):
+        self.reloads += 1
+
+    def stop(self, **_kwargs):
+        self.stops += 1
+        self.status = "exited"
+
+    def start(self):
+        self.starts += 1
+        self.status = "running"
+
+    def restart(self, **_kwargs):
+        self.restarts += 1
+        self.status = "running"
+
+    def remove(self):
+        self.removed = True
+
+
 def add_model_asset(db, path, *, name="Base", status="available", **values):
     path.mkdir(parents=True, exist_ok=True)
     (path / "config.json").write_text(
@@ -245,6 +275,127 @@ def build_preflight_service(
             }
         ),
     )
+
+
+def build_action_service(database, model_root, target):
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(model_root,))
+    get_calls = []
+
+    class Containers:
+        def get(self, identifier):
+            get_calls.append(identifier)
+            if isinstance(target, BaseException):
+                raise target
+            return target
+
+    client = type("Client", (), {"containers": Containers()})()
+    service = deployment_service.DeploymentService(
+        adapters={"vllm": adapter},
+        session_factory=database.session_factory,
+        model_roots=(model_root,),
+        docker_client=client,
+    )
+    return service, adapter, get_calls
+
+
+def add_action_deployment(db, *, managed, name="service", **values):
+    deployment = Deployment(
+        name=name,
+        runtime="vllm",
+        container_id=values.pop("container_id", "a" * 64),
+        container_name=values.pop("container_name", f"dgx-{name}"),
+        endpoint_url="http://127.0.0.1:8100",
+        api_model_name=values.pop("api_model_name", name),
+        status=values.pop("status", "running"),
+        health=values.pop("health", "healthy"),
+        managed=managed,
+        **values,
+    )
+    db.add(deployment)
+    db.commit()
+    db.refresh(deployment)
+    return deployment
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, {}, {"confirm_container_name": "wrong-container"}],
+)
+def test_discovered_delete_requires_exact_container_confirmation(
+    authenticated_client, payload
+):
+    authenticated_client.app.state.task_engine.stop()
+    with authenticated_client.app.state.database.session_factory() as db:
+        deployment = add_action_deployment(db, managed=False, name="discovered")
+        deployment_id = deployment.id
+
+    kwargs = {} if payload is None else {"json": payload}
+    response = authenticated_client.post(
+        f"/api/deployments/{deployment_id}/delete", **kwargs
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "To uninstall a discovered service, confirm_container_name must exactly "
+        "match its container name"
+    )
+    with authenticated_client.app.state.database.session_factory() as db:
+        assert db.query(TaskRecord).filter_by(type="deployment.action").count() == 0
+
+
+def test_discovered_delete_confirmation_is_not_persisted(authenticated_client):
+    authenticated_client.app.state.task_engine.stop()
+    with authenticated_client.app.state.database.session_factory() as db:
+        deployment = add_action_deployment(db, managed=False, name="discovered")
+        deployment_id = deployment.id
+        container_name = deployment.container_name
+
+    response = authenticated_client.post(
+        f"/api/deployments/{deployment_id}/delete",
+        json={"confirm_container_name": container_name},
+    )
+
+    assert response.status_code == 202
+    with authenticated_client.app.state.database.session_factory() as db:
+        task = db.get(TaskRecord, response.json()["id"])
+        assert task.title == "卸载服务 discovered"
+        assert task.input_json == {"deployment_id": deployment_id, "action": "delete"}
+        audit = db.query(AuditEvent).filter_by(action="deployment.delete").one()
+        assert "confirm" not in json.dumps(audit.details).lower()
+
+
+def test_discovered_delete_never_treats_missing_container_name_as_confirmation(
+    authenticated_client,
+):
+    authenticated_client.app.state.task_engine.stop()
+    with authenticated_client.app.state.database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name="unnamed-discovered",
+            container_name=None,
+        )
+        deployment_id = deployment.id
+
+    response = authenticated_client.post(
+        f"/api/deployments/{deployment_id}/delete", json={}
+    )
+
+    assert response.status_code == 422
+    with authenticated_client.app.state.database.session_factory() as db:
+        assert db.query(TaskRecord).filter_by(type="deployment.action").count() == 0
+
+
+@pytest.mark.parametrize("action", ["start", "stop", "restart", "delete"])
+def test_managed_deployment_actions_remain_body_optional(authenticated_client, action):
+    authenticated_client.app.state.task_engine.stop()
+    with authenticated_client.app.state.database.session_factory() as db:
+        deployment = add_action_deployment(db, managed=True, name=f"managed-{action}")
+        deployment_id = deployment.id
+
+    response = authenticated_client.post(f"/api/deployments/{deployment_id}/{action}")
+
+    assert response.status_code == 202
 
 
 def test_deployment_spec_serializes_recommendation_settings(tmp_path):
@@ -2842,6 +2993,385 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
     assert container.remove_force is True
 
 
+@pytest.mark.parametrize(
+    ("action", "transition_status", "adapter_method"),
+    [("stop", "stopping", "stop"), ("delete", "deleting", "uninstall")],
+)
+def test_destructive_action_commits_transition_before_adapter_call(
+    tmp_path, monkeypatch, action, transition_status, adapter_method
+):
+    database = Database(f"sqlite:///{tmp_path / f'{action}-transition.db'}")
+    database.create_schema()
+    container = ActionContainer("a" * 64, "dgx-managed")
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=container.id,
+            container_name=container.name,
+        )
+        deployment_id = deployment.id
+    service, adapter, _ = build_action_service(database, tmp_path, container)
+    observed = {}
+
+    def operation(_container, **_kwargs):
+        with database.session_factory() as db:
+            current = db.get(Deployment, deployment_id)
+            observed.update(status=current.status, health=current.health)
+        if action == "delete":
+            container.removed = True
+        else:
+            container.status = "exited"
+
+    monkeypatch.setattr(adapter, adapter_method, operation)
+
+    result = service.action_handler(
+        HandlerContext(), {"deployment_id": deployment_id, "action": action}
+    )
+
+    assert observed == {"status": transition_status, "health": "unknown"}
+    assert result["container_missing"] is False
+
+
+def test_discovered_uninstall_removes_container_record_but_keeps_model(
+    tmp_path,
+):
+    database = Database(f"sqlite:///{tmp_path / 'discovered-uninstall.db'}")
+    database.create_schema()
+    model_path = tmp_path / "models" / "base"
+    container = ActionContainer("b" * 64, "external-inference")
+    with database.session_factory() as db:
+        model = add_model_asset(db, model_path)
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name="discovered",
+            model_id=model.id,
+            container_id=container.id,
+            container_name=container.name,
+        )
+        deployment_id, model_id = deployment.id, model.id
+    service, _, _ = build_action_service(database, tmp_path, container)
+
+    result = service.action_handler(
+        HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+    )
+
+    assert result == {
+        "deployment_id": deployment_id,
+        "action": "delete",
+        "status": "deleted",
+        "health": "unknown",
+        "container_missing": False,
+    }
+    assert container.stops == 1
+    assert container.removed is True
+    with database.session_factory() as db:
+        assert db.get(Deployment, deployment_id) is None
+        assert db.get(ModelAsset, model_id) is not None
+    assert model_path.is_dir()
+    assert (model_path / "model.safetensors").is_file()
+
+
+@pytest.mark.parametrize(
+    ("actual_id", "actual_name"),
+    [("b" * 64, "dgx-managed"), ("a" * 64, "renamed-container")],
+)
+def test_action_rejects_changed_container_identity(tmp_path, actual_id, actual_name):
+    database = Database(f"sqlite:///{tmp_path / f'identity-{actual_name}.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id="a" * 64,
+            container_name="dgx-managed",
+        )
+        deployment_id = deployment.id
+    container = ActionContainer(actual_id, actual_name)
+    service, _, _ = build_action_service(database, tmp_path, container)
+
+    with pytest.raises(ValueError, match="identity does not match"):
+        service.action_handler(
+            HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+        )
+
+    assert container.removed is False
+    with database.session_factory() as db:
+        current = db.get(Deployment, deployment_id)
+        assert current is not None
+        assert current.status != "deleting"
+
+
+@pytest.mark.parametrize(
+    "container_name", ["dgx-spark-web-manager", "dgx-spark-ops-agent"]
+)
+def test_action_rejects_reserved_manager_containers(tmp_path, container_name):
+    database = Database(f"sqlite:///{tmp_path / f'{container_name}.db'}")
+    database.create_schema()
+    container = ActionContainer("c" * 64, container_name)
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name=f"record-{container_name}",
+            container_id=container.id,
+            container_name=container_name,
+        )
+        deployment_id = deployment.id
+    service, _, _ = build_action_service(database, tmp_path, container)
+
+    with pytest.raises(ValueError, match="protected manager container"):
+        service.action_handler(
+            HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+        )
+
+    assert container.removed is False
+
+
+def test_action_rejects_current_manager_container_id(tmp_path, monkeypatch):
+    database = Database(f"sqlite:///{tmp_path / 'manager-self.db'}")
+    database.create_schema()
+    container = ActionContainer("d" * 64, "tampered-record")
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name="tampered",
+            container_id=container.id,
+            container_name=container.name,
+        )
+        deployment_id = deployment.id
+    service, _, _ = build_action_service(database, tmp_path, container)
+    monkeypatch.setenv("HOSTNAME", container.id[:12])
+
+    with pytest.raises(ValueError, match="protected manager container"):
+        service.action_handler(
+            HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+        )
+
+    assert container.removed is False
+
+
+@pytest.mark.parametrize("missing_kind", ["no_id", "not_found"])
+def test_delete_clears_stale_deployment_record(tmp_path, missing_kind):
+    database = Database(f"sqlite:///{tmp_path / f'stale-{missing_kind}.db'}")
+    database.create_schema()
+    target = docker.errors.NotFound("missing")
+    container_id = None if missing_kind == "no_id" else "e" * 64
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name=f"stale-{missing_kind}",
+            container_id=container_id,
+            container_name=f"stale-{missing_kind}",
+        )
+        deployment_id = deployment.id
+    service, _, get_calls = build_action_service(database, tmp_path, target)
+
+    result = service.action_handler(
+        HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+    )
+
+    assert result["status"] == "deleted"
+    assert result["container_missing"] is True
+    assert get_calls == ([] if missing_kind == "no_id" else [container_id])
+    with database.session_factory() as db:
+        assert db.get(Deployment, deployment_id) is None
+
+
+@pytest.mark.parametrize("container_id", [None, "2b" * 32])
+def test_stale_delete_does_not_require_a_supported_runtime(tmp_path, container_id):
+    database = Database(f"sqlite:///{tmp_path / f'stale-runtime-{container_id}.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name=f"stale-runtime-{container_id}",
+            container_id=container_id,
+            container_name="stale-runtime",
+        )
+        deployment.runtime = "removed-runtime"
+        db.commit()
+        deployment_id = deployment.id
+    service, _, _ = build_action_service(
+        database,
+        tmp_path,
+        docker.errors.NotFound("missing"),
+    )
+
+    result = service.action_handler(
+        HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+    )
+
+    assert result["container_missing"] is True
+    with database.session_factory() as db:
+        assert db.get(Deployment, deployment_id) is None
+
+
+def test_non_delete_action_with_no_container_id_reports_missing(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'missing-stop.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name="missing-stop",
+            container_id=None,
+            container_name="missing-stop",
+        )
+        deployment_id = deployment.id
+    service, _, get_calls = build_action_service(
+        database,
+        tmp_path,
+        ActionContainer("f" * 64, "missing-stop"),
+    )
+
+    with pytest.raises(ValueError, match="Deployment or container was not found"):
+        service.action_handler(
+            HandlerContext(), {"deployment_id": deployment_id, "action": "stop"}
+        )
+
+    assert get_calls == []
+    with database.session_factory() as db:
+        current = db.get(Deployment, deployment_id)
+        assert current.status == "running"
+        assert current.health == "healthy"
+
+
+@pytest.mark.parametrize(
+    ("action", "container_status", "expected_status", "adapter_method"),
+    [
+        ("stop", "running", "running", "stop"),
+        ("delete", "exited", "exited", "uninstall"),
+        ("delete", "paused", "unknown", "uninstall"),
+    ],
+)
+def test_failed_destructive_action_restores_non_transitional_state(
+    tmp_path,
+    monkeypatch,
+    action,
+    container_status,
+    expected_status,
+    adapter_method,
+):
+    database = Database(f"sqlite:///{tmp_path / f'failed-{action}.db'}")
+    database.create_schema()
+    container = ActionContainer("f" * 64, "dgx-managed")
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=container.id,
+            container_name=container.name,
+        )
+        deployment_id = deployment.id
+    service, adapter, _ = build_action_service(database, tmp_path, container)
+
+    def fail(_container, **_kwargs):
+        container.status = container_status
+        raise RuntimeError("docker operation failed")
+
+    monkeypatch.setattr(adapter, adapter_method, fail)
+
+    with pytest.raises(RuntimeError, match="docker operation failed"):
+        service.action_handler(
+            HandlerContext(), {"deployment_id": deployment_id, "action": action}
+        )
+
+    with database.session_factory() as db:
+        current = db.get(Deployment, deployment_id)
+        assert current is not None
+        assert current.status == expected_status
+        assert current.health == "unhealthy"
+
+
+def test_recovery_failure_does_not_replace_docker_error(tmp_path, monkeypatch):
+    database = Database(f"sqlite:///{tmp_path / 'recovery-error.db'}")
+    database.create_schema()
+    container = ActionContainer("2a" * 32, "dgx-managed")
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=container.id,
+            container_name=container.name,
+        )
+        deployment_id = deployment.id
+    service, adapter, _ = build_action_service(database, tmp_path, container)
+
+    def fail_stop(_container, **_kwargs):
+        raise RuntimeError("original docker error")
+
+    def fail_recovery(*_args, **_kwargs):
+        raise RuntimeError("recovery error")
+
+    monkeypatch.setattr(adapter, "stop", fail_stop)
+    monkeypatch.setattr(service, "_recover_action_failure", fail_recovery)
+
+    with pytest.raises(RuntimeError, match="original docker error"):
+        service.action_handler(
+            HandlerContext(), {"deployment_id": deployment_id, "action": "stop"}
+        )
+
+
+def test_action_accepts_docker_short_id_and_normalized_name(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'short-id.db'}")
+    database.create_schema()
+    full_id = "1a" * 32
+    container = ActionContainer(full_id, "/dgx-managed", status="exited")
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=full_id[:12],
+            container_name="dgx-managed",
+            status="exited",
+        )
+        deployment_id = deployment.id
+    service, _, _ = build_action_service(database, tmp_path, container)
+
+    result = service.action_handler(
+        HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+    )
+
+    assert result["status"] == "deleted"
+    assert container.removed is True
+
+
+def test_restart_action_preserves_identity_and_reports_container_present(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'restart.db'}")
+    database.create_schema()
+    container = ActionContainer("1b" * 32, "dgx-managed", status="running")
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=container.id,
+            container_name=container.name,
+        )
+        deployment_id = deployment.id
+    service, _, _ = build_action_service(database, tmp_path, container)
+    service.wait_for_health = lambda *_args, **_kwargs: True
+
+    result = service.action_handler(
+        HandlerContext(), {"deployment_id": deployment_id, "action": "restart"}
+    )
+
+    assert container.restarts == 1
+    assert result["status"] == "running"
+    assert result["health"] == "healthy"
+    assert result["container_missing"] is False
+
+
 def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
     database = Database(f"sqlite:///{tmp_path / 'action.db'}")
     database.create_schema()
@@ -2870,8 +3400,12 @@ def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
     )
 
     class FakeContainer:
+        id = "container-id"
         name = "dgx-managed"
         starts = 0
+
+        def reload(self):
+            return None
 
         def start(self):
             self.starts += 1

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 import docker
 import httpx
+from docker.errors import NotFound
 from docker.types import DeviceRequest, LogConfig
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -31,6 +33,10 @@ from app.services.runtime_capabilities import RuntimeCapabilities, RuntimeCapabi
 from app.tasks.engine import TaskContext
 
 LABEL_PREFIX = "com.dgx-spark-manager."
+PROTECTED_CONTAINER_NAMES = {
+    "dgx-spark-web-manager",
+    "dgx-spark-ops-agent",
+}
 
 
 def resolve_host_model_mount(
@@ -1058,6 +1064,128 @@ class DeploymentService:
                     pass
             raise
 
+    @staticmethod
+    def _normalized_container_name(value: Any) -> str:
+        return str(value or "").lstrip("/")
+
+    @staticmethod
+    def _container_ids_equivalent(recorded_id: Any, actual_id: Any) -> bool:
+        recorded = str(recorded_id or "").strip().lower()
+        actual = str(actual_id or "").strip().lower()
+        if not recorded or not actual:
+            return False
+        if recorded == actual:
+            return True
+        shorter, longer = sorted((recorded, actual), key=len)
+        return (
+            len(shorter) >= 12
+            and all(character in "0123456789abcdef" for character in shorter)
+            and all(character in "0123456789abcdef" for character in longer)
+            and longer.startswith(shorter)
+        )
+
+    def _validate_action_container(
+        self,
+        container: Any,
+        *,
+        recorded_id: str,
+        recorded_name: str | None,
+    ) -> None:
+        container.reload()
+        actual_id = getattr(container, "id", None)
+        actual_name = self._normalized_container_name(getattr(container, "name", None))
+        expected_name = str(recorded_name or "")
+        if not self._container_ids_equivalent(recorded_id, actual_id) or (
+            actual_name != expected_name
+        ):
+            raise ValueError("Container identity does not match deployment record")
+
+        hostname = os.environ.get("HOSTNAME", "").strip()
+        protected_name = actual_name in PROTECTED_CONTAINER_NAMES or (
+            self._normalized_container_name(recorded_name) in PROTECTED_CONTAINER_NAMES
+        )
+        current_manager = self._container_ids_equivalent(hostname, actual_id)
+        if protected_name or current_manager:
+            raise ValueError("Refusing to operate on a protected manager container")
+
+    @staticmethod
+    def _stable_container_status(status: Any, *, fallback: str) -> str:
+        normalized = str(status or "").lower()
+        if normalized == "running":
+            return "running"
+        if normalized in {"dead", "exited", "stopped"}:
+            return "exited"
+        if normalized:
+            return "unknown"
+        if fallback in {"running", "exited"}:
+            return fallback
+        return "unknown"
+
+    def _recover_action_failure(
+        self,
+        deployment_id: str,
+        *,
+        container: Any | None,
+        original_status: str,
+    ) -> None:
+        actual_status = None
+        if container is not None:
+            try:
+                container.reload()
+                actual_status = getattr(container, "status", None)
+            except Exception:
+                pass
+        recovered_status = self._stable_container_status(
+            actual_status,
+            fallback=original_status,
+        )
+        with self.session_factory() as db:
+            deployment = db.get(Deployment, deployment_id)
+            if deployment is not None:
+                deployment.status = recovered_status
+                deployment.health = "unhealthy"
+                db.commit()
+
+    def _delete_stale_deployment(self, deployment_id: str) -> None:
+        with self.session_factory() as db:
+            deployment = db.get(Deployment, deployment_id)
+            if deployment is not None:
+                db.delete(deployment)
+                db.commit()
+
+    def _best_effort_recover_action_failure(
+        self,
+        deployment_id: str,
+        *,
+        container: Any | None,
+        original_status: str,
+    ) -> None:
+        try:
+            self._recover_action_failure(
+                deployment_id,
+                container=container,
+                original_status=original_status,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _action_result(
+        deployment_id: str,
+        action: str,
+        status: str,
+        health: str,
+        *,
+        container_missing: bool,
+    ) -> dict[str, Any]:
+        return {
+            "deployment_id": deployment_id,
+            "action": action,
+            "status": status,
+            "health": health,
+            "container_missing": container_missing,
+        }
+
     def action_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         deployment_id = str(payload["deployment_id"])
         action = str(payload["action"])
@@ -1065,31 +1193,81 @@ class DeploymentService:
             raise ValueError("Unsupported deployment action")
         with self.session_factory() as db:
             deployment = db.get(Deployment, deployment_id)
-            if not deployment or not deployment.container_id:
-                raise ValueError("Deployment or container was not found")
-            if action == "delete" and not deployment.managed:
-                raise ValueError("Discovered containers cannot be deleted by the manager")
+            if not deployment:
+                raise ValueError("Deployment was not found")
             container_id = deployment.container_id
+            container_name = deployment.container_name
             endpoint_url = deployment.endpoint_url
-            adapter = self.adapter(deployment.runtime)
+            runtime = deployment.runtime
+            original_status = deployment.status
+            if action == "delete" and not container_id:
+                db.delete(deployment)
+                db.commit()
+                return self._action_result(
+                    deployment_id,
+                    action,
+                    "deleted",
+                    "unknown",
+                    container_missing=True,
+                )
+            if not container_id:
+                raise ValueError("Deployment or container was not found")
             if action in {"start", "restart"}:
                 deployment.status = "starting"
                 deployment.health = "unknown"
-                db.commit()
-        container = self.docker_client().containers.get(container_id)
-        context.update(progress=20, message=f"Executing {action} on {container.name}")
-        if action == "start":
-            adapter.start(container)
-            new_status = "running"
-        elif action == "stop":
-            adapter.stop(container, timeout=30)
-            new_status = "exited"
-        elif action == "restart":
-            adapter.restart(container, timeout=30)
-            new_status = "running"
-        else:
-            adapter.uninstall(container)
-            new_status = "deleted"
+            elif action == "stop":
+                deployment.status = "stopping"
+                deployment.health = "unknown"
+            elif action == "delete":
+                deployment.status = "deleting"
+                deployment.health = "unknown"
+            db.commit()
+
+        container = None
+        try:
+            container = self.docker_client().containers.get(container_id)
+            self._validate_action_container(
+                container,
+                recorded_id=container_id,
+                recorded_name=container_name,
+            )
+            adapter = self.adapter(runtime)
+            context.update(progress=20, message=f"Executing {action} on {container.name}")
+            if action == "start":
+                adapter.start(container)
+                new_status = "running"
+            elif action == "stop":
+                adapter.stop(container, timeout=30)
+                new_status = "exited"
+            elif action == "restart":
+                adapter.restart(container, timeout=30)
+                new_status = "running"
+            else:
+                adapter.uninstall(container)
+                new_status = "deleted"
+        except NotFound:
+            if action == "delete":
+                self._delete_stale_deployment(deployment_id)
+                return self._action_result(
+                    deployment_id,
+                    action,
+                    "deleted",
+                    "unknown",
+                    container_missing=True,
+                )
+            self._best_effort_recover_action_failure(
+                deployment_id,
+                container=container,
+                original_status=original_status,
+            )
+            raise
+        except Exception:
+            self._best_effort_recover_action_failure(
+                deployment_id,
+                container=container,
+                original_status=original_status,
+            )
+            raise
         health = "unknown"
         if action in {"start", "restart"}:
             context.update(progress=30, message="Waiting for runtime health")
@@ -1122,12 +1300,13 @@ class DeploymentService:
                     deployment.status = new_status
                     deployment.health = health
                 db.commit()
-        return {
-            "deployment_id": deployment_id,
-            "action": action,
-            "status": new_status,
-            "health": health,
-        }
+        return self._action_result(
+            deployment_id,
+            action,
+            new_status,
+            health,
+            container_missing=False,
+        )
 
     def logs(self, deployment: Deployment, tail: int = 500) -> str:
         if not deployment.container_id:

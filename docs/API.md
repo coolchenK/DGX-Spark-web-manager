@@ -58,6 +58,27 @@ Authorization: Bearer dgx_...
 | GET | `/api/settings` | Non-secret manager configuration |
 | PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
 
+### Deployment lifecycle actions
+
+`POST /api/deployments/{id}/stop` stops an inference instance and immediately removes it from
+gateway routing while the task runs. Stopping preserves the container, deployment configuration,
+model files, image, and volumes so the same instance can be started again.
+
+`POST /api/deployments/{id}/delete` uninstalls an inference service. The task stops a running
+container, removes that container, and removes its deployment record. It does not delete the linked
+model asset or model files, and it does not remove Docker images or volumes. This behavior applies to
+both manager-created and discovered inference services.
+
+Manager-created services can be uninstalled without a request body. A discovered service requires
+the exact current container name as confirmation:
+
+```json
+{"confirm_container_name":"external-inference"}
+```
+
+Missing or mismatched confirmation returns `422` and does not create a task. The confirmation value
+is used only to authorize the request and is not stored in the task input or audit event.
+
 ### Permanent model deletion
 
 `DELETE /api/models/{id}` requires an administrator session and CSRF token. The request body must
