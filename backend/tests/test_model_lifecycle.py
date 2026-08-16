@@ -1453,7 +1453,7 @@ def test_delete_model_creates_bounded_audited_task(stopped_task_client, tmp_path
         assert "token" not in serialized_audit
 
 
-def test_delete_model_is_idempotent_while_task_is_non_terminal(
+def test_delete_model_reuses_queued_task_before_worker_start(
     stopped_task_client, tmp_path
 ):
     database = stopped_task_client.app.state.database
@@ -1467,6 +1467,44 @@ def test_delete_model_is_idempotent_while_task_is_non_terminal(
     assert second.json()["id"] == first.json()["id"]
     with database.session_factory() as db:
         assert len(list(db.scalars(select(TaskRecord)))) == 1
+
+
+def test_delete_model_rejects_deleting_asset_even_with_running_task(
+    stopped_task_client, tmp_path
+):
+    database = stopped_task_client.app.state.database
+    with database.session_factory() as db:
+        task = stopped_task_client.app.state.task_engine.create_task(
+            db,
+            task_type="model.delete",
+            title="删除模型 Target Model",
+            input_json={"model_id": "target"},
+            idempotency_key="model:target:delete",
+        )
+        task.status = "running"
+        db.commit()
+        task_id = task.id
+    _add_asset(
+        database,
+        tmp_path / "models" / "target",
+        name="Target Model",
+        status="deleting",
+        metadata_json={"_delete_task_id": task_id},
+    )
+
+    response = _delete_model(stopped_task_client, "target", "Target Model")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Model deletion is already in progress"
+    with database.session_factory() as db:
+        task = db.get(TaskRecord, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert list(
+            db.scalars(
+                select(AuditEvent).where(AuditEvent.action == "model.delete.create")
+            )
+        ) == []
 
 
 def test_delete_model_rejects_asset_already_deleting(stopped_task_client, tmp_path):

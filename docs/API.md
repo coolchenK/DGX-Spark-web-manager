@@ -92,7 +92,9 @@ deployment:
 ```
 
 A missing model returns `404`. A confirmation that does not exactly match the registered name
-returns `422`. Repeating an accepted request while its task is non-terminal returns the same task.
+returns `422`. Repeating an accepted request while its task is still queued and has not started
+reuses the same task. Once the worker starts and marks the model `deleting`, another request returns
+`409`; after deletion completes and the inventory record is removed, it returns `404`.
 
 ### Hugging Face Spark compatibility
 
