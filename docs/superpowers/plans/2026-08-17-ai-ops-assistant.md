@@ -596,7 +596,43 @@ git add frontend/src/pages/ProvidersPage.tsx frontend/src/pages/ProvidersPage.te
 git commit -m "feat: show AI provider model readiness"
 ```
 
-### Task 9: Full Verification, Visual Review, and DGX Deployment
+### Task 9: Physically Clear Alerts and Diagnostics History
+
+**Files:**
+- Modify: `backend/app/api/settings.py`
+- Modify: `backend/tests/test_settings.py`
+- Modify: `frontend/src/api/types.ts`
+- Modify: `frontend/src/pages/SettingsPage.tsx`
+- Create: `frontend/src/pages/SettingsPage.test.tsx`
+
+- [ ] **Step 1: Write failing transactional cleanup tests**
+
+Cover exact confirmation, CSRF, active `ops.respond`/`operation.execute` task conflicts, approved-plan conflicts, physical deletion counts, cascaded session data, related audit removal, unaffected domain records, and rollback on failure.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: `python -m pytest backend/tests/test_settings.py -k history -v`
+
+Expected: FAIL because the cleanup endpoint does not exist.
+
+- [ ] **Step 3: Implement one-transaction physical deletion**
+
+Add `DELETE /api/settings/alerts-diagnostics-history` with body `{ "confirmation": "清除历史记录" }`. Delete failed tasks, operation plans, operations sessions/messages/tool runs and related diagnostic/operations audit details with SQLAlchemy delete statements in dependency-safe order. Reject the entire request while an operations task or approved unfinished plan is active. Insert only one `maintenance.history.clear` audit event containing aggregate counts, then commit once.
+
+- [ ] **Step 4: Add the Settings danger action**
+
+Render an unframed danger section with a destructive button and Ant Design modal. Require the exact confirmation phrase, explain which records are and are not deleted, and invalidate `tasks`, `diagnostics`, `ops-sessions`, `audit`, and dashboard-related queries after success. Keep the control usable at mobile widths and under dark mode.
+
+- [ ] **Step 5: Run backend and frontend checks and commit**
+
+Run: `python -m pytest backend/tests/test_settings.py -v && pnpm --dir frontend test -- SettingsPage.test.tsx && pnpm --dir frontend lint && pnpm --dir frontend build`
+
+```bash
+git add backend/app/api/settings.py backend/tests/test_settings.py frontend/src/api/types.ts frontend/src/pages/SettingsPage.tsx frontend/src/pages/SettingsPage.test.tsx
+git commit -m "feat: physically clear operations history"
+```
+
+### Task 10: Full Verification, Visual Review, and DGX Deployment
 
 **Files:**
 - Modify: `docs/ARCHITECTURE.md`
