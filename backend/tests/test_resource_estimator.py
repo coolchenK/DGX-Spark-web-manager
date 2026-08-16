@@ -34,6 +34,16 @@ def test_kv_cache_missing_architecture_is_zero() -> None:
         context_length=8192,
         max_concurrency=2,
     ) > 0
+    assert kv_cache_bytes(
+        {
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": None,
+        },
+        context_length=8192,
+        max_concurrency=2,
+    ) > 0
 
 
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, math.inf, "4"])
@@ -47,6 +57,39 @@ def test_kv_cache_rejects_invalid_architecture_values(value: object) -> None:
         context_length=8192,
         max_concurrency=2,
     ) == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 0, -1, 1.5, math.inf, "8", 10**1000],
+)
+def test_kv_cache_rejects_explicit_invalid_kv_heads(value: object) -> None:
+    config = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": value,
+    }
+    assert kv_cache_bytes(config, context_length=8192, max_concurrency=2) == 0
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5, math.inf, "8"])
+def test_invalid_kv_heads_lower_estimate_confidence(value: object) -> None:
+    estimate = ResourceEstimator().estimate(
+        model_size_bytes=1 * GiB,
+        config={
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": value,
+        },
+        context_length=8192,
+        max_concurrency=2,
+        system_memory={"total_bytes": 128 * GiB},
+    )
+    assert estimate.kv_cache_bytes == 0
+    assert estimate.confidence == "low"
+    assert any("invalid" in reason.lower() for reason in estimate.reasons)
 
 
 @pytest.mark.parametrize(

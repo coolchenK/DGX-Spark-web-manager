@@ -66,7 +66,12 @@ def kv_cache_bytes(
         config.get("num_attention_heads"), maximum=MAX_NUM_HEADS
     )
     raw_kv_heads = config.get("num_key_value_heads")
-    kv_heads = _positive_int(raw_kv_heads, maximum=MAX_NUM_HEADS)
+    if "num_key_value_heads" not in config or raw_kv_heads is None:
+        kv_heads = attention_heads
+    else:
+        kv_heads = _positive_int(raw_kv_heads, maximum=MAX_NUM_HEADS)
+        if kv_heads is None:
+            return 0
     context = _positive_int(context_length, maximum=MAX_CONTEXT_LENGTH)
     concurrency = _positive_int(max_concurrency, maximum=MAX_CONCURRENCY)
     if (
@@ -77,9 +82,6 @@ def kv_cache_bytes(
         or not concurrency
     ):
         return 0
-    if _positive_int(raw_kv_heads) and kv_heads is None:
-        return 0
-    kv_heads = kv_heads or attention_heads
     if hidden % attention_heads != 0:
         return 0
     head_dim = hidden // attention_heads
