@@ -270,6 +270,8 @@ def read_frame(reader: BinaryIO) -> dict[str, Any]:
     """Read exactly one bounded frame from a socket or binary stream."""
     header = _read_exact(reader, 4)
     (length,) = struct.unpack(">I", header)
+    if length == 0:
+        raise ProtocolError("invalid frame length")
     if length > MAX_FRAME_SIZE:
         raise ProtocolError("frame too large")
 

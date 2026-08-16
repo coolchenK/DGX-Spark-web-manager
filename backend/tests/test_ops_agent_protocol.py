@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import io
 import json
 import struct
@@ -56,6 +58,21 @@ def test_signed_request_round_trip_without_mutating_input():
     assert signed["signature"] != SECRET.hex()
     assert verified == request
     assert verified["action"] == "host.memory"
+
+
+def test_sign_message_uses_hmac_sha256_over_canonical_bytes():
+    request = new_request(
+        "host.memory",
+        {"unicode": "\u8bb0"},
+        now=1000,
+        nonce="nonce-1",
+        request_id="request-1",
+    )
+
+    signed = sign_message(request, SECRET)
+    expected = hmac.new(SECRET, canonical_bytes(request), hashlib.sha256).hexdigest()
+
+    assert signed["signature"] == expected
 
 
 def test_new_request_has_fixed_schema_and_optional_approval():
@@ -291,6 +308,11 @@ def test_frame_reader_rejects_oversized_length_before_reading_body():
         read_frame(reader)
 
     assert reader.calls == 1
+
+
+def test_frame_reader_rejects_zero_length_before_reading_body():
+    with pytest.raises(ProtocolError, match="frame length"):
+        read_frame(io.BytesIO(struct.pack(">I", 0)))
 
 
 class _ChunkedReader:
