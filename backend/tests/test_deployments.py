@@ -167,10 +167,13 @@ class HandlerContext:
     def __init__(self, task_id="task-1", *, update_error=None):
         self.task_id = task_id
         self.update_error = update_error
+        self.messages = []
 
-    def update(self, **_kwargs):
+    def update(self, **kwargs):
         if self.update_error is not None:
             raise self.update_error
+        if kwargs.get("message"):
+            self.messages.append(kwargs["message"])
 
     def check_control(self):
         return None
@@ -419,6 +422,15 @@ def test_deployment_spec_roundtrips_resource_warning_acknowledgement(tmp_path):
 
     assert spec.resource_warning_acknowledged is True
     assert spec.model_dump(mode="json")["resource_warning_acknowledged"] is True
+
+
+def test_deployment_spec_fingerprint_ignores_browser_model_path(tmp_path):
+    first = DeploymentSpec.model_validate(valid_spec_payload(tmp_path))
+    second = first.model_copy(update={"model_path": str(tmp_path / "other-browser-path")})
+
+    assert deployment_service.deployment_spec_fingerprint(
+        first
+    ) == deployment_service.deployment_spec_fingerprint(second)
 
 
 def test_resolve_spec_uses_available_database_asset_instead_of_browser_path(tmp_path):
@@ -1766,13 +1778,89 @@ def test_create_handler_rejects_same_identity_with_different_spec(tmp_path):
         db.commit()
 
     changed = original.model_copy(update={"port": 8101})
-    idempotent = service.create_handler(
-        HandlerContext(), original.model_dump(mode="json")
-    )
-    assert idempotent["idempotent"] is True
-
     with pytest.raises(ValueError, match="different deployment spec"):
         service.create_handler(HandlerContext(), changed.model_dump(mode="json"))
+
+
+def test_create_handler_recovers_committed_target_before_blocked_live_preflight(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'create-committed-retry.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    original = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path=str(tmp_path / "browser-path-a"),
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+    with database.session_factory() as db:
+        preview = service.preview(db, original)
+        preview["spec_fingerprint"] = "0" * 64
+        deployment = Deployment(
+            name="base",
+            model_id=model_id,
+            runtime="vllm",
+            container_id="committed-container",
+            container_name="dgx-base",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="base",
+            status="running",
+            health="healthy",
+            managed=True,
+            image="vllm:test",
+            port=8100,
+            config=preview,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+    stored_spec = DeploymentSpec.model_validate(preview["spec"])
+    labels = service._expected_container_labels(
+        stored_spec,
+        task_id="original-task",
+        spec_fingerprint=preview["spec_fingerprint"],
+    )
+
+    class Container:
+        id = "committed-container"
+        name = "dgx-base"
+        status = "running"
+        attrs = {"Config": {"Labels": labels}}
+
+        def start(self):
+            self.status = "running"
+
+    container = Container()
+    containers = type(
+        "Containers", (), {"get": lambda _self, _identifier: container}
+    )()
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": containers})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+    blocked = StaticEstimator("blocked")
+    service.resource_estimator = blocked
+    retry = original.model_copy(
+        update={"model_path": str(tmp_path / "browser-path-b")}
+    )
+
+    result = service.create_handler(
+        HandlerContext(task_id="retry-task"), retry.model_dump(mode="json")
+    )
+
+    assert result["deployment_id"] == deployment_id
+    assert result["idempotent"] is True
+    assert blocked.calls == []
 
 
 def test_create_handler_rejects_orphan_container_with_incomplete_labels(
@@ -1973,6 +2061,107 @@ def test_update_handler_blocked_preflight_does_not_touch_old_container(tmp_path)
         unchanged = db.get(Deployment, deployment_id)
         assert unchanged.container_id == "old-container"
         assert unchanged.status == "running"
+
+
+def test_update_recovers_committed_target_and_keeps_unmanaged_backup(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'update-committed-retry.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path=str(tmp_path / "browser-path-a"),
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+    with database.session_factory() as db:
+        preview = service.preview(db, spec)
+        deployment = Deployment(
+            name=spec.name,
+            model_id=model_id,
+            runtime=spec.runtime,
+            container_id="replacement-container",
+            container_name="dgx-base",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name=spec.api_model_name,
+            status="running",
+            health="healthy",
+            managed=True,
+            image=spec.image,
+            port=spec.port,
+            config=preview,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+    stored_spec = DeploymentSpec.model_validate(preview["spec"])
+    labels = service._expected_container_labels(
+        stored_spec,
+        task_id="original-task",
+        spec_fingerprint=deployment_service.deployment_spec_fingerprint(stored_spec),
+        deployment_id=deployment_id,
+    )
+    labels["com.dgx-spark-manager.replaces-container-id"] = "old-container"
+
+    class Replacement:
+        id = "replacement-container"
+        name = "dgx-base"
+        status = "running"
+        attrs = {"Config": {"Labels": labels}}
+
+        def start(self):
+            self.status = "running"
+
+    class UnmanagedBackup:
+        id = "attacker-container"
+        name = service._backup_container_name(deployment_id)
+        attrs = {"Config": {"Labels": {}}}
+        removed = False
+
+        def remove(self, **_kwargs):
+            self.removed = True
+
+    replacement = Replacement()
+    backup = UnmanagedBackup()
+
+    class Containers:
+        def get(self, identifier):
+            if identifier == "replacement-container":
+                return replacement
+            if identifier == backup.name:
+                return backup
+            raise docker.errors.NotFound("missing")
+
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": Containers()})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+    blocked = StaticEstimator("blocked")
+    service.resource_estimator = blocked
+    context = HandlerContext(task_id="retry-task")
+    retry = spec.model_copy(
+        update={"model_path": str(tmp_path / "browser-path-b")}
+    )
+
+    result = service.update_handler(
+        context,
+        {"deployment_id": deployment_id, "spec": retry.model_dump(mode="json")},
+    )
+
+    assert result["idempotent"] is True
+    assert blocked.calls == []
+    assert backup.removed is False
+    assert any("backup cleanup conflict" in message for message in context.messages)
 
 
 def test_create_app_shares_preflight_dependencies(settings):
@@ -2592,6 +2781,7 @@ def test_update_handler_reconciles_interrupted_replacement_stages(
         task_id="task-1",
         spec_fingerprint=fingerprint,
         deployment_id=deployment_id,
+        replaces_container_id="old-container",
     )
 
     class Container:
@@ -2622,7 +2812,11 @@ def test_update_handler_reconciles_interrupted_replacement_stages(
         def logs(self, **_kwargs):
             return b"ready"
 
-    old = Container("old-container", backup_name)
+    old = Container(
+        "old-container",
+        backup_name,
+        labels={"com.dgx-spark-manager.managed": "true"},
+    )
     replacement = (
         None
         if crash_stage == "renamed"

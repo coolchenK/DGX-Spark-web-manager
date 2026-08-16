@@ -52,6 +52,7 @@ def deployment_spec_fingerprint(spec: DeploymentSpec) -> str:
     public = spec.public_dump() if isinstance(spec, ResolvedDeploymentSpec) else spec.model_dump(
         mode="json"
     )
+    public.pop("model_path", None)
     canonical = json.dumps(
         public,
         sort_keys=True,
@@ -284,11 +285,12 @@ class DeploymentService:
 
     @staticmethod
     def _expected_container_labels(
-        spec: ResolvedDeploymentSpec,
+        spec: DeploymentSpec,
         *,
         task_id: str,
         spec_fingerprint: str,
         deployment_id: str | None = None,
+        replaces_container_id: str | None = None,
     ) -> dict[str, str]:
         labels = {
             f"{LABEL_PREFIX}managed": "true",
@@ -302,6 +304,8 @@ class DeploymentService:
         }
         if deployment_id is not None:
             labels[f"{LABEL_PREFIX}deployment-id"] = deployment_id
+        if replaces_container_id is not None:
+            labels[f"{LABEL_PREFIX}replaces-container-id"] = replaces_container_id
         return labels
 
     @staticmethod
@@ -311,12 +315,15 @@ class DeploymentService:
         *,
         require_task: bool = True,
         require_deployment: bool = True,
+        require_fingerprint: bool = True,
     ) -> None:
         labels = (container.attrs.get("Config") or {}).get("Labels") or {}
         for key, value in expected.items():
             if not require_task and key == f"{LABEL_PREFIX}task-id":
                 continue
             if not require_deployment and key == f"{LABEL_PREFIX}deployment-id":
+                continue
+            if not require_fingerprint and key == f"{LABEL_PREFIX}spec-fingerprint":
                 continue
             if labels.get(key) != value:
                 raise ValueError("Existing container labels do not match this task and spec")
@@ -335,9 +342,6 @@ class DeploymentService:
     @staticmethod
     def _stored_spec_fingerprint(deployment: Deployment) -> str | None:
         config = deployment.config if isinstance(deployment.config, Mapping) else {}
-        value = config.get("spec_fingerprint")
-        if isinstance(value, str) and len(value) == 64:
-            return value
         stored_spec = config.get("spec")
         if not isinstance(stored_spec, Mapping):
             return None
@@ -345,6 +349,96 @@ class DeploymentService:
             return deployment_spec_fingerprint(DeploymentSpec.model_validate(stored_spec))
         except (TypeError, ValueError):
             return None
+
+    def _adapter_for_spec(self, spec: DeploymentSpec) -> RuntimeAdapter:
+        adapter = self.adapter(spec.runtime)
+        if spec.runtime != adapter.runtime:
+            raise ValueError(
+                f"Adapter {adapter.runtime} cannot deploy runtime {spec.runtime}"
+            )
+        if spec.image not in adapter.allowed_images:
+            raise ValueError(f"Image is not allowed for {spec.runtime}")
+        return adapter
+
+    def _deployment_matches_spec(
+        self, deployment: Deployment, spec: DeploymentSpec
+    ) -> bool:
+        return (
+            self._stored_spec_fingerprint(deployment)
+            == deployment_spec_fingerprint(spec)
+            and deployment.name == spec.name
+            and deployment.model_id == spec.model_id
+            and deployment.runtime == spec.runtime
+            and deployment.api_model_name == spec.api_model_name
+            and deployment.image == spec.image
+            and deployment.port == spec.port
+        )
+
+    def _cleanup_committed_backup(
+        self,
+        context: TaskContext,
+        client: Any,
+        target: Any,
+        deployment_id: str,
+    ) -> None:
+        backup = self._get_container_optional(
+            client, self._backup_container_name(deployment_id)
+        )
+        if backup is None or backup.id == target.id:
+            return
+        target_labels = (target.attrs.get("Config") or {}).get("Labels") or {}
+        backup_labels = (backup.attrs.get("Config") or {}).get("Labels") or {}
+        replaced_id = target_labels.get(f"{LABEL_PREFIX}replaces-container-id")
+        if (
+            backup_labels.get(f"{LABEL_PREFIX}managed") != "true"
+            or not replaced_id
+            or backup.id != replaced_id
+        ):
+            context.update(
+                message="backup cleanup conflict: ownership could not be verified"
+            )
+            return
+        self._remove_owned_container(backup)
+
+    def _recover_committed_deployment(
+        self,
+        context: TaskContext,
+        deployment: Deployment,
+        spec: DeploymentSpec,
+        *,
+        cleanup_backup: bool,
+    ) -> dict[str, Any]:
+        adapter = self._adapter_for_spec(spec)
+        client = self.docker_client()
+        target = self._get_container_optional(client, deployment.container_id)
+        if target is None:
+            raise ValueError("Persisted replacement container was not found")
+        expected_labels = self._expected_container_labels(
+            spec,
+            task_id=str(getattr(context, "task_id", "manual")),
+            spec_fingerprint=deployment_spec_fingerprint(spec),
+            deployment_id=deployment.id,
+        )
+        self._validate_container_labels(
+            target,
+            expected_labels,
+            require_task=False,
+            require_deployment=False,
+            require_fingerprint=False,
+        )
+        if target.status != "running":
+            adapter.start(target)
+        endpoint = f"http://127.0.0.1:{spec.port}"
+        if not self.wait_for_health(context, endpoint, adapter=adapter):
+            raise RuntimeError("Persisted replacement container is unhealthy")
+        if cleanup_backup:
+            self._cleanup_committed_backup(context, client, target, deployment.id)
+        return {
+            "deployment_id": deployment.id,
+            "container_name": deployment.container_name,
+            "endpoint_url": endpoint,
+            "idempotent": True,
+        }
 
     @staticmethod
     def _remove_owned_container(container: Any) -> None:
@@ -500,6 +594,7 @@ class DeploymentService:
         task_id: str = "manual",
         spec_fingerprint: str | None = None,
         deployment_id: str | None = None,
+        replaces_container_id: str | None = None,
     ) -> Any:
         if not isinstance(spec, ResolvedDeploymentSpec):
             raise ValueError("Resolved deployment spec is required")
@@ -531,6 +626,7 @@ class DeploymentService:
                 task_id=task_id,
                 spec_fingerprint=fingerprint,
                 deployment_id=deployment_id,
+                replaces_container_id=replaces_container_id,
             ),
             restart_policy={"Name": "unless-stopped"},
             log_config=LogConfig(
@@ -561,8 +657,6 @@ class DeploymentService:
                 )
                 ).all()
             )
-            resolved, preview = self._preflight(db, spec)
-            fingerprint = preview["spec_fingerprint"]
             if matches:
                 if len(matches) != 1:
                     raise ValueError("Deployment identity conflicts with existing deployments")
@@ -572,14 +666,13 @@ class DeploymentService:
                     or existing.api_model_name != spec.api_model_name
                 ):
                     raise ValueError("Deployment identity conflicts with an existing deployment")
-                if self._stored_spec_fingerprint(existing) != fingerprint:
+                if not self._deployment_matches_spec(existing, spec):
                     raise ValueError("Existing deployment uses a different deployment spec")
-                return {
-                    "deployment_id": existing.id,
-                    "container_name": existing.container_name,
-                    "endpoint_url": existing.endpoint_url,
-                    "idempotent": True,
-                }
+                return self._recover_committed_deployment(
+                    context, existing, spec, cleanup_backup=False
+                )
+            resolved, preview = self._preflight(db, spec)
+            fingerprint = preview["spec_fingerprint"]
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
         name = deterministic_container_name(resolved.name)
@@ -675,6 +768,10 @@ class DeploymentService:
             )
             if conflict:
                 raise ValueError("Another deployment uses this name or API model name")
+            if self._deployment_matches_spec(deployment, spec):
+                return self._recover_committed_deployment(
+                    context, deployment, spec, cleanup_backup=True
+                )
             resolved, preview = self._preflight(
                 db,
                 spec,
@@ -685,15 +782,6 @@ class DeploymentService:
                 deployment.name
             )
             current_status = deployment.status
-            stored_fingerprint = self._stored_spec_fingerprint(deployment)
-            current_matches_target = (
-                deployment.name == resolved.name
-                and deployment.model_id == resolved.model_id
-                and deployment.runtime == resolved.runtime
-                and deployment.api_model_name == resolved.api_model_name
-                and deployment.image == resolved.image
-                and deployment.port == resolved.port
-            )
 
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
@@ -707,31 +795,8 @@ class DeploymentService:
             task_id=task_id,
             spec_fingerprint=fingerprint,
             deployment_id=deployment_id,
+            replaces_container_id=current_container_id,
         )
-
-        if stored_fingerprint == fingerprint and current_matches_target:
-            target = self._get_container_optional(client, current_container_id)
-            if target is None:
-                raise ValueError("Persisted replacement container was not found")
-            self._validate_container_labels(
-                target,
-                expected_labels,
-                require_task=False,
-                require_deployment=False,
-            )
-            if target.status != "running":
-                adapter.start(target)
-            if not self.wait_for_health(context, endpoint, adapter=adapter):
-                raise RuntimeError("Persisted replacement container is unhealthy")
-            backup = self._get_container_optional(client, backup_name)
-            if backup is not None and backup.id != target.id:
-                self._remove_owned_container(backup)
-            return {
-                "deployment_id": deployment_id,
-                "container_name": current_container_name,
-                "endpoint_url": endpoint,
-                "idempotent": True,
-            }
 
         old_container = client.containers.get(current_container_id)
         old_container.reload()
@@ -764,6 +829,7 @@ class DeploymentService:
                     task_id=task_id,
                     spec_fingerprint=fingerprint,
                     deployment_id=deployment_id,
+                    replaces_container_id=current_container_id,
                 )
             else:
                 new_container = replacement
