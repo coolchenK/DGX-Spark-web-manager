@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 43_200
     cookie_secure: bool = False
     deployment_startup_timeout_seconds: int = Field(default=300, ge=30, le=1800)
+    runtime_probe_timeout_seconds: int = Field(default=45, ge=5, le=180)
+    recommendation_cache_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
+    recommendation_card_max_chars: int = Field(default=100_000, ge=10_000, le=500_000)
+    memory_reserve_fraction: float = Field(default=0.10, ge=0.05, le=0.30)
+    memory_reserve_min_bytes: int = Field(default=8 * 1024**3, ge=1024**3)
     allowed_vllm_images: str = "vllm/vllm-openai:v0.27.1"
     allowed_sglang_images: str = (
         "sglang-inkling:specforge,lmsysorg/sglang:dev-cu13-inkling-dspark"
