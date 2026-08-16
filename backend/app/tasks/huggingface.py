@@ -10,7 +10,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 
 from app.services.discovery import directory_size, resolve_hf_snapshot
 from app.tasks.engine import TaskCancelled, TaskContext, TaskPaused
@@ -313,6 +313,29 @@ class HuggingFaceService:
             "total_size": total_size,
             "card_data": serialize_card_data(model.card_data),
         }
+
+    def model_card_text(
+        self,
+        repository_id: str,
+        revision: str = "main",
+        max_chars: int = 100_000,
+    ) -> str:
+        repository_id = validate_repository_id(repository_id)
+        if (
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or not 1 <= max_chars <= 500_000
+        ):
+            raise ValueError("max_chars must be between 1 and 500000")
+        path = hf_hub_download(
+            repo_id=repository_id,
+            filename="README.md",
+            revision=revision,
+            cache_dir=self.cache_dir,
+            token=self.token,
+        )
+        with Path(path).open("r", encoding="utf-8", errors="replace") as stream:
+            return stream.read(max_chars)
 
     def download_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         repository_id = validate_repository_id(str(payload["repository_id"]))

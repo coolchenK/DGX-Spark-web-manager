@@ -64,6 +64,39 @@ def test_model_card_data_uses_hub_serialization_contract():
     assert serialize_card_data(None) == {}
 
 
+def test_model_card_text_uses_download_contract_and_bounds_content(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "hub"
+    downloaded = tmp_path / "README.md"
+    downloaded.write_text("abcdef", encoding="utf-8")
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return downloaded
+
+    monkeypatch.setattr(huggingface, "hf_hub_download", fake_download)
+    service = huggingface.HuggingFaceService(cache_dir, token="hf_test_token")
+
+    assert service.model_card_text("org/model", revision="abc123", max_chars=4) == "abcd"
+    assert calls == [
+        {
+            "repo_id": "org/model",
+            "filename": "README.md",
+            "revision": "abc123",
+            "cache_dir": cache_dir,
+            "token": "hf_test_token",
+        }
+    ]
+
+
+@pytest.mark.parametrize("max_chars", [0, -1, 500_001])
+def test_model_card_text_rejects_unbounded_limits(tmp_path, max_chars):
+    service = huggingface.HuggingFaceService(tmp_path)
+
+    with pytest.raises(ValueError, match="max_chars"):
+        service.model_card_text("org/model", max_chars=max_chars)
+
+
 def test_search_ranks_nvfp4_ahead_of_more_downloaded_model(tmp_path):
     service = huggingface.HuggingFaceService(tmp_path)
     service.api = FakeHuggingFaceApi(
