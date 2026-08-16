@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { api } from '../api/client'
 import type { DeploymentRecommendation } from '../api/types'
@@ -25,6 +25,19 @@ interface StableRecommendationTuple {
   tuple: RecommendationTuple
 }
 
+interface RefreshOwnership {
+  sequence: number
+  controller: AbortController | null
+  tupleKey: string | null
+}
+
+
+function refreshAbortError(controller: AbortController): Error {
+  return controller.signal.reason instanceof Error
+    ? controller.signal.reason
+    : new DOMException('AI recommendation refresh was cancelled', 'AbortError')
+}
+
 
 export function useDeploymentRecommendation({
   modelId = '',
@@ -34,6 +47,18 @@ export function useDeploymentRecommendation({
   enabled,
 }: DeploymentRecommendationOptions) {
   const queryClient = useQueryClient()
+  const refreshOwnership = useRef<RefreshOwnership>({
+    sequence: 0,
+    controller: null,
+    tupleKey: null,
+  })
+  const invalidateRefresh = useCallback(() => {
+    const ownership = refreshOwnership.current
+    ownership.sequence += 1
+    ownership.controller?.abort()
+    ownership.controller = null
+    ownership.tupleKey = null
+  }, [])
   const normalizedProviderId = providerId ?? null
   const tuple = useMemo<RecommendationTuple>(() => ({
     modelId,
@@ -45,6 +70,10 @@ export function useDeploymentRecommendation({
     () => JSON.stringify([modelId, runtime, image, normalizedProviderId]),
     [image, modelId, normalizedProviderId, runtime],
   )
+  const committedInput = useRef<{ enabled: boolean; tupleKey: string | null }>({
+    enabled: false,
+    tupleKey: null,
+  })
   const eligible = Boolean(enabled && tuple.modelId && tuple.image)
   const [stable, setStable] = useState<StableRecommendationTuple | null>(null)
 
@@ -59,6 +88,14 @@ export function useDeploymentRecommendation({
     }, 300)
     return () => window.clearTimeout(timeout)
   }, [enabled, image, modelId, normalizedProviderId, runtime, tupleKey])
+
+  useEffect(() => {
+    committedInput.current = { enabled, tupleKey }
+    return () => {
+      committedInput.current = { enabled: false, tupleKey: null }
+      invalidateRefresh()
+    }
+  }, [enabled, image, invalidateRefresh, modelId, normalizedProviderId, runtime, tupleKey])
 
   const activeTuple = eligible && stable?.key === tupleKey ? stable.tuple : null
   const body = useMemo(() => activeTuple ? {
@@ -86,16 +123,59 @@ export function useDeploymentRecommendation({
   })
 
   const refreshAI = useCallback(async () => {
-    if (!activeTuple || !body) {
+    const input = committedInput.current
+    if (
+      !activeTuple
+      || !body
+      || !stable
+      || !input.enabled
+      || input.tupleKey !== stable.key
+    ) {
       throw new Error('Recommendation tuple is not stable')
     }
-    const result = await api.post<DeploymentRecommendation>(
-      '/api/deployments/recommendations?refresh_ai=true',
-      body,
-    )
-    queryClient.setQueryData(queryKey, result)
-    return result
-  }, [activeTuple, body, queryClient, queryKey])
+    const ownership = refreshOwnership.current
+    ownership.controller?.abort()
+    const controller = new AbortController()
+    const sequence = ownership.sequence + 1
+    const ownedTupleKey = stable.key
+    ownership.sequence = sequence
+    ownership.controller = controller
+    ownership.tupleKey = ownedTupleKey
+
+    const assertOwnership = () => {
+      const current = refreshOwnership.current
+      if (
+        controller.signal.aborted
+        || current.sequence !== sequence
+        || current.controller !== controller
+        || current.tupleKey !== ownedTupleKey
+        || !committedInput.current.enabled
+        || committedInput.current.tupleKey !== ownedTupleKey
+      ) {
+        throw refreshAbortError(controller)
+      }
+    }
+
+    try {
+      await queryClient.cancelQueries({ queryKey, exact: true })
+      assertOwnership()
+      const result = await api.post<DeploymentRecommendation>(
+        '/api/deployments/recommendations?refresh_ai=true',
+        body,
+        { signal: controller.signal },
+      )
+      assertOwnership()
+      await queryClient.cancelQueries({ queryKey, exact: true })
+      assertOwnership()
+      queryClient.setQueryData(queryKey, result)
+      return result
+    } finally {
+      const current = refreshOwnership.current
+      if (current.sequence === sequence && current.controller === controller) {
+        current.controller = null
+      }
+    }
+  }, [activeTuple, body, queryClient, queryKey, stable])
 
   return { ...query, refreshAI }
 }

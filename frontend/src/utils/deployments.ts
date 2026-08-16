@@ -96,7 +96,11 @@ function normalizeGenerationDefaults(value: unknown): GenerationDefaults {
     normalized.frequency_penalty = saved.frequency_penalty as number
   }
   if (saved.max_tokens != null) normalized.max_tokens = saved.max_tokens as number
-  if (saved.stop != null) normalized.stop = saved.stop as string | string[]
+  if (saved.stop != null) {
+    normalized.stop = Array.isArray(saved.stop)
+      ? [...saved.stop] as string[]
+      : saved.stop as string
+  }
   return normalized
 }
 
@@ -119,6 +123,28 @@ function normalizeSpeculativeSettings(value: unknown): SpeculativeSettings | nul
     normalized.num_draft_tokens = saved.num_draft_tokens as number
   }
   return normalized
+}
+
+
+function normalizeRecommendationProvenance(value: unknown): RecommendationProvenance | null {
+  const saved = objectValue(value)
+  const resourceSnapshot = objectValue(saved?.resource_snapshot)
+  const sources = objectValue(saved?.sources)
+  if (!saved || !resourceSnapshot || !sources) return null
+  return {
+    generated_at: saved.generated_at as string,
+    evidence_hash: saved.evidence_hash as string,
+    provider_id: saved.provider_id as string | null,
+    resource_snapshot: {
+      total_bytes: resourceSnapshot.total_bytes as number,
+      available_bytes: resourceSnapshot.available_bytes as number,
+      reserved_bytes: resourceSnapshot.reserved_bytes as number,
+    },
+    modified_fields: Array.isArray(saved.modified_fields)
+      ? [...saved.modified_fields] as string[]
+      : [],
+    sources: { ...sources } as RecommendationProvenance['sources'],
+  }
 }
 
 
@@ -165,7 +191,7 @@ export function deploymentToFormValues(
     trust_remote_code: saved.trust_remote_code ?? command.includes('--trust-remote-code'),
     generation_defaults: normalizeGenerationDefaults(saved.generation_defaults),
     speculative: normalizeSpeculativeSettings(saved.speculative),
-    recommendation: saved.recommendation ? { ...saved.recommendation } : null,
+    recommendation: normalizeRecommendationProvenance(saved.recommendation),
     resource_warning_acknowledged: saved.resource_warning_acknowledged ?? false,
   }
   if (mode === 'clone') {

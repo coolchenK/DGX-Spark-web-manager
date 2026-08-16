@@ -91,6 +91,17 @@ function wrapper(queryClient: QueryClient) {
 }
 
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+
 describe('deployment recommendation helpers', () => {
   it('applies only untouched recommendations unless force is true', () => {
     const recommendation = recommendationFixture({
@@ -120,6 +131,20 @@ describe('deployment recommendation helpers', () => {
       context_length: 16_384,
       generation_defaults: { temperature: 0.6, stop: ['END'] },
     })
+  })
+
+  it('copies recommended stop arrays before handing values to the form', () => {
+    const cachedStop = ['END']
+    const recommendation = recommendationFixture({
+      generation_defaults: { stop: recommended(cachedStop) },
+    })
+
+    const values = valuesFromRecommendation(recommendation, new Set(), false)
+    const formStop = values.generation_defaults?.stop as string[]
+    formStop.push('FORM-ONLY')
+
+    expect(cachedStop).toEqual(['END'])
+    expect(recommendation.generation_defaults.stop.value).toEqual(['END'])
   })
 
   it('recursively flattens sorted scalar and array leaves', () => {
@@ -419,5 +444,150 @@ describe('recommendation client and hook', () => {
     )
     await waitFor(() => expect(post).toHaveBeenCalledTimes(3))
     expect(post.mock.calls[2][0]).toBe('/api/deployments/recommendations')
+  })
+
+  it('lets only the latest concurrent AI refresh update the base query', async () => {
+    const ordinary = recommendationFixture({ status: 'partial' })
+    const firstResult = recommendationFixture({ generated_at: '2026-08-16T01:00:00Z' })
+    const secondResult = recommendationFixture({ generated_at: '2026-08-16T02:00:00Z' })
+    const first = deferred<DeploymentRecommendation>()
+    const second = deferred<DeploymentRecommendation>()
+    const refreshSignals: Array<AbortSignal | null | undefined> = []
+    let refreshCalls = 0
+    vi.spyOn(api, 'post').mockImplementation((path, _body, options) => {
+      if (!path.includes('refresh_ai=true')) return Promise.resolve(ordinary)
+      refreshSignals.push(options?.signal)
+      return (++refreshCalls === 1 ? first : second).promise
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { result } = renderHook(
+      () => useDeploymentRecommendation({
+        modelId: 'model-1', runtime: 'vllm', image: 'vllm:test', enabled: true,
+      }),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(result.current.data).toEqual(ordinary))
+    const firstRefresh = result.current.refreshAI()
+    await waitFor(() => expect(refreshCalls).toBe(1))
+    const secondRefresh = result.current.refreshAI()
+    await waitFor(() => expect(refreshCalls).toBe(2))
+    expect(refreshSignals[0]?.aborted).toBe(true)
+
+    second.resolve(secondResult)
+    await expect(secondRefresh).resolves.toEqual(secondResult)
+    first.resolve(firstResult)
+    await expect(firstRefresh).rejects.toMatchObject({ name: 'AbortError' })
+    await waitFor(() => expect(result.current.data).toEqual(secondResult))
+  })
+
+  it.each(['disable', 'unmount', 'tuple-change'] as const)(
+    'invalidates an AI refresh on %s even when transport ignores abort',
+    async (transition) => {
+      const ordinary = recommendationFixture({ status: 'partial' })
+      const late = recommendationFixture({ generated_at: '2026-08-16T03:00:00Z' })
+      const refresh = deferred<DeploymentRecommendation>()
+      let refreshSignal: AbortSignal | null | undefined
+      vi.spyOn(api, 'post').mockImplementation((path, _body, options) => {
+        if (!path.includes('refresh_ai=true')) return Promise.resolve(ordinary)
+        refreshSignal = options?.signal
+        return refresh.promise
+      })
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      let enabled = true
+      let modelId = 'model-1'
+      const rendered = renderHook(
+        () => useDeploymentRecommendation({
+          modelId, runtime: 'vllm', image: 'vllm:test', enabled,
+        }),
+        { wrapper: wrapper(queryClient) },
+      )
+
+      await waitFor(() => expect(rendered.result.current.data).toEqual(ordinary))
+      const refreshPromise = rendered.result.current.refreshAI()
+      await waitFor(() => expect(refreshSignal).toBeInstanceOf(AbortSignal))
+      if (transition === 'disable') {
+        enabled = false
+        rendered.rerender()
+      } else if (transition === 'tuple-change') {
+        modelId = 'model-2'
+        rendered.rerender()
+      } else {
+        rendered.unmount()
+      }
+      expect(refreshSignal?.aborted).toBe(true)
+
+      refresh.resolve(late)
+      await expect(refreshPromise).rejects.toMatchObject({ name: 'AbortError' })
+      expect(queryClient.getQueryData([
+        'deployment-recommendation',
+        { modelId: 'model-1', runtime: 'vllm', image: 'vllm:test', providerId: null },
+      ])).toEqual(ordinary)
+    },
+  )
+
+  it('rejects a saved refresh callback after its tuple is no longer current', async () => {
+    const ordinary = recommendationFixture({ status: 'partial' })
+    const post = vi.spyOn(api, 'post').mockResolvedValue(ordinary)
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    let modelId = 'model-1'
+    const { rerender, result } = renderHook(
+      () => useDeploymentRecommendation({
+        modelId, runtime: 'vllm', image: 'vllm:test', enabled: true,
+      }),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(result.current.data).toEqual(ordinary))
+    const staleRefresh = result.current.refreshAI
+    modelId = 'model-2'
+    rerender()
+
+    await expect(staleRefresh()).rejects.toThrow('Recommendation tuple is not stable')
+    expect(post.mock.calls.filter(([path]) => path.includes('refresh_ai=true'))).toHaveLength(0)
+  })
+
+  it('cancels an ordinary refetch before committing a refresh result', async () => {
+    const ordinary = recommendationFixture({ status: 'partial' })
+    const refreshed = recommendationFixture({ generated_at: '2026-08-16T04:00:00Z' })
+    const lateOrdinary = recommendationFixture({ generated_at: '2026-08-16T05:00:00Z' })
+    const refresh = deferred<DeploymentRecommendation>()
+    const refetch = deferred<DeploymentRecommendation>()
+    let ordinaryCalls = 0
+    let refetchSignal: AbortSignal | null | undefined
+    vi.spyOn(api, 'post').mockImplementation((path, _body, options) => {
+      if (path.includes('refresh_ai=true')) return refresh.promise
+      ordinaryCalls += 1
+      if (ordinaryCalls === 1) return Promise.resolve(ordinary)
+      refetchSignal = options?.signal
+      return refetch.promise
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const tuple = {
+      modelId: 'model-1', runtime: 'vllm' as const, image: 'vllm:test', providerId: null,
+    }
+    const { result } = renderHook(
+      () => useDeploymentRecommendation({ ...tuple, enabled: true }),
+      { wrapper: wrapper(queryClient) },
+    )
+
+    await waitFor(() => expect(result.current.data).toEqual(ordinary))
+    const refreshPromise = result.current.refreshAI()
+    await waitFor(() => expect(api.post).toHaveBeenCalledWith(
+      '/api/deployments/recommendations?refresh_ai=true',
+      expect.anything(),
+      expect.anything(),
+    ))
+    const refetchPromise = queryClient.refetchQueries({
+      queryKey: ['deployment-recommendation', tuple], exact: true,
+    })
+    await waitFor(() => expect(refetchSignal).toBeInstanceOf(AbortSignal))
+
+    refresh.resolve(refreshed)
+    await expect(refreshPromise).resolves.toEqual(refreshed)
+    expect(refetchSignal?.aborted).toBe(true)
+    refetch.resolve(lateOrdinary)
+    await refetchPromise
+    expect(queryClient.getQueryData(['deployment-recommendation', tuple])).toEqual(refreshed)
   })
 })

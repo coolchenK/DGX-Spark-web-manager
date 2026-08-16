@@ -64,7 +64,9 @@ export function valuesFromRecommendation(
   for (const [field, recommended] of Object.entries(recommendation.generation_defaults)) {
     if (!GENERATION_FIELDS.has(field as keyof GenerationDefaults)) continue
     if (!force && editedFields.has(`generation_defaults.${field}`)) continue
-    writableGeneration[field] = recommended.value
+    writableGeneration[field] = field === 'stop' && Array.isArray(recommended.value)
+      ? [...recommended.value]
+      : recommended.value
   }
   if (Object.keys(generationDefaults).length) {
     values.generation_defaults = generationDefaults

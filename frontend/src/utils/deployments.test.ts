@@ -163,4 +163,33 @@ describe('deploymentToFormValues', () => {
       manual_review_acknowledged: false,
     })
   })
+
+  it('does not share saved nested objects with editable form values', () => {
+    const saved = deployment.config.spec as {
+      generation_defaults: { stop: string[] }
+      speculative: { method: string }
+      recommendation: {
+        resource_snapshot: { total_bytes: number }
+        modified_fields: string[]
+        sources: Record<string, string>
+      }
+    }
+    const values = deploymentToFormValues(deployment, model, 'edit')
+
+    ;(values.generation_defaults.stop as string[]).push('FORM-ONLY')
+    if (values.speculative) values.speculative.method = 'draft_model'
+    if (values.recommendation) {
+      values.recommendation.resource_snapshot.total_bytes = 9999
+      values.recommendation.modified_fields.push('context_length')
+      values.recommendation.sources.context_length = 'device_rule'
+    }
+
+    expect(saved.generation_defaults.stop).toEqual(['END'])
+    expect(saved.speculative.method).toBe('eagle3')
+    expect(saved.recommendation.resource_snapshot.total_bytes).toBe(1000)
+    expect(saved.recommendation.modified_fields).toEqual(['generation_defaults.temperature'])
+    expect(saved.recommendation.sources).toEqual({
+      'generation_defaults.temperature': 'model_card',
+    })
+  })
 })
