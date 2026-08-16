@@ -16,7 +16,7 @@ from huggingface_hub import ModelCard
 from pydantic import BaseModel, ConfigDict, Field
 from yaml.error import YAMLError
 
-MAX_JSON_BYTES = 1024**2
+MAX_JSON_BYTES = 4 * 1024**2
 MAX_CARD_CHARS = 500_000
 MAX_TOKENIZER_FILE_BYTES = 128 * 1024**2
 

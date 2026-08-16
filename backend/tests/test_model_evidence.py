@@ -724,10 +724,11 @@ def test_oversized_tokenizer_file_is_reported_without_fingerprint(tmp_path, monk
     assert evidence.warnings == ["tokenizer.json is too large for tokenizer fingerprint"]
 
 
-def test_invalid_oversized_and_non_dictionary_json_is_bounded(tmp_path):
+def test_invalid_oversized_and_non_dictionary_json_is_bounded(tmp_path, monkeypatch):
     model = tmp_path / "model"
     model.mkdir()
-    (model / "config.json").write_bytes(b"{" + b"x" * (1024**2))
+    monkeypatch.setattr(model_evidence, "MAX_JSON_BYTES", 4)
+    (model / "config.json").write_bytes(b"12345")
     (model / "generation_config.json").write_text("[]", encoding="utf-8")
 
     evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
@@ -735,8 +736,29 @@ def test_invalid_oversized_and_non_dictionary_json_is_bounded(tmp_path):
     assert evidence.config == {}
     assert evidence.generation_config == {}
     assert evidence.local_generation_values == {}
-    assert len(evidence.warnings) == 2
+    assert evidence.warnings == [
+        "config.json exceeds the size limit",
+        "generation_config.json must contain a JSON object",
+    ]
     assert len(json.dumps(evidence.warnings)) < 500
+
+
+def test_large_nemotron_config_within_four_mib_is_read(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    payload = json.dumps(
+        {
+            "max_position_embeddings": 1_048_576,
+            "padding": "x" * 1_337_600,
+        }
+    )
+    assert 1_300_000 < len(payload.encode("utf-8")) < 1_400_000
+    (model / "config.json").write_text(payload, encoding="utf-8")
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+    assert evidence.config["max_position_embeddings"] == 1_048_576
+    assert evidence.warnings == []
 
 
 def test_malformed_json_does_not_abort_evidence_loading(tmp_path):
