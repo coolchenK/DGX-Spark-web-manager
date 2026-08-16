@@ -138,6 +138,28 @@ button, input, textarea, select { letter-spacing: 0; }
 .deployment-preview h5.ant-typography { margin: 0 0 6px; font-size: 14px; }
 .deployment-preview pre { overflow: auto; margin: 0; padding: 12px; border-radius: 6px; background: var(--color-surface); }
 .form-grid .ant-input-number { width: 100%; }
+.deployment-wizard-steps { margin-bottom: 20px; }
+.deployment-step { display: grid; gap: 16px; min-width: 0; }
+.deployment-step-heading { min-width: 0; padding-bottom: 12px; border-bottom: 1px solid var(--color-border); }
+.deployment-step-heading h4.ant-typography { margin: 0; font-size: 16px; line-height: 24px; }
+.deployment-step-heading-actions { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.recommendation-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(0, 1.15fr); gap: 8px 12px; align-items: start; min-width: 0; }
+.recommendation-field { min-width: 0; margin-bottom: 0; }
+.recommendation-field .ant-input-number, .recommendation-field .ant-select { width: 100%; }
+.recommendation-field-meta { display: grid; gap: 4px; min-width: 0; padding-top: 30px; }
+.recommendation-meta { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.recommendation-meta .ant-tag { margin-inline-end: 0; }
+.recommendation-reason, .draft-candidate-name, .draft-candidate-details, .break-anywhere { overflow-wrap: anywhere; }
+.draft-advanced-toggle { display: flex; align-items: center; gap: 10px; color: var(--color-muted); }
+.draft-candidate-list { display: block; min-width: 0; border-bottom: 1px solid var(--color-border); }
+.draft-candidate { min-width: 0; padding: 12px 0; border-top: 1px solid var(--color-border); }
+.draft-candidate .ant-radio-wrapper { width: 100%; align-items: flex-start; white-space: normal; }
+.draft-candidate-label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.draft-candidate-label .ant-tag { margin-inline-end: 0; }
+.draft-candidate-details { display: block; margin-top: 4px; color: var(--color-muted); font-size: 12px; line-height: 18px; }
+.preview-section { min-width: 0; padding-top: 4px; }
+.preview-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.deployment-wizard-actions { position: sticky; z-index: 5; bottom: -24px; display: flex; justify-content: space-between; gap: 10px; margin-top: 20px; padding: 14px 0 24px; border-top: 1px solid var(--color-border); background: var(--color-bg); }
 .gateway-summary, .diagnostic-composer, .settings-section { padding: 18px 20px; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 6px; }
 .code-section { border-top: 1px solid var(--color-border); }
 .code-section pre { overflow-x: auto; margin: 0; padding: 18px 20px; border-radius: 6px; background: oklch(0.15 0 0); color: oklch(0.91 0.01 110); font: 13px/1.7 ui-monospace, Consolas, monospace; }
@@ -196,6 +218,13 @@ button, input, textarea, select { letter-spacing: 0; }
   .hf-search { grid-template-columns: 1fr; }
   .settings-section { align-items: flex-start; flex-direction: column; }
   .log-toolbar { align-items: stretch; flex-direction: column; }
+  .deployment-step-heading-actions { align-items: stretch; flex-direction: column; }
+  .recommendation-row { grid-template-columns: 1fr; }
+  .recommendation-field-meta { padding-top: 0; }
+  .preview-split { grid-template-columns: 1fr; }
+  .deployment-wizard-actions { bottom: -24px; flex-wrap: wrap; }
+  .deployment-wizard-actions .ant-btn { flex: 1 1 140px; }
+  .draft-advanced-toggle { justify-content: space-between; }
 }
 
 @media (prefers-reduced-motion: reduce) {

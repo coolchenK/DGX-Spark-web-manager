@@ -3,49 +3,72 @@ import {
   DeleteOutlined,
   EditOutlined,
   FileTextOutlined,
+  LeftOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
+  RightOutlined,
+  RocketOutlined,
 } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Alert,
   Button,
-  Descriptions,
   Drawer,
   Flex,
   Form,
-  Input,
-  InputNumber,
-  List,
+  Grid,
   Popconfirm,
-  Segmented,
-  Select,
-  Slider,
   Space,
   Steps,
-  Switch,
   Tag,
   Tooltip,
   Typography,
   message,
 } from 'antd'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 
 import { api } from '../api/client'
-import type { Deployment, ModelAsset, TaskRecord } from '../api/types'
+import type {
+  Deployment,
+  DeploymentRecommendation,
+  DraftCandidate,
+  ModelAsset,
+  Provider,
+  RecommendationProvenance,
+  RecommendationSource,
+  TaskRecord,
+} from '../api/types'
+import { DeploymentBasicsStep } from '../components/deployments/DeploymentBasicsStep'
+import {
+  DeploymentPreviewStep,
+  type DeploymentPreview,
+} from '../components/deployments/DeploymentPreviewStep'
+import { DraftModelStep } from '../components/deployments/DraftModelStep'
+import { RecommendationStep } from '../components/deployments/RecommendationStep'
 import { LogViewer } from '../components/LogViewer'
 import { PageHeader } from '../components/PageHeader'
 import { QueryState } from '../components/QueryState'
 import { ResponsiveDataView } from '../components/ResponsiveDataView'
 import { StatusBadge } from '../components/StatusBadge'
-import { deploymentToFormValues, type DeploymentFormValues } from '../utils/deployments'
-import { formatBytes } from '../utils/format'
+import { useDeploymentRecommendation } from '../hooks/useDeploymentRecommendation'
+import {
+  flattenChangedFields,
+  valuesFromRecommendation,
+} from '../utils/deploymentRecommendations'
+import {
+  deploymentToFormValues,
+  type DeploymentFormValues,
+  type SpeculativeSettings,
+} from '../utils/deployments'
 
 
-const defaultValues: Partial<DeploymentFormValues> = {
+interface DeploymentWizardValues extends DeploymentFormValues {
+  provider_id?: string
+}
+
+const defaultValues: Partial<DeploymentWizardValues> = {
   runtime: 'vllm',
   image: 'vllm/vllm-openai:v0.27.1',
   port: 8100,
@@ -53,23 +76,110 @@ const defaultValues: Partial<DeploymentFormValues> = {
   memory_fraction: 0.8,
   max_concurrency: 8,
   trust_remote_code: false,
+  generation_defaults: {},
+  speculative: null,
+  recommendation: null,
+  resource_warning_acknowledged: false,
+}
+
+const recommendationFieldPaths = new Set([
+  'context_length',
+  'memory_fraction',
+  'max_concurrency',
+  'max_batched_tokens',
+  'quantization',
+  'generation_defaults.temperature',
+  'generation_defaults.top_p',
+  'generation_defaults.top_k',
+  'generation_defaults.min_p',
+  'generation_defaults.repetition_penalty',
+  'generation_defaults.presence_penalty',
+  'generation_defaults.frequency_penalty',
+  'generation_defaults.max_tokens',
+  'generation_defaults.stop',
+])
+
+const basicFields: Array<keyof DeploymentWizardValues> = [
+  'model_id',
+  'name',
+  'model_path',
+  'api_model_name',
+  'runtime',
+  'image',
+  'port',
+]
+
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException
+    ? error.name === 'AbortError'
+    : error instanceof Error && error.name === 'AbortError'
+}
+
+
+function recommendationPaths(recommendation: DeploymentRecommendation): Set<string> {
+  return new Set([
+    ...Object.keys(recommendation.fields),
+    ...Object.keys(recommendation.generation_defaults).map((field) => `generation_defaults.${field}`),
+  ])
+}
+
+
+function restoredRecommendationFields(values: DeploymentFormValues): Set<string> {
+  const restored = new Set<string>()
+  for (const path of recommendationFieldPaths) {
+    const [root, nested] = path.split('.')
+    const value = nested
+      ? (values[root as 'generation_defaults'] as Record<string, unknown> | undefined)?.[nested]
+      : values[root as keyof DeploymentFormValues]
+    if (value !== undefined && value !== null) restored.add(path)
+  }
+  return restored
+}
+
+
+function sourceSnapshot(recommendation: DeploymentRecommendation): Record<string, RecommendationSource> {
+  const sources: Record<string, RecommendationSource> = {}
+  for (const [field, value] of Object.entries(recommendation.fields)) {
+    if (recommendationFieldPaths.has(field)) sources[field] = value.source
+  }
+  for (const [field, value] of Object.entries(recommendation.generation_defaults)) {
+    const path = `generation_defaults.${field}`
+    if (recommendationFieldPaths.has(path)) sources[path] = value.source
+  }
+  return sources
 }
 
 
 export function DeploymentsPage() {
-  const [form] = Form.useForm<DeploymentFormValues>()
+  const [form] = Form.useForm<DeploymentWizardValues>()
   const [searchParams] = useSearchParams()
+  const screens = Grid.useBreakpoint()
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [editingDeployment, setEditingDeployment] = useState<Deployment | null>(null)
-  const [preview, setPreview] = useState<Record<string, unknown> | null>(null)
+  const [step, setStep] = useState(0)
+  const [editedFields, setEditedFields] = useState<Set<string>>(new Set())
+  const editedFieldsRef = useRef<Set<string>>(new Set())
+  const [advancedDrafts, setAdvancedDrafts] = useState(false)
+  const [draftValidationError, setDraftValidationError] = useState<string | null>(null)
+  const [preview, setPreview] = useState<DeploymentPreview | null>(null)
   const [logsFor, setLogsFor] = useState<Deployment | null>(null)
+  const applyingRecommendation = useRef(false)
   const queryClient = useQueryClient()
+
   const deployments = useQuery({
     queryKey: ['deployments'],
     queryFn: () => api.get<Deployment[]>('/api/deployments'),
     refetchInterval: 8_000,
   })
-  const models = useQuery({ queryKey: ['models'], queryFn: () => api.get<ModelAsset[]>('/api/models') })
+  const models = useQuery({
+    queryKey: ['models'],
+    queryFn: () => api.get<ModelAsset[]>('/api/models'),
+  })
+  const providers = useQuery({
+    queryKey: ['providers'],
+    queryFn: () => api.get<Provider[]>('/api/providers'),
+  })
   const logs = useQuery({
     queryKey: ['deployment-logs', logsFor?.id],
     queryFn: () => api.get<{ logs: string }>(`/api/deployments/${logsFor?.id}/logs?tail=1000`),
@@ -77,26 +187,96 @@ export function DeploymentsPage() {
     refetchInterval: logsFor ? 5_000 : false,
   })
 
-  const selectModel = (modelId: string) => {
-    const model = models.data?.find((item) => item.id === modelId)
+  const watchOptions = useMemo(() => ({ form, preserve: true }), [form])
+  const modelId = Form.useWatch('model_id', watchOptions)
+  const runtime = Form.useWatch('runtime', watchOptions) ?? 'vllm'
+  const image = Form.useWatch('image', watchOptions)
+  const providerId = Form.useWatch('provider_id', watchOptions)
+  const selectedDraftId = Form.useWatch(['speculative', 'draft_model_id'], watchOptions)
+
+  const recommendation = useDeploymentRecommendation({
+    modelId,
+    runtime,
+    image,
+    providerId: providerId || null,
+    enabled: drawerOpen,
+  })
+  const activeRecommendation = useMemo(() => {
+    const data = recommendation.data
+    if (!data || data.model_id !== modelId || data.runtime !== runtime) return undefined
+    return data
+  }, [modelId, recommendation.data, runtime])
+
+  const replaceEditedFields = useCallback((next: Set<string>) => {
+    editedFieldsRef.current = next
+    setEditedFields(next)
+  }, [])
+
+  const applyRecommendation = useCallback((result: DeploymentRecommendation, force: boolean) => {
+    const currentEdited = editedFieldsRef.current
+    applyingRecommendation.current = true
+    form.setFieldsValue(valuesFromRecommendation(result, currentEdited, force))
+    applyingRecommendation.current = false
+    if (force) {
+      const appliedPaths = recommendationPaths(result)
+      replaceEditedFields(new Set([...currentEdited].filter((path) => !appliedPaths.has(path))))
+    }
+    setPreview(null)
+  }, [form, replaceEditedFields])
+
+  useEffect(() => {
+    if (activeRecommendation) applyRecommendation(activeRecommendation, false)
+  }, [activeRecommendation, applyRecommendation])
+
+  useEffect(() => {
+    if (!drawerOpen || form.getFieldValue('provider_id') !== undefined || !providers.data) return
+    const enabledProviders = providers.data.filter((provider) => provider.enabled)
+    const saved = window.localStorage.getItem('dgx-deployment-recommendation-provider')
+    const selected = enabledProviders.length === 1
+      ? enabledProviders[0].id
+      : enabledProviders.some((provider) => provider.id === saved) ? saved ?? '' : ''
+    form.setFieldValue('provider_id', selected)
+  }, [drawerOpen, form, providers.data])
+
+  const resetWizardState = useCallback(() => {
+    setStep(0)
+    replaceEditedFields(new Set())
+    setAdvancedDrafts(false)
+    setDraftValidationError(null)
+    setPreview(null)
+  }, [replaceEditedFields])
+
+  const selectModel = useCallback((selectedModelId: string) => {
+    const model = models.data?.find((item) => item.id === selectedModelId)
     if (!model) return
     const shortName = model.name.split('/').pop() ?? model.name
+    applyingRecommendation.current = true
     form.setFieldsValue({
       name: shortName,
       model_path: model.local_path,
       api_model_name: model.alias ?? shortName.toLowerCase(),
       model_id: model.id,
-      quantization: model.quantization as DeploymentFormValues['quantization'],
+      quantization: 'auto',
+      speculative: null,
+      resource_warning_acknowledged: false,
+      recommendation: null,
     })
-  }
-
-  const openCreate = () => {
-    setEditingDeployment(null)
+    applyingRecommendation.current = false
+    replaceEditedFields(new Set())
+    setAdvancedDrafts(false)
+    setDraftValidationError(null)
     setPreview(null)
+  }, [form, models.data, replaceEditedFields])
+
+  const openCreate = useCallback(() => {
+    setEditingDeployment(null)
+    resetWizardState()
     form.resetFields()
+    applyingRecommendation.current = true
     form.setFieldsValue(defaultValues)
+    applyingRecommendation.current = false
     setDrawerOpen(true)
-  }
+  }, [form, resetWizardState])
 
   const openFromDeployment = (deployment: Deployment, mode: 'edit' | 'clone') => {
     const model = models.data?.find((item) => item.id === deployment.model_id)
@@ -104,32 +284,86 @@ export function DeploymentsPage() {
       message.error('该实例未关联可用的本地模型，无法编辑或克隆')
       return
     }
+    const restored = deploymentToFormValues(deployment, model, mode)
+    resetWizardState()
     setEditingDeployment(mode === 'edit' ? deployment : null)
-    setPreview(null)
-    form.setFieldsValue(deploymentToFormValues(deployment, model, mode))
+    applyingRecommendation.current = true
+    form.resetFields()
+    form.setFieldsValue({
+      ...restored,
+      provider_id: restored.recommendation?.provider_id ?? '',
+    })
+    applyingRecommendation.current = false
+    if (mode === 'edit') replaceEditedFields(restoredRecommendationFields(restored))
+    setAdvancedDrafts(Boolean(restored.speculative))
     setDrawerOpen(true)
   }
 
   useEffect(() => {
-    const modelId = searchParams.get('model')
-    if (modelId && models.data?.some((item) => item.id === modelId)) {
+    const selectedModelId = searchParams.get('model')
+    if (selectedModelId && models.data?.some((item) => item.id === selectedModelId)) {
       openCreate()
-      selectModel(modelId)
+      selectModel(selectedModelId)
     }
-    // The URL model selector should only initialize the drawer when inventory arrives.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [models.data, searchParams])
+  }, [models.data, openCreate, searchParams, selectModel])
 
   const closeDrawer = () => {
     setDrawerOpen(false)
     setEditingDeployment(null)
-    setPreview(null)
+    resetWizardState()
+    form.resetFields()
   }
+
+  const payloadFromForm = useCallback((): DeploymentFormValues => {
+    const values = form.getFieldsValue(true)
+    const { provider_id: _, ...deploymentValues } = values
+    const data = activeRecommendation
+    let provenance: RecommendationProvenance | null = null
+    const snapshot = data?.resource_snapshot
+    if (
+      data?.evidence_hash
+      && typeof snapshot?.total_bytes === 'number'
+      && typeof snapshot.available_bytes === 'number'
+      && typeof snapshot.reserved_bytes === 'number'
+    ) {
+      provenance = {
+        generated_at: data.generated_at,
+        evidence_hash: data.evidence_hash,
+        provider_id: providerId || null,
+        resource_snapshot: {
+          total_bytes: snapshot.total_bytes,
+          available_bytes: snapshot.available_bytes,
+          reserved_bytes: snapshot.reserved_bytes,
+        },
+        modified_fields: [...editedFieldsRef.current].sort(),
+        sources: sourceSnapshot(data),
+      }
+    }
+    const speculative = deploymentValues.speculative?.draft_model_id
+      ? deploymentValues.speculative
+      : null
+    return {
+      ...deploymentValues,
+      route_alias: deploymentValues.route_alias || undefined,
+      generation_defaults: deploymentValues.generation_defaults ?? {},
+      speculative,
+      recommendation: provenance,
+      resource_warning_acknowledged: deploymentValues.resource_warning_acknowledged === true,
+    }
+  }, [activeRecommendation, form, providerId])
+
   const previewMutation = useMutation({
-    mutationFn: (values: DeploymentFormValues) =>
-      api.post<Record<string, unknown>>('/api/deployments/preview', values),
-    onSuccess: setPreview,
-    onError: (error: Error) => message.error(error.message),
+    mutationFn: (values: DeploymentFormValues) => {
+      const suffix = editingDeployment ? `?deployment_id=${encodeURIComponent(editingDeployment.id)}` : ''
+      return api.post<DeploymentPreview>(`/api/deployments/preview${suffix}`, values)
+    },
+    onSuccess: (result) => {
+      setPreview(result)
+      setStep(3)
+    },
+    onError: (error: Error) => {
+      if (!isAbortError(error)) message.error(error.message)
+    },
   })
   const saveMutation = useMutation({
     mutationFn: (values: DeploymentFormValues) => editingDeployment
@@ -140,7 +374,9 @@ export function DeploymentsPage() {
       closeDrawer()
       queryClient.invalidateQueries({ queryKey: ['tasks'] })
     },
-    onError: (error: Error) => message.error(error.message),
+    onError: (error: Error) => {
+      if (!isAbortError(error)) message.error(error.message)
+    },
   })
   const action = useMutation({
     mutationFn: ({ id, actionName }: { id: string; actionName: string }) =>
@@ -151,13 +387,103 @@ export function DeploymentsPage() {
     },
     onError: (error: Error) => message.error(error.message),
   })
-  const runtime = Form.useWatch('runtime', form) ?? 'vllm'
-  const compatibility = preview?.compatibility as {
-    compatible: boolean
-    architectures: string[]
-    reasons: string[]
-  } | undefined
-  const operations = preview?.operations as string[] | undefined
+
+  const handleRetryAI = async () => {
+    try {
+      const refreshed = await recommendation.refreshAI()
+      if (refreshed.model_id === form.getFieldValue('model_id') && refreshed.runtime === form.getFieldValue('runtime')) {
+        applyRecommendation(refreshed, false)
+      }
+    } catch (error) {
+      if (!isAbortError(error)) message.error(error instanceof Error ? error.message : '推荐分析失败')
+    }
+  }
+
+  const handleDraftSelect = (candidate?: DraftCandidate) => {
+    applyingRecommendation.current = true
+    if (!candidate) {
+      form.setFieldValue('speculative', null)
+    } else {
+      const restored = form.getFieldValue('speculative')
+      const keepRestored = restored?.draft_model_id === candidate.model_id
+      const next: SpeculativeSettings = {
+        draft_model_id: candidate.model_id,
+        method: candidate.method ?? 'draft_model',
+        num_speculative_tokens: keepRestored ? restored.num_speculative_tokens : 5,
+        num_steps: keepRestored ? restored.num_steps : undefined,
+        eagle_top_k: keepRestored ? restored.eagle_top_k : undefined,
+        num_draft_tokens: keepRestored ? restored.num_draft_tokens : undefined,
+        manual_review_acknowledged: keepRestored
+          ? restored.manual_review_acknowledged
+          : false,
+      }
+      form.setFieldValue('speculative', next)
+    }
+    applyingRecommendation.current = false
+    replaceEditedFields(new Set([...editedFieldsRef.current, 'speculative.draft_model_id']))
+    setPreview(null)
+    setDraftValidationError(null)
+  }
+
+  const goForward = async () => {
+    if (step === 0) {
+      await form.validateFields(basicFields)
+      setStep(1)
+      return
+    }
+    if (step === 1) {
+      setStep(2)
+      return
+    }
+    if (step === 2) {
+      const selected = activeRecommendation?.draft_candidates.find((item) => item.model_id === selectedDraftId)
+      if (selected?.status === 'review' && !form.getFieldValue(['speculative', 'manual_review_acknowledged'])) {
+        setDraftValidationError('请确认 Draft Model 配对风险')
+        return
+      }
+      const resourceDecision = activeRecommendation?.resource_estimate.decision
+      if (resourceDecision === 'warning' && !form.getFieldValue('resource_warning_acknowledged')) {
+        setDraftValidationError('请确认统一内存资源警告')
+        return
+      }
+      if (resourceDecision === 'blocked') {
+        message.error('资源估算超过 DGX Spark 硬上限，无法生成部署任务')
+        return
+      }
+      previewMutation.mutate(payloadFromForm())
+    }
+  }
+
+  const goBack = () => {
+    if (step === 3) setPreview(null)
+    setStep((current) => Math.max(0, current - 1))
+  }
+
+  const onValuesChange = (changed: Record<string, unknown>) => {
+    if (applyingRecommendation.current) return
+    setPreview(null)
+    setDraftValidationError(null)
+    const changedPaths = flattenChangedFields(changed)
+    replaceEditedFields(new Set([...editedFieldsRef.current, ...changedPaths]))
+    if ('runtime' in changed) {
+      const nextRuntime = changed.runtime as 'vllm' | 'sglang'
+      applyingRecommendation.current = true
+      form.setFieldsValue({
+        image: nextRuntime === 'vllm'
+          ? 'vllm/vllm-openai:v0.27.1'
+          : 'sglang-inkling:specforge',
+        speculative: null,
+        resource_warning_acknowledged: false,
+      })
+      applyingRecommendation.current = false
+      return
+    }
+    if ('image' in changed) {
+      applyingRecommendation.current = true
+      form.setFieldsValue({ speculative: null, resource_warning_acknowledged: false })
+      applyingRecommendation.current = false
+    }
+  }
 
   const operationButtons = (item: Deployment, mobile = false) => (
     <Space wrap>
@@ -199,6 +525,55 @@ export function DeploymentsPage() {
     </Space>
   )
 
+  const stepContent = [
+    <DeploymentBasicsStep
+      key="basics"
+      models={models.data ?? []}
+      providers={providers.data ?? []}
+      runtime={runtime}
+      loading={models.isLoading}
+      providersLoading={providers.isLoading}
+      onModelChange={selectModel}
+      onProviderChange={(selectedProviderId) => {
+        if (selectedProviderId) {
+          window.localStorage.setItem('dgx-deployment-recommendation-provider', selectedProviderId)
+        } else {
+          window.localStorage.removeItem('dgx-deployment-recommendation-provider')
+        }
+        setPreview(null)
+      }}
+    />,
+    <RecommendationStep
+      key="recommendation"
+      recommendation={activeRecommendation}
+      editedFields={editedFields}
+      loading={recommendation.isLoading || recommendation.isFetching}
+      refreshing={recommendation.isFetching}
+      error={recommendation.error}
+      runtime={runtime}
+      onReapplyAll={() => activeRecommendation && applyRecommendation(activeRecommendation, true)}
+      onRetryAI={handleRetryAI}
+    />,
+    <DraftModelStep
+      key="draft"
+      candidates={activeRecommendation?.draft_candidates ?? []}
+      selectedId={selectedDraftId}
+      advanced={advancedDrafts}
+      resourceEstimate={activeRecommendation?.resource_estimate}
+      validationError={draftValidationError}
+      onAdvancedChange={setAdvancedDrafts}
+      onSelect={handleDraftSelect}
+    />,
+    preview
+      ? <DeploymentPreviewStep
+          key="preview"
+          preview={preview}
+          editing={Boolean(editingDeployment)}
+          fallbackRoute={form.getFieldValue('api_model_name')}
+        />
+      : <div key="preview-empty" />,
+  ]
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -225,70 +600,55 @@ export function DeploymentsPage() {
       </QueryState>
       <Drawer
         title={editingDeployment ? `编辑 ${editingDeployment.name}` : '新建模型部署'}
-        width={620}
+        width="min(900px, 100vw)"
         open={drawerOpen}
         onClose={closeDrawer}
-        extra={<Steps size="small" current={preview ? 1 : 0} items={[{ title: '配置' }, { title: '确认' }]} />}
+        destroyOnHidden
       >
+        <Steps
+          className="deployment-wizard-steps"
+          size="small"
+          current={step}
+          direction={screens.md ? 'horizontal' : 'vertical'}
+          items={[
+            { title: '基础模型' },
+            { title: '推荐配置' },
+            { title: 'Draft Model' },
+            { title: '部署预览' },
+          ]}
+        />
         <Form
           form={form}
           layout="vertical"
           initialValues={defaultValues}
-          onFinish={(values) => preview ? saveMutation.mutate(values) : previewMutation.mutate(values)}
-          onValuesChange={(changed) => {
-            setPreview(null)
-            if ('runtime' in changed) {
-              form.setFieldValue('image', changed.runtime === 'vllm'
-                ? 'vllm/vllm-openai:v0.27.1'
-                : 'sglang-inkling:specforge')
-            }
-          }}
+          onValuesChange={onValuesChange}
         >
-          {!preview ? <>
-            <Form.Item name="model_id" label="模型" rules={[{ required: true }]}>
-              <Select loading={models.isLoading} options={models.data?.map((item) => ({ value: item.id, label: item.name }))} onChange={selectModel} />
-            </Form.Item>
-            <Form.Item name="name" label="部署名称" rules={[{ required: true }]}><Input /></Form.Item>
-            <Form.Item name="model_path" label="模型路径" rules={[{ required: true }]}><Input readOnly /></Form.Item>
-            <Form.Item name="api_model_name" label="实例模型名称" rules={[{ required: true }]} tooltip="传给上游运行时的唯一模型名称"><Input /></Form.Item>
-            <Form.Item name="route_alias" label="共享网关别名（可选）" tooltip="多个部署填写相同别名时，网关会在健康实例间轮询"><Input placeholder="例如 qwen-production" /></Form.Item>
-            <Form.Item name="runtime" label="推理运行时"><Segmented block options={[{ label: 'vLLM', value: 'vllm' }, { label: 'SGLang', value: 'sglang' }]} /></Form.Item>
-            <Form.Item name="image" label="ARM64 镜像" rules={[{ required: true }]}>
-              <Select options={(runtime === 'vllm'
-                ? ['vllm/vllm-openai:v0.27.1']
-                : ['sglang-inkling:specforge', 'lmsysorg/sglang:dev-cu13-inkling-dspark'])
-                .map((value) => ({ value, label: value }))} />
-            </Form.Item>
-            <div className="form-grid">
-              <Form.Item name="port" label="主机端口"><InputNumber min={1024} max={65535} /></Form.Item>
-              <Form.Item name="context_length" label="上下文长度"><InputNumber min={1024} step={1024} /></Form.Item>
-              <Form.Item name="max_concurrency" label="最大并发"><InputNumber min={1} max={1024} /></Form.Item>
-              <Form.Item name="max_batched_tokens" label="批处理 Token 上限" tooltip={runtime === 'vllm' ? 'vLLM 每轮调度的最大 Token 数' : '当前 SGLang 适配器不设置此参数'}>
-                <InputNumber min={1024} step={1024} disabled={runtime !== 'vllm'} />
-              </Form.Item>
-              <Form.Item name="quantization" label="量化加载方式"><Select allowClear placeholder="自动检测" options={['auto', 'awq', 'gptq', 'fp8', 'bitsandbytes', 'marlin'].map((value) => ({ value, label: value }))} /></Form.Item>
-              <Form.Item name="trust_remote_code" label="信任远程代码" valuePropName="checked"><Switch /></Form.Item>
-            </div>
-            <Form.Item name="memory_fraction" label="统一内存比例"><Slider min={0.05} max={0.98} step={0.01} tooltip={{ formatter: (value) => `${Math.round((value ?? 0) * 100)}%` }} /></Form.Item>
-          </> : <div className="deployment-preview">
-            {editingDeployment && <Alert type="warning" showIcon message="更新会替换当前容器" description="旧容器会先停止并保留到新实例通过健康检查；更新失败时自动恢复旧容器。" />}
-            <Alert type={compatibility?.compatible ? 'success' : 'warning'} showIcon message={compatibility?.compatible ? '模型结构与所选运行时兼容' : '兼容性检查需要确认'} description={compatibility?.compatible ? `检测到 ${compatibility.architectures.join(', ') || 'Transformers'} 架构` : compatibility?.reasons.join('；')} />
-            <Descriptions bordered size="small" column={1} items={[
-              { key: 'runtime', label: '运行时', children: String(preview.runtime) },
-              { key: 'image', label: 'ARM64 镜像', children: String(preview.image) },
-              { key: 'container', label: '容器', children: String(preview.container_name) },
-              { key: 'port', label: '主机端口', children: String(preview.port) },
-              { key: 'disk', label: '模型磁盘', children: formatBytes(Number(preview.estimated_disk_bytes ?? 0)) },
-              { key: 'memory', label: '估算统一内存', children: formatBytes(Number(preview.estimated_memory_bytes ?? 0)) },
-              { key: 'route', label: '网关模型名', children: String(preview.route_alias || form.getFieldValue('api_model_name')) },
-            ]} />
-            <div><Typography.Title level={5}>执行动作</Typography.Title><List size="small" dataSource={operations} renderItem={(item) => <List.Item>{item}</List.Item>} /></div>
-            <div><Typography.Title level={5}>调用示例</Typography.Title><pre><code>{String(preview.api_example)}</code></pre></div>
-            <Alert type="info" showIcon message="失败回滚" description={String(preview.rollback)} />
-          </div>}
-          <Button type="primary" htmlType="submit" block loading={previewMutation.isPending || saveMutation.isPending}>
-            {preview ? (editingDeployment ? '确认并创建更新任务' : '确认并创建任务') : '检查部署配置'}
-          </Button>
+          {stepContent[step]}
+          <div className="deployment-wizard-actions">
+            <Button aria-label="上一步" icon={<LeftOutlined />} disabled={step === 0} onClick={goBack}>上一步</Button>
+            {step < 3 ? (
+              <Button
+                type="primary"
+                iconPosition="end"
+                icon={<RightOutlined />}
+                loading={previewMutation.isPending}
+                onClick={goForward}
+                aria-label={step === 2 ? '生成部署预览' : '下一步'}
+              >
+                {step === 2 ? '生成部署预览' : '下一步'}
+              </Button>
+            ) : (
+              <Button
+                type="primary"
+                icon={<RocketOutlined />}
+                loading={saveMutation.isPending}
+                onClick={() => saveMutation.mutate(payloadFromForm())}
+                aria-label={editingDeployment ? '确认并创建更新任务' : '确认并创建任务'}
+              >
+                {editingDeployment ? '确认并创建更新任务' : '确认并创建任务'}
+              </Button>
+            )}
+          </div>
         </Form>
       </Drawer>
       <Drawer title={`${logsFor?.name ?? ''} 日志`} width={760} open={Boolean(logsFor)} onClose={() => setLogsFor(null)}>

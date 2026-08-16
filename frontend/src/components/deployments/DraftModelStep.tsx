@@ -1,0 +1,146 @@
+import { Alert, Checkbox, Collapse, Form, InputNumber, Radio, Switch, Tag, Typography } from 'antd'
+
+import type { DraftCandidate, ResourceEstimate } from '../../api/types'
+import { formatBytes } from '../../utils/format'
+
+
+interface DraftModelStepProps {
+  candidates: DraftCandidate[]
+  selectedId?: string
+  advanced: boolean
+  resourceEstimate?: Partial<ResourceEstimate>
+  validationError?: string | null
+  onAdvancedChange: (value: boolean) => void
+  onSelect: (candidate?: DraftCandidate) => void
+}
+
+const statusPresentation = {
+  compatible: ['兼容', 'success'],
+  review: ['待确认', 'warning'],
+  incompatible: ['不兼容', 'error'],
+} as const
+
+
+export function DraftModelStep({
+  candidates,
+  selectedId,
+  advanced,
+  resourceEstimate,
+  validationError,
+  onAdvancedChange,
+  onSelect,
+}: DraftModelStepProps) {
+  const visibleCandidates = advanced
+    ? candidates
+    : candidates.filter((candidate) => candidate.status === 'compatible')
+  const selectedCandidate = candidates.find((candidate) => candidate.model_id === selectedId)
+  const resourceDecision = resourceEstimate?.decision
+
+  return (
+    <section className="deployment-step" aria-labelledby="draft-model-heading">
+      <div className="deployment-step-heading deployment-step-heading-actions">
+        <div>
+          <Typography.Title level={4} id="draft-model-heading">Draft Model</Typography.Title>
+          <Typography.Text type="secondary">附带兼容的本地 Draft Model 以启用推测解码。</Typography.Text>
+        </div>
+        <label className="draft-advanced-toggle">
+          <span>显示待确认及不兼容模型</span>
+          <Switch checked={advanced} onChange={onAdvancedChange} aria-label="显示待确认及不兼容模型" />
+        </label>
+      </div>
+      {validationError && <Alert type="error" showIcon message={validationError} />}
+      <Radio.Group
+        className="draft-candidate-list"
+        value={selectedId ?? ''}
+        onChange={(event) => {
+          const candidate = candidates.find((item) => item.model_id === event.target.value)
+          onSelect(candidate)
+        }}
+      >
+        <div className="draft-candidate draft-candidate-none">
+          <Radio value="">不使用 Draft Model</Radio>
+        </div>
+        {visibleCandidates.map((candidate) => {
+          const [label, color] = statusPresentation[candidate.status]
+          return (
+            <div className="draft-candidate" key={candidate.model_id}>
+              <Radio value={candidate.model_id} disabled={candidate.status === 'incompatible'}>
+                <span className="draft-candidate-label">
+                  <strong className="draft-candidate-name">{candidate.name}</strong>
+                  <Tag color={color}>{label}</Tag>
+                  {candidate.method && <Tag>{candidate.method}</Tag>}
+                </span>
+                <span className="draft-candidate-details">
+                  {candidate.reasons.join('；')}
+                  {' · '}{formatBytes(candidate.size_bytes)}
+                </span>
+              </Radio>
+            </div>
+          )
+        })}
+      </Radio.Group>
+      {selectedCandidate?.status === 'review' && (
+        <Alert
+          type="warning"
+          showIcon
+          message="该 Draft Model 需要人工确认"
+          description={selectedCandidate.reasons.join('；')}
+          action={(
+            <Form.Item
+              name={['speculative', 'manual_review_acknowledged']}
+              valuePropName="checked"
+              noStyle
+            >
+              <Checkbox>我已核对该 Draft Model 的兼容性风险</Checkbox>
+            </Form.Item>
+          )}
+        />
+      )}
+      {selectedCandidate && (
+        <Collapse
+          items={[{
+            key: 'speculative-tuning',
+            label: '推测解码高级参数',
+            children: (
+              <div className="form-grid">
+                <Form.Item name={['speculative', 'num_speculative_tokens']} label="每轮推测 Token">
+                  <InputNumber min={1} max={64} />
+                </Form.Item>
+                <Form.Item name={['speculative', 'num_steps']} label="推测步数">
+                  <InputNumber min={1} max={32} />
+                </Form.Item>
+                <Form.Item name={['speculative', 'eagle_top_k']} label="EAGLE Top K">
+                  <InputNumber min={1} max={32} />
+                </Form.Item>
+                <Form.Item name={['speculative', 'num_draft_tokens']} label="Draft Token 数">
+                  <InputNumber min={1} max={256} />
+                </Form.Item>
+              </div>
+            ),
+          }]}
+        />
+      )}
+      {resourceDecision === 'warning' && (
+        <Alert
+          type="warning"
+          showIcon
+          message="当前可用统一内存可能不足"
+          description={resourceEstimate?.reasons?.join('；')}
+          action={(
+            <Form.Item name="resource_warning_acknowledged" valuePropName="checked" noStyle>
+              <Checkbox>我了解资源不足可能导致部署失败</Checkbox>
+            </Form.Item>
+          )}
+        />
+      )}
+      {resourceDecision === 'blocked' && (
+        <Alert
+          type="error"
+          showIcon
+          message="资源估算超过 DGX Spark 硬上限"
+          description={resourceEstimate?.reasons?.join('；')}
+        />
+      )}
+    </section>
+  )
+}
