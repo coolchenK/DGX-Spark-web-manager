@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,6 +79,18 @@ def valid_spec_payload(tmp_path):
             },
         },
     }
+
+
+def legacy_spec_fingerprint(spec: DeploymentSpec) -> str:
+    public = (
+        spec.public_dump()
+        if isinstance(spec, ResolvedDeploymentSpec)
+        else spec.model_dump(mode="json")
+    )
+    canonical = json.dumps(
+        public, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def valid_recommendation_payload():
@@ -1803,17 +1816,16 @@ def test_create_handler_recovers_committed_target_before_blocked_live_preflight(
     )
     with database.session_factory() as db:
         preview = service.preview(db, original)
-        preview["spec_fingerprint"] = "0" * 64
         deployment = Deployment(
             name="base",
             model_id=model_id,
             runtime="vllm",
             container_id="committed-container",
-            container_name="dgx-base",
-            endpoint_url="http://127.0.0.1:8100",
+            container_name="stale-container-name",
+            endpoint_url="http://127.0.0.1:9999",
             api_model_name="base",
-            status="running",
-            health="healthy",
+            status="exited",
+            health="unhealthy",
             managed=True,
             image="vllm:test",
             port=8100,
@@ -1826,7 +1838,7 @@ def test_create_handler_recovers_committed_target_before_blocked_live_preflight(
     labels = service._expected_container_labels(
         stored_spec,
         task_id="original-task",
-        spec_fingerprint=preview["spec_fingerprint"],
+        spec_fingerprint=legacy_spec_fingerprint(stored_spec),
     )
 
     class Container:
@@ -1861,6 +1873,89 @@ def test_create_handler_recovers_committed_target_before_blocked_live_preflight(
     assert result["deployment_id"] == deployment_id
     assert result["idempotent"] is True
     assert blocked.calls == []
+    with database.session_factory() as db:
+        recovered = db.get(Deployment, deployment_id)
+        assert recovered.status == "running"
+        assert recovered.health == "healthy"
+        assert recovered.container_name == "dgx-base"
+        assert recovered.endpoint_url == "http://127.0.0.1:8100"
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_committed_recovery_rejects_different_full_fingerprint(
+    tmp_path, monkeypatch, operation
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / f'fingerprint-{operation}.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+    with database.session_factory() as db:
+        preview = service.preview(db, spec)
+        deployment = Deployment(
+            name=spec.name,
+            model_id=model_id,
+            runtime=spec.runtime,
+            container_id="committed-container",
+            container_name="dgx-base",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name=spec.api_model_name,
+            status="running",
+            health="healthy",
+            managed=True,
+            image=spec.image,
+            port=spec.port,
+            config=preview,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+    different_spec = spec.model_copy(update={"context_length": 65536})
+    labels = service._expected_container_labels(
+        spec,
+        task_id="original-task",
+        spec_fingerprint=deployment_service.deployment_spec_fingerprint(
+            different_spec
+        ),
+        deployment_id=deployment_id if operation == "update" else None,
+    )
+
+    class Container:
+        id = "committed-container"
+        name = "dgx-base"
+        status = "running"
+        attrs = {"Config": {"Labels": labels}}
+
+    container = Container()
+    containers = type(
+        "Containers", (), {"get": lambda _self, _identifier: container}
+    )()
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": containers})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(ValueError, match="container labels do not match"):
+        if operation == "create":
+            service.create_handler(HandlerContext(), spec.model_dump(mode="json"))
+        else:
+            service.update_handler(
+                HandlerContext(),
+                {"deployment_id": deployment_id, "spec": spec.model_dump(mode="json")},
+            )
 
 
 def test_create_handler_rejects_orphan_container_with_incomplete_labels(
@@ -2089,11 +2184,11 @@ def test_update_recovers_committed_target_and_keeps_unmanaged_backup(
             model_id=model_id,
             runtime=spec.runtime,
             container_id="replacement-container",
-            container_name="dgx-base",
-            endpoint_url="http://127.0.0.1:8100",
+            container_name="stale-container-name",
+            endpoint_url="http://127.0.0.1:9999",
             api_model_name=spec.api_model_name,
-            status="running",
-            health="healthy",
+            status="exited",
+            health="unhealthy",
             managed=True,
             image=spec.image,
             port=spec.port,
@@ -2113,8 +2208,8 @@ def test_update_recovers_committed_target_and_keeps_unmanaged_backup(
 
     class Replacement:
         id = "replacement-container"
-        name = "dgx-base"
-        status = "running"
+        name = "actual-container-name"
+        status = "exited"
         attrs = {"Config": {"Labels": labels}}
 
         def start(self):
@@ -2162,6 +2257,176 @@ def test_update_recovers_committed_target_and_keeps_unmanaged_backup(
     assert blocked.calls == []
     assert backup.removed is False
     assert any("backup cleanup conflict" in message for message in context.messages)
+    assert replacement.status == "running"
+    with database.session_factory() as db:
+        recovered = db.get(Deployment, deployment_id)
+        assert recovered.status == "running"
+        assert recovered.health == "healthy"
+        assert recovered.container_name == "actual-container-name"
+        assert recovered.endpoint_url == "http://127.0.0.1:8100"
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_committed_recovery_rejects_wrong_deployment_label(
+    tmp_path, monkeypatch, operation
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'wrong-deployment-label.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+    with database.session_factory() as db:
+        preview = service.preview(db, spec)
+        deployment = Deployment(
+            name=spec.name,
+            model_id=model_id,
+            runtime=spec.runtime,
+            container_id="replacement-container",
+            container_name="dgx-base",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name=spec.api_model_name,
+            status="running",
+            health="healthy",
+            managed=True,
+            image=spec.image,
+            port=spec.port,
+            config=preview,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+    labels = service._expected_container_labels(
+        spec,
+        task_id="original-task",
+        spec_fingerprint=deployment_service.deployment_spec_fingerprint(spec),
+        deployment_id="another-deployment",
+    )
+
+    class Container:
+        id = "replacement-container"
+        name = "dgx-base"
+        status = "running"
+        attrs = {"Config": {"Labels": labels}}
+
+    container = Container()
+    containers = type(
+        "Containers", (), {"get": lambda _self, _identifier: container}
+    )()
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": containers})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(ValueError, match="container labels do not match"):
+        if operation == "create":
+            service.create_handler(HandlerContext(), spec.model_dump(mode="json"))
+        else:
+            service.update_handler(
+                HandlerContext(),
+                {"deployment_id": deployment_id, "spec": spec.model_dump(mode="json")},
+            )
+
+
+def test_committed_recovery_does_not_overwrite_concurrent_deployment_change(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'concurrent-recovery.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+    with database.session_factory() as db:
+        preview = service.preview(db, spec)
+        deployment = Deployment(
+            name=spec.name,
+            model_id=model_id,
+            runtime=spec.runtime,
+            container_id="replacement-container",
+            container_name="dgx-base",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name=spec.api_model_name,
+            status="exited",
+            health="unhealthy",
+            managed=True,
+            image=spec.image,
+            port=spec.port,
+            config=preview,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+    labels = service._expected_container_labels(
+        spec,
+        task_id="original-task",
+        spec_fingerprint=deployment_service.deployment_spec_fingerprint(spec),
+        deployment_id=deployment_id,
+    )
+
+    class Container:
+        id = "replacement-container"
+        name = "dgx-base"
+        status = "running"
+        attrs = {"Config": {"Labels": labels}}
+
+    container = Container()
+
+    class Containers:
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise docker.errors.NotFound("missing")
+
+    def concurrent_change(*_args, **_kwargs):
+        with database.session_factory() as db:
+            changed = db.get(Deployment, deployment_id)
+            changed.container_id = "concurrent-container"
+            changed.container_name = "concurrent-name"
+            changed.status = "starting"
+            db.commit()
+        return True
+
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": Containers()})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", concurrent_change)
+
+    with pytest.raises(ValueError, match="changed while recovery was running"):
+        service.update_handler(
+            HandlerContext(),
+            {"deployment_id": deployment_id, "spec": spec.model_dump(mode="json")},
+        )
+
+    with database.session_factory() as db:
+        changed = db.get(Deployment, deployment_id)
+        assert changed.container_id == "concurrent-container"
+        assert changed.container_name == "concurrent-name"
+        assert changed.status == "starting"
 
 
 def test_create_app_shares_preflight_dependencies(settings):

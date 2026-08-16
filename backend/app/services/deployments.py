@@ -48,11 +48,14 @@ def resolve_host_model_mount(
     raise ValueError("Model path is outside configured model roots")
 
 
-def deployment_spec_fingerprint(spec: DeploymentSpec) -> str:
+def _deployment_spec_fingerprint(
+    spec: DeploymentSpec, *, include_model_path: bool
+) -> str:
     public = spec.public_dump() if isinstance(spec, ResolvedDeploymentSpec) else spec.model_dump(
         mode="json"
     )
-    public.pop("model_path", None)
+    if not include_model_path:
+        public.pop("model_path", None)
     canonical = json.dumps(
         public,
         sort_keys=True,
@@ -60,6 +63,10 @@ def deployment_spec_fingerprint(spec: DeploymentSpec) -> str:
         ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def deployment_spec_fingerprint(spec: DeploymentSpec) -> str:
+    return _deployment_spec_fingerprint(spec, include_model_path=False)
 
 
 class DeploymentService:
@@ -315,15 +322,26 @@ class DeploymentService:
         *,
         require_task: bool = True,
         require_deployment: bool = True,
-        require_fingerprint: bool = True,
+        accepted_fingerprints: set[str] | None = None,
     ) -> None:
         labels = (container.attrs.get("Config") or {}).get("Labels") or {}
         for key, value in expected.items():
             if not require_task and key == f"{LABEL_PREFIX}task-id":
                 continue
-            if not require_deployment and key == f"{LABEL_PREFIX}deployment-id":
+            if (
+                not require_deployment
+                and key == f"{LABEL_PREFIX}deployment-id"
+                and key not in labels
+            ):
                 continue
-            if not require_fingerprint and key == f"{LABEL_PREFIX}spec-fingerprint":
+            if (
+                accepted_fingerprints is not None
+                and key == f"{LABEL_PREFIX}spec-fingerprint"
+            ):
+                if labels.get(key) not in accepted_fingerprints:
+                    raise ValueError(
+                        "Existing container labels do not match this task and spec"
+                    )
                 continue
             if labels.get(key) != value:
                 raise ValueError("Existing container labels do not match this task and spec")
@@ -349,6 +367,21 @@ class DeploymentService:
             return deployment_spec_fingerprint(DeploymentSpec.model_validate(stored_spec))
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _stored_container_fingerprints(deployment: Deployment) -> set[str]:
+        config = deployment.config if isinstance(deployment.config, Mapping) else {}
+        stored_spec = config.get("spec")
+        if not isinstance(stored_spec, Mapping):
+            return set()
+        try:
+            spec = DeploymentSpec.model_validate(stored_spec)
+        except (TypeError, ValueError):
+            return set()
+        return {
+            deployment_spec_fingerprint(spec),
+            _deployment_spec_fingerprint(spec, include_model_path=True),
+        }
 
     def _adapter_for_spec(self, spec: DeploymentSpec) -> RuntimeAdapter:
         adapter = self.adapter(spec.runtime)
@@ -408,9 +441,17 @@ class DeploymentService:
         *,
         cleanup_backup: bool,
     ) -> dict[str, Any]:
+        deployment_id = deployment.id
+        container_id = deployment.container_id
+        original_state = (
+            deployment.status,
+            deployment.health,
+            deployment.container_name,
+            deployment.endpoint_url,
+        )
         adapter = self._adapter_for_spec(spec)
         client = self.docker_client()
-        target = self._get_container_optional(client, deployment.container_id)
+        target = self._get_container_optional(client, container_id)
         if target is None:
             raise ValueError("Persisted replacement container was not found")
         expected_labels = self._expected_container_labels(
@@ -423,19 +464,44 @@ class DeploymentService:
             target,
             expected_labels,
             require_task=False,
-            require_deployment=False,
-            require_fingerprint=False,
+            require_deployment=cleanup_backup,
+            accepted_fingerprints=self._stored_container_fingerprints(deployment),
         )
         if target.status != "running":
             adapter.start(target)
         endpoint = f"http://127.0.0.1:{spec.port}"
         if not self.wait_for_health(context, endpoint, adapter=adapter):
             raise RuntimeError("Persisted replacement container is unhealthy")
+        with self.session_factory() as db:
+            current = db.scalar(
+                select(Deployment)
+                .where(Deployment.id == deployment_id)
+                .with_for_update()
+            )
+            current_state = (
+                current.status,
+                current.health,
+                current.container_name,
+                current.endpoint_url,
+            ) if current is not None else None
+            if (
+                current is None
+                or current.container_id != container_id
+                or not current.managed
+                or current_state != original_state
+                or not self._deployment_matches_spec(current, spec)
+            ):
+                raise ValueError("Deployment changed while recovery was running")
+            current.status = "running"
+            current.health = "healthy"
+            current.container_name = target.name
+            current.endpoint_url = endpoint
+            db.commit()
         if cleanup_backup:
-            self._cleanup_committed_backup(context, client, target, deployment.id)
+            self._cleanup_committed_backup(context, client, target, deployment_id)
         return {
-            "deployment_id": deployment.id,
-            "container_name": deployment.container_name,
+            "deployment_id": deployment_id,
+            "container_name": target.name,
             "endpoint_url": endpoint,
             "idempotent": True,
         }
