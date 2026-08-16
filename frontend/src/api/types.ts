@@ -165,6 +165,11 @@ export interface HuggingFaceModel {
   gated: boolean
   last_modified: string | null
   tags: string[]
+  spark_compatibility: {
+    level: 'recommended' | 'compatible' | 'review'
+    score: number
+    reasons: string[]
+  }
 }
 
 export interface HuggingFaceModelInfo {

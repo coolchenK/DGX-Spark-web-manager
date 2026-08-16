@@ -1,4 +1,4 @@
-import { CloudDownloadOutlined, LockOutlined, SearchOutlined } from '@ant-design/icons'
+import { CloudDownloadOutlined, LockOutlined, SearchOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Button, Checkbox, Descriptions, Form, Input, List, Modal, Segmented, Space, Tag, Typography, message } from 'antd'
 import { useState } from 'react'
@@ -9,7 +9,7 @@ import type { HuggingFaceModel, HuggingFaceModelInfo, TaskRecord } from '../api/
 import { PageHeader } from '../components/PageHeader'
 import { QueryState } from '../components/QueryState'
 import { formatBytes } from '../utils/format'
-import { buildDownloadPatterns, type DownloadFileMode } from '../utils/huggingface'
+import { buildDownloadPatterns, getSparkCompatibilityPresentation, type DownloadFileMode } from '../utils/huggingface'
 
 
 export function HuggingFacePage() {
@@ -30,7 +30,12 @@ export function HuggingFacePage() {
     <div className="page-stack">
       <PageHeader title="Hugging Face" description="搜索、检查并下载模型到本机缓存" />
       <form className="hf-search" onSubmit={(event) => { event.preventDefault(); setActiveQuery(query.trim()) }}><Input size="large" allowClear prefix={<SearchOutlined />} placeholder="搜索模型名称，例如 Qwen 或 Nemotron" value={query} onChange={(event) => setQuery(event.target.value)} /><Button size="large" type="primary" htmlType="submit" disabled={!query.trim()}>搜索</Button></form>
-      {!activeQuery ? <div className="search-idle"><CloudDownloadOutlined /><h2>查找 Hugging Face 模型</h2><p>搜索结果会显示任务类型、受限状态和社区使用情况。</p></div> : <QueryState loading={results.isLoading} error={results.error} empty={!results.data?.length}><List className="hf-results" dataSource={results.data} renderItem={(model) => <List.Item actions={[<Button key="download" icon={<CloudDownloadOutlined />} onClick={() => setSelected(model)}>下载</Button>]}><List.Item.Meta title={<Space><strong>{model.id}</strong>{model.gated && <Tag icon={<LockOutlined />} color="warning">需授权</Tag>}</Space>} description={<Space wrap><Tag>{model.pipeline_tag ?? '未分类'}</Tag><Typography.Text type="secondary">{model.downloads.toLocaleString()} 次下载</Typography.Text><Typography.Text type="secondary">{model.likes.toLocaleString()} 赞</Typography.Text></Space>} /></List.Item>} /></QueryState>}
+      {!activeQuery ? <div className="search-idle"><CloudDownloadOutlined /><h2>查找 Hugging Face 模型</h2><p>搜索结果会显示任务类型、受限状态和社区使用情况。</p></div> : <QueryState loading={results.isLoading} error={results.error} empty={!results.data?.length}><List className="hf-results" dataSource={results.data} renderItem={(model) => {
+        const compatibility = getSparkCompatibilityPresentation(model.spark_compatibility.level)
+        const compatibilityReasons = model.spark_compatibility.reasons.slice(0, 2)
+
+        return <List.Item actions={[<Button key="download" icon={<CloudDownloadOutlined />} onClick={() => setSelected(model)}>下载</Button>]}><List.Item.Meta title={<div className="hf-result-title"><strong>{model.id}</strong><Tag className={`hf-spark-tag hf-spark-tag-${model.spark_compatibility.level}`} icon={<ThunderboltOutlined />} color={compatibility.color}>{compatibility.label}</Tag>{model.gated && <Tag icon={<LockOutlined />} color="warning">需授权</Tag>}</div>} description={<div className="hf-result-meta"><Tag>{model.pipeline_tag ?? '未分类'}</Tag><Typography.Text type="secondary">{model.downloads.toLocaleString()} 次下载</Typography.Text><Typography.Text type="secondary">{model.likes.toLocaleString()} 赞</Typography.Text><Typography.Text className="hf-compatibility-reason" type="secondary">{compatibilityReasons.length ? compatibilityReasons.join(' · ') : '模型元数据不足'}</Typography.Text></div>} /></List.Item>
+      }} /></QueryState>}
       <Modal title={`下载 ${selected?.id ?? ''}`} open={Boolean(selected)} onCancel={() => { setSelected(null); setFileMode('all'); setSelectedFiles([]) }} footer={null} width={720} destroyOnClose>
         <QueryState loading={details.isLoading} error={details.error}>
           {details.data && (
