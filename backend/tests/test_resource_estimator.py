@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import math
+
+import pytest
+from app.services.resource_estimator import (
+    ResourceEstimate,
+    ResourceEstimator,
+    clamp_context_length,
+    kv_cache_bytes,
+    reserve_bytes,
+)
+
+GiB = 1024**3
+
+
+def test_kv_cache_formula_uses_grouped_query_attention() -> None:
+    assert kv_cache_bytes(
+        {
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+        },
+        context_length=8192,
+        max_concurrency=2,
+    ) == 2 * 32 * 8 * (4096 // 32) * (8192 * 2) * 2
+
+
+def test_kv_cache_missing_architecture_is_zero() -> None:
+    assert kv_cache_bytes({}, context_length=8192, max_concurrency=2) == 0
+    assert kv_cache_bytes(
+        {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32},
+        context_length=8192,
+        max_concurrency=2,
+    ) > 0
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, math.inf, "4"])
+def test_kv_cache_rejects_invalid_architecture_values(value: object) -> None:
+    assert kv_cache_bytes(
+        {
+            "hidden_size": value,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+        },
+        context_length=8192,
+        max_concurrency=2,
+    ) == 0
+
+
+def test_reserve_bytes_uses_floor_and_minimum() -> None:
+    assert reserve_bytes(128 * GiB, 0.10, 8 * GiB) == 13_743_895_347
+    assert reserve_bytes(1, 0.10, 8 * GiB) == 8 * GiB
+
+
+def test_resource_estimate_uses_host_memory_once() -> None:
+    estimator = ResourceEstimator(reserve_fraction=0.10, reserve_min_bytes=8 * GiB)
+    estimate = estimator.estimate(
+        model_size_bytes=20 * GiB,
+        draft_size_bytes=2 * GiB,
+        config={
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+        },
+        context_length=8192,
+        max_concurrency=2,
+        system_memory={"total_bytes": 128 * GiB, "available_bytes": 80 * GiB},
+    )
+    assert estimate.total_bytes == 128 * GiB
+    assert estimate.reserved_bytes == 13_743_895_347
+    assert estimate.required_bytes < estimate.total_bytes
+    assert estimate.decision == "ok"
+
+
+def test_resource_estimate_blocks_physical_overcommit() -> None:
+    estimator = ResourceEstimator(reserve_fraction=0.10, reserve_min_bytes=8 * GiB)
+    estimate = estimator.estimate(
+        model_size_bytes=125 * GiB,
+        draft_size_bytes=0,
+        config={},
+        context_length=32768,
+        max_concurrency=8,
+        system_memory={"total_bytes": 128 * GiB, "available_bytes": 120 * GiB},
+    )
+    assert estimate.decision == "blocked"
+    assert "physical" in estimate.reasons[0].lower()
+
+
+def test_resource_estimate_warns_when_only_current_available_memory_is_short() -> None:
+    estimator = ResourceEstimator(reserve_fraction=0.10, reserve_min_bytes=8 * GiB)
+    estimate = estimator.estimate(
+        model_size_bytes=40 * GiB,
+        draft_size_bytes=0,
+        config={},
+        context_length=4096,
+        max_concurrency=1,
+        system_memory={"total_bytes": 128 * GiB, "available_bytes": 30 * GiB},
+    )
+    assert estimate.decision == "warning"
+
+
+def test_missing_architecture_lowers_confidence_with_reason() -> None:
+    estimate = ResourceEstimator().estimate(
+        model_size_bytes=1 * GiB,
+        config={},
+        context_length=4096,
+        max_concurrency=1,
+        system_memory={"total_bytes": 128 * GiB},
+    )
+    assert estimate.confidence == "low"
+    assert any(
+        "architecture" in reason.lower() or "kv" in reason.lower()
+        for reason in estimate.reasons
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"model_size_bytes": -1}, "model"),
+        ({"context_length": 0}, "context"),
+        ({"max_concurrency": True}, "concurrency"),
+        ({"system_memory": {}}, "total"),
+        ({"system_memory": {"total_bytes": 10, "available_bytes": -1}}, "available"),
+    ],
+)
+def test_estimate_rejects_invalid_inputs(kwargs: dict[str, object], message: str) -> None:
+    base = {
+        "model_size_bytes": 1 * GiB,
+        "config": {},
+        "context_length": 4096,
+        "max_concurrency": 1,
+        "system_memory": {"total_bytes": 128 * GiB},
+    }
+    base.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        ResourceEstimator().estimate(**base)
+
+
+def test_available_memory_is_clamped_to_total() -> None:
+    estimate = ResourceEstimator().estimate(
+        model_size_bytes=1 * GiB,
+        config={},
+        context_length=4096,
+        max_concurrency=1,
+        system_memory={"total_bytes": 128 * GiB, "available_bytes": 256 * GiB},
+    )
+    assert estimate.available_bytes == estimate.total_bytes
+    assert any("clamp" in reason.lower() for reason in estimate.reasons)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"reserve_fraction": -0.1},
+        {"reserve_fraction": True},
+        {"reserve_fraction": math.inf},
+        {"reserve_min_bytes": -1},
+        {"reserve_min_bytes": True},
+        {"reserve_min_bytes": 1.5},
+    ],
+)
+def test_estimator_options_are_strictly_validated(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        ResourceEstimator(**kwargs)
+
+
+def test_context_clamp_retries_until_not_blocked() -> None:
+    calls: list[int] = []
+
+    def factory(context: int) -> ResourceEstimate:
+        calls.append(context)
+        if context > 4096:
+            return ResourceEstimate.blocked("physical memory budget exceeded")
+        return ResourceEstimate(
+            total_bytes=1,
+            available_bytes=1,
+            reserved_bytes=0,
+            weight_bytes=0,
+            draft_weight_bytes=0,
+            kv_cache_bytes=0,
+            runtime_overhead_bytes=0,
+            required_bytes=0,
+            decision="ok",
+            confidence="high",
+            reasons=[],
+        )
+
+    result = clamp_context_length(20000, 16384, factory)
+    assert result.original_context_length == 20000
+    assert result.final_context_length == 4096
+    assert result.explanation
+    assert calls == [16384, 8192, 4096]
+
+
+def test_context_clamp_respects_lower_bound() -> None:
+    calls: list[int] = []
+
+    def factory(context: int) -> ResourceEstimate:
+        calls.append(context)
+        return ResourceEstimate.blocked("always blocked")
+
+    result = clamp_context_length(2048, 2048, factory)
+    assert result.final_context_length == 1024
+    assert calls == [2048, 1024]
+
+
+def test_context_clamp_validates_requested_and_hard_limit() -> None:
+    with pytest.raises(ValueError):
+        clamp_context_length(0, 4096, lambda _: ResourceEstimate.blocked("x"))
+    with pytest.raises(ValueError):
+        clamp_context_length(4096, 512, lambda _: ResourceEstimate.blocked("x"))
