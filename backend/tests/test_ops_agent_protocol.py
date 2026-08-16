@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import struct
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
@@ -462,6 +463,25 @@ def test_frame_reader_rejects_nonstandard_constants_and_duplicate_keys(body):
     assert exc_info.value.__cause__ is None
 
 
+def test_frame_reader_rejects_float_overflow():
+    body = b'{"number":1e9999}'
+    frame = struct.pack(">I", len(body)) + body
+
+    with pytest.raises(ProtocolError, match="^invalid frame JSON$") as exc_info:
+        read_frame(io.BytesIO(frame))
+    assert exc_info.value.__cause__ is None
+
+
+def test_frame_reader_preserves_normal_exponents_and_negative_zero():
+    body = b'{"exponent":-1.25e2,"negative_zero":-0.0}'
+    frame = struct.pack(">I", len(body)) + body
+
+    message = read_frame(io.BytesIO(frame))
+
+    assert message["exponent"] == -125.0
+    assert math.copysign(1.0, message["negative_zero"]) == -1.0
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_outbound_json_rejects_nonstandard_constants(value):
     with pytest.raises(ProtocolError, match="^invalid frame JSON$") as frame_error:
@@ -484,6 +504,53 @@ def test_outbound_json_normalizes_excessive_nesting():
 
     with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
         canonical_bytes(value)
+    assert canonical_error.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {1: "integer", "1": "string"},
+        {None: "none", "null": "string"},
+        {"nested": {1: "integer"}},
+        {"tuple": (1, 2)},
+    ],
+    ids=["integer-key-collision", "none-key-collision", "nested-key", "tuple-value"],
+)
+def test_outbound_json_rejects_values_that_cannot_round_trip(message):
+    with pytest.raises(ProtocolError, match="^invalid frame JSON$") as frame_error:
+        encode_frame(message)
+    assert frame_error.value.__cause__ is None
+
+    with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
+        canonical_bytes(message)
+    assert canonical_error.value.__cause__ is None
+
+
+def test_frame_round_trip_is_closed_over_strict_json_values():
+    message = {
+        "string": "\u8bb0",
+        "integer": 1,
+        "float": -125.0,
+        "boolean": True,
+        "null": None,
+        "array": [1, "two", False, None],
+        "nested": {"key": "value"},
+    }
+
+    assert read_frame(io.BytesIO(encode_frame(message))) == message
+
+
+def test_outbound_json_normalizes_circular_references():
+    message = {}
+    message["self"] = message
+
+    with pytest.raises(ProtocolError, match="^invalid frame JSON$") as frame_error:
+        encode_frame(message)
+    assert frame_error.value.__cause__ is None
+
+    with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
+        canonical_bytes(message)
     assert canonical_error.value.__cause__ is None
 
 

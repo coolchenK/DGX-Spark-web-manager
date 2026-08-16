@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import struct
 import threading
@@ -66,12 +67,46 @@ def _validate_max_age(max_age: Any) -> None:
         raise ProtocolError("invalid max_age")
 
 
+def _validate_json_tree(value: Any) -> None:
+    active_containers: set[int] = set()
+    stack = [(value, False)]
+    while stack:
+        current, leaving = stack.pop()
+        if leaving:
+            active_containers.remove(id(current))
+            continue
+
+        if isinstance(current, dict):
+            identifier = id(current)
+            if identifier in active_containers:
+                raise ValueError("circular JSON value")
+            active_containers.add(identifier)
+            stack.append((current, True))
+            for key, item in current.items():
+                if not isinstance(key, str):
+                    raise TypeError("JSON object keys must be strings")
+                stack.append((item, False))
+        elif isinstance(current, list):
+            identifier = id(current)
+            if identifier in active_containers:
+                raise ValueError("circular JSON value")
+            active_containers.add(identifier)
+            stack.append((current, True))
+            stack.extend((item, False) for item in current)
+        elif isinstance(current, float):
+            if not math.isfinite(current):
+                raise ValueError("non-finite JSON number")
+        elif current is not None and not isinstance(current, (str, int, bool)):
+            raise TypeError("unsupported JSON value")
+
+
 def canonical_bytes(message: dict[str, Any]) -> bytes:
     """Serialize a JSON object deterministically, excluding its top-level signature."""
     if not isinstance(message, dict):
         raise ProtocolError("message must be a JSON object")
     unsigned = {key: value for key, value in message.items() if key != "signature"}
     try:
+        _validate_json_tree(unsigned)
         encoded = json.dumps(
             unsigned,
             sort_keys=True,
@@ -235,6 +270,7 @@ def _json_payload(message: dict[str, Any]) -> bytes:
     if not isinstance(message, dict):
         raise ProtocolError("frame must contain a JSON object")
     try:
+        _validate_json_tree(message)
         payload = json.dumps(
             message,
             separators=(",", ":"),
@@ -296,6 +332,13 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
 def read_frame(reader: BinaryIO) -> dict[str, Any]:
     """Read exactly one bounded frame from a socket or binary stream."""
     header = _read_exact(reader, 4)
@@ -310,9 +353,10 @@ def read_frame(reader: BinaryIO) -> dict[str, Any]:
         message = json.loads(
             payload.decode("utf-8"),
             parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_float,
             object_pairs_hook=_reject_duplicate_keys,
         )
-    except (UnicodeDecodeError, ValueError, RecursionError):
+    except (UnicodeDecodeError, ValueError, OverflowError, RecursionError):
         raise ProtocolError("invalid frame JSON") from None
     if not isinstance(message, dict):
         raise ProtocolError("frame must contain a JSON object")
