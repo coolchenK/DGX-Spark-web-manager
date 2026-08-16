@@ -91,6 +91,20 @@ SAFE_DEPLOYMENT_CONTEXT_FIELDS = frozenset(
         "size_bytes",
     }
 )
+SAFE_DEPLOYMENT_RESOURCE_FIELDS = frozenset(
+    {
+        "available_bytes",
+        "draft_weight_bytes",
+        "kv_cache_bytes",
+        "memory_bytes",
+        "required_bytes",
+        "reserved_bytes",
+        "runtime_overhead_bytes",
+        "size_bytes",
+        "total_bytes",
+        "weight_bytes",
+    }
+)
 SAFE_RUNTIME_CAPABILITY_FIELDS = frozenset(
     {
         "runtime",
@@ -102,6 +116,25 @@ SAFE_RUNTIME_CAPABILITY_FIELDS = frozenset(
         "method_mapping",
         "speculative_transport",
     }
+)
+SENSITIVE_CARD_PATTERNS = (
+    (
+        re.compile(r"(?im)^[ \t]*authorization[ \t]*:[^\r\n]*"),
+        "Authorization: [REDACTED]",
+    ),
+    (re.compile(r"(?i)\bbearer\s+[^\s\"'`]+"), "Bearer [REDACTED]"),
+    (
+        re.compile(r"(?i)\b(api[_-]?key)\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"),
+        r"\1=[REDACTED]",
+    ),
+    (re.compile(r"(?i)\bhf_[A-Za-z0-9]{10,}"), "[REDACTED_HF_TOKEN]"),
+    (
+        re.compile(
+            r"(?im)\b([A-Za-z_][A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD)"
+            r"[A-Za-z0-9_]*)\s*=\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+        ),
+        r"\1=[REDACTED]",
+    ),
 )
 
 DEFAULT_DEPLOYMENT_VALUES: dict[str, Any] = {
@@ -526,8 +559,56 @@ def _clean_card_text(value: str, max_chars: int) -> str:
     cleaned = "".join(
         character for character in bounded if character in "\n\r\t" or ord(character) >= 32
     )
+    for pattern, replacement in SENSITIVE_CARD_PATTERNS:
+        cleaned = pattern.sub(replacement, cleaned)
     cleaned = re.sub(r"(?i)\b[A-Z]:[\\/][^\s\"'`]+", "[LOCAL_PATH]", cleaned)
-    return re.sub(r"(?<![:A-Za-z0-9])/(?:[^/\s]+/)*[^\s\"'`]*", "[LOCAL_PATH]", cleaned)
+    cleaned = re.sub(
+        r"(?<![:A-Za-z0-9])/(?:[^/\s]+/)*[^\s\"'`]*",
+        "[LOCAL_PATH]",
+        cleaned,
+    )
+    return cleaned[:max_chars]
+
+
+def _bounded_context_string(value: Any, max_chars: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(character for character in value if ord(character) >= 32)
+    return cleaned[:max_chars] or None
+
+
+def _bounded_resource_bytes(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1 << 60:
+        return None
+    return value
+
+
+def _resource_context(value: Mapping[str, Any]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    nested = value.get("resource_estimate")
+    sources = (value, nested if isinstance(nested, Mapping) else {})
+    for source in sources:
+        for key, raw in source.items():
+            if key not in SAFE_DEPLOYMENT_RESOURCE_FIELDS:
+                continue
+            bounded = _bounded_resource_bytes(raw)
+            if bounded is not None:
+                result[key] = bounded
+    return result
+
+
+def _model_context(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    size_bytes = _bounded_resource_bytes(value.get("size_bytes"))
+    if size_bytes is not None:
+        result["size_bytes"] = size_bytes
+    for key in ("quantization", "parameter_count"):
+        bounded = _bounded_context_string(value.get(key), 64)
+        if bounded is not None:
+            result[key] = bounded
+    return result
 
 
 def _bounded_deployments(value: Any) -> list[dict[str, Any]]:
@@ -542,10 +623,12 @@ def _bounded_deployments(value: Any) -> list[dict[str, Any]]:
         if not isinstance(item, Mapping):
             continue
         row = {
-            key: _safe_json_value(raw)
+            key: _bounded_context_string(raw, 128)
             for key, raw in item.items()
-            if key in SAFE_DEPLOYMENT_CONTEXT_FIELDS
+            if key in SAFE_DEPLOYMENT_CONTEXT_FIELDS and key not in SAFE_DEPLOYMENT_RESOURCE_FIELDS
         }
+        row = {key: raw for key, raw in row.items() if raw is not None}
+        row.update(_resource_context(item))
         if row:
             result.append(row)
     return result
@@ -571,11 +654,18 @@ def build_ai_recommendation_request(
     )
     safe_structured_evidence = {
         "config": safe_config,
+        "model": _model_context(structured_evidence.get("model")),
+        "card_data": _safe_json_value(
+            {key: value for key, value in card_data.items() if key in SAFE_CARD_DATA_FIELDS}
+            if isinstance(card_data, Mapping)
+            else {}
+        ),
         "card_deployment_values": structured_evidence.get("card_deployment_values", {}),
         "card_generation_values": structured_evidence.get("card_generation_values", {}),
         "local_generation_values": structured_evidence.get("local_generation_values", {}),
     }
     safe_device_context = {
+        "architecture": _bounded_context_string(device_context.get("architecture"), 64),
         "total_bytes": device_context.get("total_bytes"),
         "available_bytes": device_context.get("available_bytes"),
         "reserved_bytes": device_context.get("reserved_bytes"),
@@ -592,14 +682,7 @@ def build_ai_recommendation_request(
         if field in AI_DEPLOYMENT_FIELDS or field in AI_GENERATION_FIELDS
     ][:32]
     user_data = {
-        "model_card_data": {
-            "card_text": _clean_card_text(card_text, card_max_chars),
-            "card_data": _safe_json_value(
-                {key: value for key, value in card_data.items() if key in SAFE_CARD_DATA_FIELDS}
-                if isinstance(card_data, Mapping)
-                else {}
-            ),
-        },
+        "model_card_data": _clean_card_text(card_text, card_max_chars),
         "structured_evidence": _safe_json_value(safe_structured_evidence),
         "device_context": _safe_json_value(safe_device_context),
         "runtime_capabilities": _safe_json_value(safe_capabilities),
@@ -650,7 +733,7 @@ class _AiKeyLockEntry:
         self.users = 0
 
 
-def _structured_ai_evidence(evidence: ModelEvidence) -> dict[str, Any]:
+def _structured_ai_evidence(evidence: ModelEvidence, target: ModelAsset) -> dict[str, Any]:
     return {
         "config": {
             key: _safe_json_value(value)
@@ -664,6 +747,13 @@ def _structured_ai_evidence(evidence: ModelEvidence) -> dict[str, Any]:
                 if key in SAFE_CARD_DATA_FIELDS
             }
         ),
+        "model": _model_context(
+            {
+                "size_bytes": target.size_bytes,
+                "quantization": target.quantization,
+                "parameter_count": target.parameter_count,
+            }
+        ),
         "card_deployment_values": _safe_json_value(evidence.card_deployment_values),
         "card_generation_values": _safe_json_value(evidence.card_generation_values),
         "local_generation_values": _safe_json_value(evidence.local_generation_values),
@@ -672,15 +762,48 @@ def _structured_ai_evidence(evidence: ModelEvidence) -> dict[str, Any]:
 
 def _database_deployments(db: Session) -> list[dict[str, Any]]:
     rows = db.query(Deployment).order_by(Deployment.name).limit(32).all()
-    return [
-        {
-            "id": row.id,
-            "runtime": row.runtime,
-            "status": row.status,
-            "health": row.health,
-        }
-        for row in rows
-    ]
+    return _bounded_deployments(
+        [
+            {
+                "id": row.id,
+                "runtime": row.runtime,
+                "status": row.status,
+                "health": row.health,
+                "resource_estimate": (
+                    row.config.get("resource_estimate", {})
+                    if isinstance(row.config, Mapping)
+                    else {}
+                ),
+                **(
+                    {
+                        key: value
+                        for key, value in row.config.items()
+                        if key in SAFE_DEPLOYMENT_RESOURCE_FIELDS
+                    }
+                    if isinstance(row.config, Mapping)
+                    else {}
+                ),
+            }
+            for row in rows
+        ]
+    )
+
+
+def _merge_deployment_context(
+    snapshot_deployments: list[dict[str, Any]],
+    database_deployments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = [dict(item) for item in snapshot_deployments]
+    indexes = {
+        item["id"]: index for index, item in enumerate(merged) if isinstance(item.get("id"), str)
+    }
+    for item in database_deployments:
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id in indexes:
+            merged[indexes[item_id]].update(item)
+        elif len(merged) < 32:
+            merged.append(dict(item))
+    return merged[:32]
 
 
 class DeploymentRecommendationService:
@@ -915,6 +1038,7 @@ class DeploymentRecommendationService:
         self,
         *,
         provider: Provider,
+        target: ModelAsset,
         evidence: ModelEvidence,
         requested: list[str],
         device_context: Mapping[str, Any],
@@ -928,23 +1052,27 @@ class DeploymentRecommendationService:
             model=provider.default_model,
             card_text=evidence.card_text,
             unresolved_fields=requested,
-            structured_evidence=_structured_ai_evidence(evidence),
+            structured_evidence=_structured_ai_evidence(evidence, target),
             device_context=device_context,
             runtime_capabilities=capabilities.model_dump(mode="json"),
             card_max_chars=self.card_max_chars,
         )
-        response = httpx.post(
+        body = bytearray()
+        with httpx.stream(
+            "POST",
             f"{provider.base_url}/chat/completions",
             headers=self.provider_service.authorization_headers(provider),
             json=payload,
             timeout=provider.timeout_seconds,
             follow_redirects=False,
             trust_env=False,
-        )
-        response.raise_for_status()
-        if len(response.content) > MAX_AI_RESPONSE_BYTES:
-            raise ValueError("AI response is too large")
-        envelope = json.loads(response.content)
+        ) as response:
+            response.raise_for_status()
+            for chunk in response.iter_bytes():
+                if len(body) + len(chunk) > MAX_AI_RESPONSE_BYTES:
+                    raise ValueError("AI response is too large")
+                body.extend(chunk)
+        envelope = json.loads(bytes(body))
         if not isinstance(envelope, dict):
             raise ValueError("AI response shape is invalid")
         choices = envelope.get("choices")
@@ -1076,9 +1204,10 @@ class DeploymentRecommendationService:
             reserved = reserve_bytes(memory["total_bytes"], 0.10, 8 * GiB)
         resource_snapshot: dict[str, Any] = {**memory, "reserved_bytes": reserved}
         deployments = snapshot.get("deployments")
-        bounded_deployments = _bounded_deployments(deployments)
-        if not bounded_deployments:
-            bounded_deployments = _database_deployments(db)
+        bounded_deployments = _merge_deployment_context(
+            _bounded_deployments(deployments),
+            _database_deployments(db),
+        )
         if bounded_deployments:
             resource_snapshot["deployments"] = bounded_deployments
 
@@ -1103,6 +1232,7 @@ class DeploymentRecommendationService:
                 RECOMMENDATION_SCHEMA_VERSION,
             )
             device_context = {
+                "architecture": _bounded_context_string(snapshot.get("architecture"), 64),
                 "total_bytes": memory["total_bytes"],
                 "available_bytes": memory["available_bytes"],
                 "reserved_bytes": reserved,
@@ -1114,6 +1244,7 @@ class DeploymentRecommendationService:
                     if ai_values is None:
                         ai_values, invalid = self._fetch_ai_values(
                             provider=provider,
+                            target=target,
                             evidence=evidence,
                             requested=ai_candidates,
                             device_context=device_context,
