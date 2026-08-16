@@ -75,10 +75,16 @@ def recommend_deployment(
 def preview_deployment(
     spec: DeploymentSpec,
     request: Request,
+    db: DbSession,
     _: Admin,
+    deployment_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     try:
-        return request.app.state.deployment_service.preview(spec)
+        return request.app.state.deployment_service.preview(
+            db,
+            spec,
+            exclude_deployment_id=deployment_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -91,7 +97,7 @@ def create_deployment(
     admin: CsrfAdmin,
 ) -> dict[str, Any]:
     try:
-        request.app.state.deployment_service.preview(spec)
+        request.app.state.deployment_service.preview(db, spec)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     conflict = db.scalar(
@@ -139,7 +145,11 @@ def update_deployment(
     if not deployment.managed:
         raise HTTPException(status_code=409, detail="Discovered containers cannot be edited")
     try:
-        request.app.state.deployment_service.preview(spec)
+        request.app.state.deployment_service.preview(
+            db,
+            spec,
+            exclude_deployment_id=deployment_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     conflict = db.scalar(

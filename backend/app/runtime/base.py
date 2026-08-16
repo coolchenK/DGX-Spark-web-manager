@@ -120,6 +120,7 @@ class DeploymentSpec(BaseModel):
     generation_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
     speculative: SpeculativeConfig | None = None
     recommendation: RecommendationProvenance | None = None
+    resource_warning_acknowledged: bool = False
 
     @field_validator("api_model_name", "route_alias")
     @classmethod
@@ -132,7 +133,12 @@ class DeploymentSpec(BaseModel):
 
 
 class ResolvedDeploymentSpec(DeploymentSpec):
+    base_model_root: str | None = None
+    base_host_model_root: str | None = None
+    base_container_model_path: str | None = None
     resolved_draft_model_path: str | None = None
+    draft_model_root: str | None = None
+    draft_host_model_root: str | None = None
     draft_container_model_path: str | None = None
     speculative_runtime_method: str | None = None
 
@@ -318,7 +324,11 @@ class RuntimeAdapter(ABC):
         model_size = self.model_size(model_path)
         route_name = spec.route_alias or spec.api_model_name
         return {
-            "spec": spec.model_dump(mode="json"),
+            "spec": (
+                spec.public_dump()
+                if isinstance(spec, ResolvedDeploymentSpec)
+                else spec.model_dump(mode="json")
+            ),
             "container_name": deterministic_container_name(spec.name),
             "runtime": self.runtime,
             "image": spec.image,

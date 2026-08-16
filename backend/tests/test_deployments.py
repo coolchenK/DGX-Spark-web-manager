@@ -6,7 +6,8 @@ import docker
 import pytest
 from app.config import Settings
 from app.db import Database
-from app.models import Deployment, TaskRecord
+from app.main import create_app
+from app.models import Deployment, ModelAsset, TaskRecord
 from app.runtime.base import (
     DeploymentSpec,
     GenerationDefaults,
@@ -20,6 +21,10 @@ from app.runtime.base import (
 from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
 from app.services import deployments as deployment_service
+from app.services.draft_models import DraftCandidate
+from app.services.model_evidence import ModelEvidenceLoader
+from app.services.resource_estimator import ResourceEstimate, ResourceEstimator
+from app.services.runtime_capabilities import RuntimeCapabilities
 
 
 def valid_spec_payload(tmp_path):
@@ -86,6 +91,126 @@ def valid_recommendation_payload():
         "modified_fields": ["generation_defaults.temperature"],
         "sources": {"generation_defaults.temperature": "model_card"},
     }
+
+
+class StaticRuntimeCapabilities:
+    def __init__(self, *, methods=None, mapping=None):
+        self.value = RuntimeCapabilities(
+            runtime="vllm",
+            image="vllm:test",
+            image_digest="sha256:test",
+            source="probe",
+            generation_defaults=[
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "repetition_penalty",
+                "presence_penalty",
+                "frequency_penalty",
+                "max_tokens",
+                "stop",
+            ],
+            quantization_methods=["auto", "modelopt_fp4"],
+            quantization_mapping={"nvfp4": "modelopt_fp4"},
+            speculative_methods=(
+                ["draft_model", "eagle3"] if methods is None else methods
+            ),
+            method_mapping=(
+                {"draft_model": "draft_model", "eagle3": "eagle3"}
+                if mapping is None
+                else mapping
+            ),
+            speculative_transport="json",
+            warnings=[],
+        )
+
+    def get(self, runtime, image):
+        return self.value.model_copy(update={"runtime": runtime, "image": image})
+
+
+class StaticDraftService:
+    def __init__(self, candidate):
+        self.candidate = candidate
+
+    def list_candidates(self, db, target, capabilities, snapshot):
+        return [self.candidate]
+
+
+class StaticEstimator:
+    def __init__(self, decision):
+        self.decision = decision
+        self.calls = []
+
+    def estimate(self, **kwargs):
+        self.calls.append(kwargs)
+        return ResourceEstimate(
+            total_bytes=64 * 1024**3,
+            available_bytes=48 * 1024**3,
+            reserved_bytes=8 * 1024**3,
+            weight_bytes=8,
+            draft_weight_bytes=kwargs.get("draft_size_bytes", 0),
+            kv_cache_bytes=1024,
+            runtime_overhead_bytes=4 * 1024**3,
+            required_bytes=4 * 1024**3 + 1032,
+            decision=self.decision,
+            confidence="high",
+            reasons=[f"resource decision is {self.decision}"],
+        )
+
+
+def add_model_asset(db, path, *, name="Base", status="available", **values):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(
+        '{"architectures":["Qwen2ForCausalLM"],"hidden_size":256,'
+        '"num_hidden_layers":2,"num_key_value_heads":2,"head_dim":128}',
+        encoding="utf-8",
+    )
+    (path / "model.safetensors").write_bytes(b"weights")
+    asset = ModelAsset(
+        name=name,
+        local_path=str(path),
+        status=status,
+        size_bytes=7,
+        repository_id=values.pop("repository_id", f"org/{name.lower()}"),
+        **values,
+    )
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+    return asset
+
+
+def build_preflight_service(
+    database,
+    model_roots,
+    *,
+    host_model_roots=None,
+    capabilities=None,
+    draft_service=None,
+    estimator=None,
+    snapshot=None,
+):
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=model_roots)
+    return deployment_service.DeploymentService(
+        adapters={"vllm": adapter},
+        session_factory=database.session_factory,
+        model_roots=model_roots,
+        host_model_roots=host_model_roots,
+        runtime_capability_service=capabilities or StaticRuntimeCapabilities(),
+        evidence_loader=ModelEvidenceLoader(),
+        draft_service=draft_service,
+        resource_estimator=estimator or ResourceEstimator(),
+        system_snapshot=snapshot
+        or (
+            lambda: {
+                "memory": {
+                    "total_bytes": 64 * 1024**3,
+                    "available_bytes": 64 * 1024**3,
+                }
+            }
+        ),
+    )
 
 
 def test_deployment_spec_serializes_recommendation_settings(tmp_path):
@@ -267,6 +392,516 @@ def test_resolved_deployment_spec_public_dump_is_json_safe_and_excludes_internal
     assert "resolved_draft_model_path" not in public
     assert "draft_container_model_path" not in public
     assert "speculative_runtime_method" not in public
+
+
+def test_deployment_spec_roundtrips_resource_warning_acknowledgement(tmp_path):
+    payload = valid_spec_payload(tmp_path)
+    payload["resource_warning_acknowledged"] = True
+
+    spec = DeploymentSpec.model_validate(payload)
+
+    assert spec.resource_warning_acknowledged is True
+    assert spec.model_dump(mode="json")["resource_warning_acknowledged"] is True
+
+
+def test_resolve_spec_uses_available_database_asset_instead_of_browser_path(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'resolve.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "org" / "base")
+        target_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="Base",
+        model_id=target_id,
+        model_path=str(tmp_path / "browser-controlled"),
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with database.session_factory() as db:
+        resolved = service.resolve_spec(db, spec)
+
+    assert resolved.model_path == str((root / "org" / "base").resolve())
+    assert resolved.base_container_model_path == "/models/org/base"
+    assert resolved.base_model_root == str(root.resolve())
+    assert resolved.public_dump()["model_path"] == str((root / "org" / "base").resolve())
+
+
+@pytest.mark.parametrize("status", ["missing", "unavailable"])
+def test_resolve_spec_rejects_missing_or_unavailable_database_asset(tmp_path, status):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / f'{status}.db'}")
+    database.create_schema()
+    model_id = "missing"
+    if status == "unavailable":
+        with database.session_factory() as db:
+            target = add_model_asset(db, root / "base", status="failed")
+            model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="Base",
+        model_id=model_id,
+        model_path=str(root / "base"),
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with database.session_factory() as db, pytest.raises(
+        ValueError, match="Base model is missing or unavailable"
+    ):
+        service.resolve_spec(db, spec)
+
+
+def test_resolve_spec_maps_cross_root_draft_to_separate_read_only_mount(tmp_path):
+    base_root = tmp_path / "base-models"
+    draft_root = tmp_path / "draft-models"
+    host_base = Path("/srv/base-models")
+    host_draft = Path("/srv/draft-models")
+    database = Database(f"sqlite:///{tmp_path / 'cross-root.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, base_root / "base", name="Base")
+        draft = add_model_asset(db, draft_root / "draft", name="Draft")
+        base_id, draft_id = base.id, draft.id
+    service = build_preflight_service(
+        database,
+        (base_root, draft_root),
+        host_model_roots=(host_base, host_draft),
+    )
+    spec = DeploymentSpec(
+        name="Base",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        speculative={
+            "draft_model_id": draft_id,
+            "method": "draft_model",
+        },
+    )
+    with database.session_factory() as db:
+        resolved = service.resolve_spec(db, spec)
+
+    captured = {}
+    containers = type(
+        "Containers",
+        (),
+        {"run": lambda _self, _image, **kwargs: captured.update(kwargs) or object()},
+    )()
+    service._run_container(
+        type("Client", (), {"containers": containers})(),
+        resolved,
+        service.adapter("vllm"),
+        "dgx-base",
+    )
+
+    assert resolved.draft_container_model_path == "/draft-models/draft"
+    assert captured["volumes"] == {
+        str(host_base): {"bind": "/models", "mode": "ro"},
+        str(host_draft): {"bind": "/draft-models", "mode": "ro"},
+    }
+
+
+def test_resolve_spec_reuses_base_mount_for_same_root_draft(tmp_path):
+    root = tmp_path / "models"
+    host_root = Path("/srv/models")
+    database = Database(f"sqlite:///{tmp_path / 'same-root.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base", name="Base")
+        draft = add_model_asset(db, root / "draft", name="Draft")
+        base_id, draft_id = base.id, draft.id
+    service = build_preflight_service(database, (root,), host_model_roots=(host_root,))
+    spec = DeploymentSpec(
+        name="Base",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        speculative={"draft_model_id": draft_id, "method": "draft_model"},
+    )
+    with database.session_factory() as db:
+        resolved = service.resolve_spec(db, spec)
+
+    captured = {}
+    containers = type(
+        "Containers",
+        (),
+        {"run": lambda _self, _image, **kwargs: captured.update(kwargs) or object()},
+    )()
+    service._run_container(
+        type("Client", (), {"containers": containers})(),
+        resolved,
+        service.adapter("vllm"),
+        "dgx-base",
+    )
+
+    assert resolved.draft_container_model_path == "/models/draft"
+    assert captured["volumes"] == {
+        str(host_root): {"bind": "/models", "mode": "ro"}
+    }
+
+
+@pytest.mark.parametrize(
+    ("draft_state", "message"),
+    [
+        ("missing", "Draft Model is missing or unavailable"),
+        ("unavailable", "Draft Model is missing or unavailable"),
+        ("same", "Base model and Draft Model must be different"),
+    ],
+)
+def test_resolve_spec_rejects_invalid_draft_assets(tmp_path, draft_state, message):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / f'draft-{draft_state}.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base", name="Base")
+        if draft_state == "missing":
+            draft_id = "missing"
+        elif draft_state == "same":
+            draft_id = base.id
+        else:
+            draft_id = add_model_asset(
+                db, root / "draft", name="Draft", status="failed"
+            ).id
+        base_id = base.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="base",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        speculative={"draft_model_id": draft_id, "method": "draft_model"},
+    )
+
+    with database.session_factory() as db, pytest.raises(ValueError, match=message):
+        service.resolve_spec(db, spec)
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "message"),
+    [
+        (
+            StaticRuntimeCapabilities(methods=[]),
+            "Speculative method is unsupported by the runtime",
+        ),
+        (
+            StaticRuntimeCapabilities(methods=["draft_model"], mapping={}),
+            "Speculative method mapping is unavailable",
+        ),
+    ],
+)
+def test_resolve_spec_rejects_unsupported_speculative_capabilities(
+    tmp_path, capabilities, message
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'capabilities.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base", name="Base")
+        draft = add_model_asset(db, root / "draft", name="Draft")
+        base_id, draft_id = base.id, draft.id
+    service = build_preflight_service(database, (root,), capabilities=capabilities)
+    spec = DeploymentSpec(
+        name="base",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        speculative={"draft_model_id": draft_id, "method": "draft_model"},
+    )
+
+    with database.session_factory() as db, pytest.raises(ValueError, match=message):
+        service.resolve_spec(db, spec)
+
+
+def test_run_container_rejects_public_browser_spec(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'public-run.db'}")
+    database.create_schema()
+    service = build_preflight_service(database, (tmp_path,))
+    spec = DeploymentSpec(
+        name="base",
+        model_path=str(tmp_path),
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with pytest.raises(ValueError, match="Resolved deployment spec is required"):
+        service._run_container(object(), spec, service.adapter("vllm"), "dgx-base")
+
+
+def test_preview_rejects_shared_route_with_different_generation_defaults(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'route.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base")
+        deployment = Deployment(
+            name="replica-a",
+            model_id=base.id,
+            runtime="vllm",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="replica-a",
+            status="running",
+            health="healthy",
+            managed=True,
+            image="vllm:test",
+            port=8100,
+            config={
+                "spec": {
+                    "route_alias": "shared",
+                    "generation_defaults": {"temperature": 0.2},
+                }
+            },
+        )
+        db.add(deployment)
+        db.commit()
+        base_id = base.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="replica-b",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="replica-b",
+        route_alias="shared",
+        runtime="vllm",
+        image="vllm:test",
+        port=8101,
+        generation_defaults={"temperature": 0.7},
+    )
+
+    with database.session_factory() as db, pytest.raises(
+        ValueError, match="Shared route generation defaults must match"
+    ):
+        service.preview(db, spec)
+
+
+def test_preview_excludes_current_deployment_from_shared_route_check(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'route-edit.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base")
+        deployment = Deployment(
+            name="replica-a",
+            model_id=base.id,
+            runtime="vllm",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="replica-a",
+            status="running",
+            health="healthy",
+            managed=True,
+            image="vllm:test",
+            port=8100,
+            config={
+                "spec": {
+                    "route_alias": "shared",
+                    "generation_defaults": {"temperature": 0.2},
+                }
+            },
+        )
+        db.add(deployment)
+        db.commit()
+        base_id, deployment_id = base.id, deployment.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="replica-a",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="replica-a",
+        route_alias="shared",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        generation_defaults={"temperature": 0.7},
+    )
+
+    with database.session_factory() as db:
+        preview = service.preview(db, spec, exclude_deployment_id=deployment_id)
+
+    assert preview["spec"]["generation_defaults"]["temperature"] == 0.7
+
+
+@pytest.mark.parametrize("decision", ["blocked", "warning"])
+def test_preview_enforces_realtime_resource_decision(tmp_path, decision):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / f'{decision}.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base")
+        base_id = base.id
+    estimator = StaticEstimator(decision)
+    snapshot_calls = 0
+
+    def snapshot():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return {
+            "memory": {
+                "total_bytes": 64 * 1024**3,
+                "available_bytes": 48 * 1024**3,
+            }
+        }
+
+    service = build_preflight_service(
+        database, (root,), estimator=estimator, snapshot=snapshot
+    )
+    spec = DeploymentSpec(
+        name="base",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        resource_warning_acknowledged=False,
+    )
+
+    expected = "Deployment is blocked" if decision == "blocked" else "acknowledgement"
+    with database.session_factory() as db, pytest.raises(ValueError, match=expected):
+        service.preview(db, spec)
+    assert snapshot_calls == 1
+    assert estimator.calls[0]["context_length"] == spec.context_length
+
+    if decision == "warning":
+        with database.session_factory() as db:
+            preview = service.preview(
+                db, spec.model_copy(update={"resource_warning_acknowledged": True})
+            )
+        assert preview["resource_estimate"]["decision"] == "warning"
+
+
+@pytest.mark.parametrize(
+    ("candidate_status", "acknowledged", "message"),
+    [
+        ("incompatible", True, "Draft Model is incompatible"),
+        ("review", False, "Draft Model review acknowledgement is required"),
+    ],
+)
+def test_preview_enforces_selected_draft_compatibility(
+    tmp_path, candidate_status, acknowledged, message
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / f'draft-{candidate_status}.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base", name="Base")
+        draft = add_model_asset(db, root / "draft", name="Draft")
+        base_id, draft_id = base.id, draft.id
+    candidate = DraftCandidate(
+        model_id=draft_id,
+        name="Draft",
+        repository_id="org/draft",
+        method="draft_model",
+        status=candidate_status,
+        reasons=["bounded candidate reason"],
+        size_bytes=7,
+        estimated_total_bytes=1024,
+    )
+    service = build_preflight_service(
+        database,
+        (root,),
+        draft_service=StaticDraftService(candidate),
+    )
+    spec = DeploymentSpec(
+        name="base",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        speculative={
+            "draft_model_id": draft_id,
+            "method": "draft_model",
+            "manual_review_acknowledged": acknowledged,
+        },
+    )
+
+    with database.session_factory() as db, pytest.raises(ValueError, match=message):
+        service.preview(db, spec)
+
+
+def test_preview_persists_public_spec_capabilities_resource_and_mounts(tmp_path):
+    root = tmp_path / "models"
+    host_root = Path("/srv/models")
+    database = Database(f"sqlite:///{tmp_path / 'preview.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base")
+        base_id = base.id
+    service = build_preflight_service(
+        database, (root,), host_model_roots=(host_root,)
+    )
+    spec = DeploymentSpec(
+        name="base",
+        model_id=base_id,
+        model_path=str(tmp_path / "browser-path"),
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        generation_defaults={"temperature": 0.2},
+        recommendation=valid_recommendation_payload(),
+    )
+
+    with database.session_factory() as db:
+        preview = service.preview(db, spec)
+
+    assert preview["spec"]["model_path"] == str((root / "base").resolve())
+    assert "base_model_root" not in preview["spec"]
+    assert "resolved_draft_model_path" not in preview["spec"]
+    assert preview["runtime_capabilities"]["image_digest"] == "sha256:test"
+    assert preview["resource_estimate"]["decision"] == "ok"
+    assert preview["mounts"]["base"]["host_root"] == str(host_root)
+    assert preview["generation_defaults"] == {"temperature": 0.2}
+    assert preview["recommendation"]["evidence_hash"] == "a" * 64
+    json.dumps(preview)
+
+
+def test_preview_rejects_incompatible_base_model_before_resource_estimation(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'incompatible-base.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base")
+        (root / "base" / "model.safetensors").unlink()
+        base_id = base.id
+    estimator = StaticEstimator("ok")
+    service = build_preflight_service(database, (root,), estimator=estimator)
+    spec = DeploymentSpec(
+        name="base",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with database.session_factory() as db, pytest.raises(
+        ValueError, match="Base model is incompatible"
+    ):
+        service.preview(db, spec)
+
+    assert estimator.calls == []
 
 
 @pytest.mark.parametrize(
@@ -764,8 +1399,21 @@ def test_create_endpoint_persists_json_safe_recommendation(authenticated_client,
     payload["image"] = "vllm/vllm-openai:v0.27.1"
     payload["speculative"] = None
     payload["recommendation"] = valid_recommendation_payload()
+    with authenticated_client.app.state.database.session_factory() as db:
+        target = add_model_asset(db, Path(payload["model_path"]))
+        payload["model_id"] = target.id
+    original_preview = authenticated_client.app.state.deployment_service.preview
 
-    response = authenticated_client.post("/api/deployments", json=payload)
+    def preview(db, spec, **kwargs):
+        assert db.get(ModelAsset, spec.model_id) is not None
+        return {"spec": spec.model_dump(mode="json")}
+
+    authenticated_client.app.state.deployment_service.preview = preview
+
+    try:
+        response = authenticated_client.post("/api/deployments", json=payload)
+    finally:
+        authenticated_client.app.state.deployment_service.preview = original_preview
 
     assert response.status_code == 202
     with authenticated_client.app.state.database.session_factory() as db:
@@ -776,14 +1424,154 @@ def test_create_endpoint_persists_json_safe_recommendation(authenticated_client,
         json.dumps(task.input_json)
 
 
+def test_preview_endpoint_passes_database_and_deployment_exclusion(
+    authenticated_client, tmp_path
+):
+    payload = valid_spec_payload(tmp_path)
+    payload["speculative"] = None
+    payload["recommendation"] = None
+    captured = {}
+    original_preview = authenticated_client.app.state.deployment_service.preview
+
+    def preview(db, spec, **kwargs):
+        captured["db"] = db
+        captured["spec"] = spec
+        captured.update(kwargs)
+        return {"spec": spec.model_dump(mode="json")}
+
+    authenticated_client.app.state.deployment_service.preview = preview
+    try:
+        response = authenticated_client.post(
+            "/api/deployments/preview?deployment_id=deployment-1", json=payload
+        )
+    finally:
+        authenticated_client.app.state.deployment_service.preview = original_preview
+
+    assert response.status_code == 200
+    assert captured["db"] is not None
+    assert captured["exclude_deployment_id"] == "deployment-1"
+
+
+def test_create_handler_rechecks_resources_before_any_docker_call(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'handler-preflight.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base")
+        base_id = base.id
+    service = build_preflight_service(
+        database,
+        (root,),
+        estimator=StaticEstimator("blocked"),
+    )
+    docker_calls = 0
+
+    def docker_client():
+        nonlocal docker_calls
+        docker_calls += 1
+        raise AssertionError("Docker must not be touched after a blocked preflight")
+
+    service.docker_client = docker_client
+    spec = DeploymentSpec(
+        name="base",
+        model_id=base_id,
+        model_path=str(root / "base"),
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with pytest.raises(ValueError, match="Deployment is blocked"):
+        service.create_handler(type("Context", (), {})(), spec.model_dump(mode="json"))
+
+    assert docker_calls == 0
+
+
+def test_update_handler_blocked_preflight_does_not_touch_old_container(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'update-preflight.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base")
+        deployment = Deployment(
+            name="base",
+            model_id=base.id,
+            runtime="vllm",
+            container_id="old-container",
+            container_name="dgx-base",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="base",
+            status="running",
+            health="healthy",
+            managed=True,
+            image="vllm:test",
+            port=8100,
+        )
+        db.add(deployment)
+        db.commit()
+        model_id, deployment_id = base.id, deployment.id
+    service = build_preflight_service(
+        database,
+        (root,),
+        estimator=StaticEstimator("blocked"),
+    )
+    docker_calls = 0
+
+    def docker_client():
+        nonlocal docker_calls
+        docker_calls += 1
+        raise AssertionError("Old container must remain untouched")
+
+    service.docker_client = docker_client
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path=str(root / "base"),
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with pytest.raises(ValueError, match="Deployment is blocked"):
+        service.update_handler(
+            type("Context", (), {})(),
+            {"deployment_id": deployment_id, "spec": spec.model_dump(mode="json")},
+        )
+
+    assert docker_calls == 0
+    with database.session_factory() as db:
+        unchanged = db.get(Deployment, deployment_id)
+        assert unchanged.container_id == "old-container"
+        assert unchanged.status == "running"
+
+
+def test_create_app_shares_preflight_dependencies(settings):
+    app = create_app(settings)
+    deployments = app.state.deployment_service
+    recommendations = app.state.deployment_recommendation_service
+
+    assert (
+        deployments.runtime_capability_service
+        is recommendations.runtime_capability_service
+    )
+    assert deployments.evidence_loader is recommendations.evidence_loader
+    assert deployments.resource_estimator is recommendations.resource_estimator
+    assert deployments.draft_service is recommendations.draft_service
+    assert deployments._docker_client is recommendations.runtime_capability_service.docker_client
+
+
 def test_update_endpoint_queues_managed_deployment_change(authenticated_client, tmp_path):
     model_path = tmp_path / "models" / "qwen"
     model_path.mkdir(parents=True)
     (model_path / "config.json").write_text('{"architectures":["Qwen2ForCausalLM"]}')
     (model_path / "model.safetensors").write_bytes(b"weights")
     with authenticated_client.app.state.database.session_factory() as db:
+        target = add_model_asset(db, model_path)
         deployment = Deployment(
             name="managed",
+            model_id=target.id,
             runtime="vllm",
             container_id="container-id",
             container_name="dgx-managed",
@@ -797,20 +1585,29 @@ def test_update_endpoint_queues_managed_deployment_change(authenticated_client, 
         )
         db.add(deployment)
         db.commit()
-        deployment_id = deployment.id
+        deployment_id, model_id = deployment.id, target.id
 
-    response = authenticated_client.patch(
-        f"/api/deployments/{deployment_id}",
-        json={
-            "name": "managed",
-            "model_path": str(model_path),
-            "api_model_name": "managed",
-            "runtime": "vllm",
-            "image": "vllm/vllm-openai:v0.27.1",
-            "port": 8100,
-            "recommendation": valid_recommendation_payload(),
-        },
+    original_preview = authenticated_client.app.state.deployment_service.preview
+    authenticated_client.app.state.deployment_service.preview = (
+        lambda _db, spec, **_kwargs: {"spec": spec.model_dump(mode="json")}
     )
+
+    try:
+        response = authenticated_client.patch(
+            f"/api/deployments/{deployment_id}",
+            json={
+                "name": "managed",
+                "model_id": model_id,
+                "model_path": str(model_path),
+                "api_model_name": "managed",
+                "runtime": "vllm",
+                "image": "vllm/vllm-openai:v0.27.1",
+                "port": 8100,
+                "recommendation": valid_recommendation_payload(),
+            },
+        )
+    finally:
+        authenticated_client.app.state.deployment_service.preview = original_preview
 
     assert response.status_code == 202
     assert response.json()["type"] == "deployment.update"
@@ -858,6 +1655,9 @@ def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):
     host_root = Path("/home/operator/.cache/huggingface/hub")
     database = Database(f"sqlite:///{tmp_path / 'manager.db'}")
     database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, model_path)
+        model_id = target.id
     adapter = VllmAdapter(
         allowed_images={"vllm/vllm-openai:v0.27.1"}, model_roots=(container_root,)
     )
@@ -866,6 +1666,12 @@ def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):
         session_factory=database.session_factory,
         model_roots=(container_root,),
         host_model_roots=(host_root,),
+        runtime_capability_service=StaticRuntimeCapabilities(),
+        evidence_loader=ModelEvidenceLoader(),
+        resource_estimator=ResourceEstimator(),
+        system_snapshot=lambda: {
+            "memory": {"total_bytes": 64 * 1024**3, "available_bytes": 64 * 1024**3}
+        },
     )
     captured: dict = {}
 
@@ -910,7 +1716,8 @@ def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):
     service.create_handler(
         Context(),
         DeploymentSpec(
-            name="Test Model",
+                name="Test Model",
+                model_id=model_id,
             model_path=str(model_path),
             api_model_name="test-model",
             runtime="vllm",
@@ -932,12 +1739,21 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
     model_path.mkdir(parents=True)
     database = Database(f"sqlite:///{tmp_path / 'timeout.db'}")
     database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, model_path)
+        model_id = target.id
     adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(model_root,))
     service = deployment_service.DeploymentService(
         adapters={"vllm": adapter},
         session_factory=database.session_factory,
         model_roots=(model_root,),
         startup_timeout_seconds=2,
+        runtime_capability_service=StaticRuntimeCapabilities(),
+        evidence_loader=ModelEvidenceLoader(),
+        resource_estimator=ResourceEstimator(),
+        system_snapshot=lambda: {
+            "memory": {"total_bytes": 64 * 1024**3, "available_bytes": 64 * 1024**3}
+        },
     )
 
     class FakeContainer:
@@ -986,7 +1802,8 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
         service.create_handler(
             Context(),
             DeploymentSpec(
-                name="Timeout",
+                    name="Timeout",
+                    model_id=model_id,
                 model_path=str(model_path),
                 api_model_name="timeout",
                 runtime="vllm",
@@ -1075,8 +1892,10 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
     database = Database(f"sqlite:///{tmp_path / 'update.db'}")
     database.create_schema()
     with database.session_factory() as db:
+        target = add_model_asset(db, model_path)
         deployment = Deployment(
             name="managed",
+            model_id=target.id,
             runtime="vllm",
             container_id="old-container",
             container_name="dgx-managed",
@@ -1090,13 +1909,19 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
         )
         db.add(deployment)
         db.commit()
-        deployment_id = deployment.id
+        deployment_id, model_id = deployment.id, target.id
 
     adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(model_root,))
     service = deployment_service.DeploymentService(
         adapters={"vllm": adapter},
         session_factory=database.session_factory,
         model_roots=(model_root,),
+        runtime_capability_service=StaticRuntimeCapabilities(),
+        evidence_loader=ModelEvidenceLoader(),
+        resource_estimator=ResourceEstimator(),
+        system_snapshot=lambda: {
+            "memory": {"total_bytes": 64 * 1024**3, "available_bytes": 64 * 1024**3}
+        },
     )
 
     class FakeContainer:
@@ -1151,7 +1976,8 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
         {
             "deployment_id": deployment_id,
             "spec": DeploymentSpec(
-                name="managed",
+                    name="managed",
+                    model_id=model_id,
                 model_path=str(model_path),
                 api_model_name="managed",
                 route_alias="managed-route",
@@ -1170,4 +1996,105 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
         assert updated.container_id == "new-container"
         assert updated.config["spec"]["context_length"] == 8192
         assert updated.config["route_alias"] == "managed-route"
+
+
+def test_update_handler_restores_old_container_when_replacement_is_unhealthy(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'update-rollback.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        deployment = Deployment(
+            name="base",
+            model_id=target.id,
+            runtime="vllm",
+            container_id="old-container",
+            container_name="dgx-base",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name="base",
+            status="running",
+            health="healthy",
+            managed=True,
+            image="vllm:test",
+            port=8100,
+            config={"before": True},
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id, model_id = deployment.id, target.id
+    service = build_preflight_service(database, (root,))
+
+    class Container:
+        def __init__(self, container_id, name):
+            self.id = container_id
+            self.name = name
+            self.status = "running"
+            self.removed = False
+            self.started = 0
+
+        def reload(self):
+            return None
+
+        def stop(self, **_kwargs):
+            self.status = "exited"
+
+        def start(self):
+            self.started += 1
+            self.status = "running"
+
+        def rename(self, name):
+            self.name = name
+
+        def remove(self, **_kwargs):
+            self.removed = True
+
+        def logs(self, **_kwargs):
+            return b"replacement failed"
+
+    old = Container("old-container", "dgx-base")
+    new = Container("new-container", "dgx-base")
+    containers = type(
+        "Containers",
+        (),
+        {
+            "get": lambda _self, _identifier: old,
+            "run": lambda _self, _image, **_kwargs: new,
+        },
+    )()
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": containers})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: False)
+    context = type(
+        "Context",
+        (),
+        {"update": lambda _self, **_kwargs: None, "check_control": lambda _self: None},
+    )()
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    with pytest.raises(RuntimeError, match="replacement failed"):
+        service.update_handler(
+            context,
+            {"deployment_id": deployment_id, "spec": spec.model_dump(mode="json")},
+        )
+
+    assert new.removed is True
+    assert old.name == "dgx-base"
+    assert old.started == 1
+    with database.session_factory() as db:
+        unchanged = db.get(Deployment, deployment_id)
+        assert unchanged.container_id == "old-container"
+        assert unchanged.config == {"before": True}
 

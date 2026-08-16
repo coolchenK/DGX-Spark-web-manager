@@ -92,6 +92,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     system_service = SystemService(
         app_settings.data_dir, os_release_path=app_settings.host_os_release
     )
+    provider_service = ProviderService(SecretBox(app_settings.secret_key))
+    lazy_docker_client = _LazyDockerClient()
+    evidence_loader = ModelEvidenceLoader(card_max_chars=app_settings.recommendation_card_max_chars)
+    resource_estimator = ResourceEstimator(
+        reserve_fraction=app_settings.memory_reserve_fraction,
+        reserve_min_bytes=app_settings.memory_reserve_min_bytes,
+    )
+    runtime_capability_service = RuntimeCapabilityService(
+        settings=app_settings, docker_client=lazy_docker_client
+    )
+    draft_service = DraftCompatibilityService(
+        evidence_loader=evidence_loader,
+        resource_estimator=resource_estimator,
+    )
     deployment_service = DeploymentService(
         adapters={
             "vllm": VllmAdapter(
@@ -107,24 +121,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         model_roots=app_settings.model_root_paths,
         host_model_roots=app_settings.host_model_root_paths,
         startup_timeout_seconds=app_settings.deployment_startup_timeout_seconds,
-    )
-    provider_service = ProviderService(SecretBox(app_settings.secret_key))
-    lazy_docker_client = _LazyDockerClient()
-    evidence_loader = ModelEvidenceLoader(card_max_chars=app_settings.recommendation_card_max_chars)
-    resource_estimator = ResourceEstimator(
-        reserve_fraction=app_settings.memory_reserve_fraction,
-        reserve_min_bytes=app_settings.memory_reserve_min_bytes,
+        runtime_capability_service=runtime_capability_service,
+        evidence_loader=evidence_loader,
+        draft_service=draft_service,
+        resource_estimator=resource_estimator,
+        system_snapshot=system_service.snapshot,
+        docker_client=lazy_docker_client,
     )
     deployment_recommendation_service = DeploymentRecommendationService(
         evidence_loader=evidence_loader,
-        runtime_capability_service=RuntimeCapabilityService(
-            settings=app_settings, docker_client=lazy_docker_client
-        ),
+        runtime_capability_service=runtime_capability_service,
         resource_estimator=resource_estimator,
-        draft_service=DraftCompatibilityService(
-            evidence_loader=evidence_loader,
-            resource_estimator=resource_estimator,
-        ),
+        draft_service=draft_service,
         system_snapshot=system_service.snapshot,
         huggingface_service=huggingface_service,
         provider_service=provider_service,
