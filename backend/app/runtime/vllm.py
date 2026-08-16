@@ -36,6 +36,15 @@ class VllmAdapter(RuntimeAdapter):
         if spec.trust_remote_code:
             command.append("--trust-remote-code")
         if spec.speculative is not None:
+            tuning_fields = (
+                spec.speculative.num_steps,
+                spec.speculative.eagle_top_k,
+                spec.speculative.num_draft_tokens,
+            )
+            if any(value is not None for value in tuning_fields):
+                raise ValueError(
+                    "grouped speculative tuning fields are not supported by vLLM"
+                )
             runtime_method = require_speculative_runtime_method(spec)
             if runtime_method != spec.speculative.method:
                 raise ValueError(

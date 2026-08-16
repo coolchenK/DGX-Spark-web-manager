@@ -485,6 +485,24 @@ def test_vllm_command_uses_canonical_speculative_json(tmp_path):
     )
 
 
+def test_vllm_command_rejects_unsupported_grouped_speculative_tuning(tmp_path):
+    adapter = VllmAdapter(
+        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = resolved_speculative_spec(
+        tmp_path,
+        num_steps=2,
+        eagle_top_k=4,
+        num_draft_tokens=16,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="grouped speculative tuning fields are not supported by vLLM",
+    ):
+        adapter.command(spec)
+
+
 def test_vllm_speculative_json_keeps_path_content_in_one_argument(tmp_path):
     adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
     draft_path = "/draft models/--trust-remote-code"

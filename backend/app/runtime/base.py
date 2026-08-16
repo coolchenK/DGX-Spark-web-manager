@@ -140,7 +140,7 @@ class ResolvedDeploymentSpec(DeploymentSpec):
         return self.model_dump(mode="json", include=set(DeploymentSpec.model_fields))
 
 
-def require_draft_container_path(spec: ResolvedDeploymentSpec) -> str:
+def require_draft_container_path(spec: DeploymentSpec) -> str:
     if spec.speculative is None:
         return ""
     path = getattr(spec, "draft_container_model_path", None)
@@ -154,7 +154,7 @@ def require_draft_container_path(spec: ResolvedDeploymentSpec) -> str:
     return path
 
 
-def require_speculative_runtime_method(spec: ResolvedDeploymentSpec) -> str:
+def require_speculative_runtime_method(spec: DeploymentSpec) -> str:
     if spec.speculative is None:
         return ""
     method = getattr(spec, "speculative_runtime_method", None)
