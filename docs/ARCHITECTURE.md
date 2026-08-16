@@ -118,10 +118,12 @@ oversized bodies, non-JSON output, unknown fields, unsupported values, and value
 ranges are rejected or dropped.
 
 Local evidence files must be regular files. The only accepted evidence-file symlinks are canonical
-Hugging Face cache entries under `models--*/snapshots/<revision>` whose exact relative target is
-`../../blobs/<40-or-64-character-hex-hash>`. The evidence reader opens the snapshot, repository,
-blob directory, and blob through no-follow handles and identity checks; arbitrary links, linked blob
-directories or files, and non-regular blob targets remain unreadable.
+Hugging Face cache entries under `models--<owner>--<model>/snapshots/<revision>` whose exact relative
+target is `../../blobs/<40-or-64-character-hex-hash>`. The evidence reader opens the snapshot,
+repository, blob directory, and blob through directory-relative no-follow handles on POSIX. On
+Windows it checks the original repository, snapshots, and revision directories for reparse points
+before resolving, then verifies their identities and the blob path again before reading. Arbitrary
+links, linked blob directories or files, and non-regular blob targets remain unreadable.
 
 AI can suggest only a bounded set of deployment and generation values. It cannot choose images,
 quantization, paths, compatibility status, runtime operations, or shell commands. Suggestions remain

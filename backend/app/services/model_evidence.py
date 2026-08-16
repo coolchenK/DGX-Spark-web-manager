@@ -85,7 +85,8 @@ REPOSITORY_ID = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
 )
 HUGGINGFACE_CACHE_REPOSITORY = re.compile(
-    r"^models--[A-Za-z0-9][A-Za-z0-9._-]*(?:--[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+    r"^models--[A-Za-z0-9][A-Za-z0-9._-]*--[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"(?:--[A-Za-z0-9][A-Za-z0-9._-]*)*$"
 )
 HUGGINGFACE_BLOB_LINK = re.compile(
     r"^\.\./\.\./blobs/(?P<digest>[A-Fa-f0-9]{40}(?:[A-Fa-f0-9]{24})?)$"
@@ -115,6 +116,10 @@ class ModelEvidence(BaseModel):
 
 
 Fence = namedtuple("Fence", "language body start end closed newline")
+WindowsSnapshotLayout = namedtuple(
+    "WindowsSnapshotLayout",
+    "repository original_paths resolved_paths identities",
+)
 
 
 def _parse_huggingface_blob_link_target(target: str) -> str | None:
@@ -122,20 +127,95 @@ def _parse_huggingface_blob_link_target(target: str) -> str | None:
     return match.group("digest") if match is not None else None
 
 
-def _huggingface_snapshot_repository(model_root: Path) -> Path | None:
-    try:
-        resolved_root = model_root.resolve(strict=True)
-    except OSError:
-        return None
-    snapshots = resolved_root.parent
+def _huggingface_snapshot_paths(model_root: Path) -> tuple[Path, Path, Path] | None:
+    snapshots = model_root.parent
     repository = snapshots.parent
     if (
         snapshots.name != "snapshots"
-        or not resolved_root.name
+        or not model_root.name
         or HUGGINGFACE_CACHE_REPOSITORY.fullmatch(repository.name) is None
     ):
         return None
-    return repository
+    return repository, snapshots, model_root
+
+
+def _resolve_strict(path: Path) -> Path:
+    return path.resolve(strict=True)
+
+
+def _resolve_evidence_path(path: Path) -> Path:
+    try:
+        return _resolve_strict(path)
+    except RuntimeError as exc:
+        raise ValueError("model evidence path could not be resolved safely") from exc
+
+
+def _path_lstat(path: Path) -> os.stat_result:
+    return os.stat(path, follow_symlinks=False)
+
+
+def _huggingface_snapshot_repository(model_root: Path) -> Path | None:
+    try:
+        resolved_root = _resolve_strict(model_root)
+    except (OSError, RuntimeError):
+        return None
+    paths = _huggingface_snapshot_paths(resolved_root)
+    return paths[0] if paths is not None else None
+
+
+def _safe_windows_directory(value: os.stat_result) -> bool:
+    return stat.S_ISDIR(value.st_mode) and not _is_windows_reparse_point(value)
+
+
+def _windows_huggingface_snapshot_layout(
+    model_root: Path,
+) -> WindowsSnapshotLayout | None:
+    original_paths = _huggingface_snapshot_paths(model_root)
+    if original_paths is None:
+        return None
+    try:
+        original_stats = tuple(_path_lstat(path) for path in original_paths)
+    except OSError:
+        return None
+    if not all(_safe_windows_directory(value) for value in original_stats):
+        return None
+
+    try:
+        resolved_root = _resolve_strict(model_root)
+    except (OSError, RuntimeError):
+        return None
+    resolved_paths = _huggingface_snapshot_paths(resolved_root)
+    if resolved_paths is None:
+        return None
+    try:
+        resolved_stats = tuple(_path_lstat(path) for path in resolved_paths)
+    except OSError:
+        return None
+    if (
+        not all(_safe_windows_directory(value) for value in resolved_stats)
+        or tuple(_stat_identity(value) for value in original_stats)
+        != tuple(_stat_identity(value) for value in resolved_stats)
+    ):
+        return None
+    return WindowsSnapshotLayout(
+        repository=resolved_paths[0],
+        original_paths=original_paths,
+        resolved_paths=resolved_paths,
+        identities=tuple(_stat_identity(value) for value in original_stats),
+    )
+
+
+def _windows_snapshot_hierarchy_unchanged(layout: WindowsSnapshotLayout) -> bool:
+    try:
+        original_stats = tuple(_path_lstat(path) for path in layout.original_paths)
+        resolved_stats = tuple(_path_lstat(path) for path in layout.resolved_paths)
+    except OSError:
+        return False
+    return all(
+        all(_safe_windows_directory(value) for value in values)
+        and tuple(_stat_identity(value) for value in values) == layout.identities
+        for values in (original_stats, resolved_stats)
+    )
 
 
 def _stat_identity(value: os.stat_result) -> tuple[int, int]:
@@ -218,15 +298,15 @@ def _open_windows_huggingface_blob(
     candidate: Path,
     link_stat: os.stat_result,
 ) -> Iterator[Any]:
-    repository = _huggingface_snapshot_repository(model_root)
-    if repository is None:
+    layout = _windows_huggingface_snapshot_layout(model_root)
+    if layout is None:
         raise ValueError("model evidence symlink is outside a Hugging Face snapshot")
     raw_target = os.readlink(candidate)
     digest = _parse_huggingface_blob_link_target(_windows_link_target(raw_target))
     if digest is None:
         raise ValueError("model evidence symlink target is not a Hugging Face blob")
 
-    blobs = repository / "blobs"
+    blobs = layout.repository / "blobs"
     blobs_before = os.stat(blobs, follow_symlinks=False)
     if not stat.S_ISDIR(blobs_before.st_mode) or _is_windows_reparse_point(blobs_before):
         raise ValueError("Hugging Face blob directory is not a regular directory")
@@ -252,9 +332,10 @@ def _open_windows_huggingface_blob(
             or _stat_identity(blobs_before) != _stat_identity(blobs_after)
             or _stat_identity(link_stat) != _stat_identity(link_after)
             or os.readlink(candidate) != raw_target
+            or not _windows_snapshot_hierarchy_unchanged(layout)
         ):
             raise ValueError("model evidence blob changed while opening")
-        resolved_blob = blob.resolve(strict=True)
+        resolved_blob = _resolve_evidence_path(blob)
         if resolved_blob != blob.absolute():
             raise ValueError("model evidence blob is a symlink")
         yield stream
@@ -337,8 +418,15 @@ def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
         return
 
     candidate = model_root / filename
-    if model_root.is_symlink():
-        raise ValueError("model root is a symlink")
+    root_stat = _path_lstat(model_root)
+    if not _safe_windows_directory(root_stat):
+        raise ValueError("model root is not a regular directory")
+    snapshot_paths = _huggingface_snapshot_paths(model_root)
+    snapshot_layout = None
+    if snapshot_paths is not None:
+        snapshot_layout = _windows_huggingface_snapshot_layout(model_root)
+        if snapshot_layout is None:
+            raise ValueError("model evidence snapshot hierarchy is unsafe")
     file_stat = os.stat(candidate, follow_symlinks=False)
     if stat.S_ISLNK(file_stat.st_mode):
         with _open_windows_huggingface_blob(model_root, candidate, file_stat) as stream:
@@ -351,8 +439,13 @@ def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
             or _stat_identity(file_stat) != _stat_identity(opened_stat)
         ):
             raise ValueError("model evidence file is not regular")
-        resolved = candidate.resolve(strict=True)
-        if not resolved.is_relative_to(model_root):
+        resolved = _resolve_evidence_path(candidate)
+        resolved_root = (
+            snapshot_layout.resolved_paths[2]
+            if snapshot_layout is not None
+            else _resolve_evidence_path(model_root)
+        )
+        if not resolved.is_relative_to(resolved_root):
             raise ValueError("model evidence file escapes model directory")
         opened_stat = os.fstat(stream.fileno())
         resolved_stat = os.stat(resolved, follow_symlinks=True)
@@ -361,6 +454,11 @@ def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
             resolved_stat.st_ino,
         ):
             raise ValueError("model evidence file changed while opening")
+        if (
+            snapshot_layout is not None
+            and not _windows_snapshot_hierarchy_unchanged(snapshot_layout)
+        ):
+            raise ValueError("model evidence snapshot hierarchy changed while opening")
         yield stream
 
 
@@ -441,7 +539,8 @@ def tokenizer_fingerprint(model_path: Path | str) -> str | None:
     supplied_path = Path(model_path)
     if not supplied_path.is_dir() or supplied_path.is_symlink():
         raise ValueError("model directory must be a regular directory")
-    fingerprint, _warnings = _tokenizer_fingerprint(supplied_path.resolve(strict=True))
+    evidence_root = Path(os.path.abspath(supplied_path))
+    fingerprint, _warnings = _tokenizer_fingerprint(evidence_root)
     return fingerprint
 
 
@@ -666,12 +765,18 @@ class ModelEvidenceLoader:
             raise ValueError("model directory must exist")
         if supplied_path.is_symlink():
             raise ValueError("model directory must not be a symlink")
-        model_root = supplied_path.resolve(strict=True)
+        try:
+            model_root = supplied_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("model directory could not be resolved safely") from exc
+        evidence_root = Path(os.path.abspath(supplied_path))
         warnings: list[str] = []
-        config = _read_json_dict(model_root, "config.json", warnings)
-        generation_config = _read_json_dict(model_root, "generation_config.json", warnings)
+        config = _read_json_dict(evidence_root, "config.json", warnings)
+        generation_config = _read_json_dict(
+            evidence_root, "generation_config.json", warnings
+        )
         if card_text_override is None:
-            raw_card_text = _read_card(model_root, self.card_max_chars, warnings)
+            raw_card_text = _read_card(evidence_root, self.card_max_chars, warnings)
         else:
             raw_card_text = card_text_override[: self.card_max_chars]
             if len(card_text_override) > self.card_max_chars:
@@ -680,7 +785,7 @@ class ModelEvidenceLoader:
         card_deployment_values, card_generation_values = _card_values(raw_card_text, warnings)
         card_text = _sanitize_shell_fences(raw_card_text)
         local_generation_values = _extract_generation_values(generation_config)
-        fingerprint, tokenizer_warnings = _tokenizer_fingerprint(model_root)
+        fingerprint, tokenizer_warnings = _tokenizer_fingerprint(evidence_root)
         warnings.extend(tokenizer_warnings)
         targets = _target_model_ids(card_data)
         method = _speculative_method(card_data)

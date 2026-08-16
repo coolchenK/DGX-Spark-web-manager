@@ -1,6 +1,9 @@
 import json
+import os
+import stat
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from app.services import model_evidence
@@ -34,6 +37,15 @@ def _linked_hub_blob(
     _symlink_or_skip(
         snapshot / filename,
         Path("..") / ".." / "blobs" / digest,
+    )
+
+
+def _fake_directory_stat(inode: int, *, reparse: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        st_mode=stat.S_IFDIR,
+        st_dev=1,
+        st_ino=inode,
+        st_file_attributes=0x400 if reparse else 0,
     )
 
 
@@ -171,6 +183,273 @@ def test_huggingface_blob_link_parser_accepts_only_canonical_posix_targets():
     assert model_evidence._parse_huggingface_blob_link_target(f"../../blobs/{sha1}/file") is None
     assert model_evidence._parse_huggingface_blob_link_target("../../blobs/not-a-hash") is None
     assert model_evidence._parse_huggingface_blob_link_target(f"../blobs/{sha1}") is None
+
+
+def test_huggingface_snapshot_repository_requires_owner_and_model_segments(tmp_path):
+    snapshot = tmp_path / "models--model" / "snapshots" / "revision"
+    snapshot.mkdir(parents=True)
+
+    assert model_evidence._huggingface_snapshot_repository(snapshot) is None
+
+
+@pytest.mark.parametrize("reparse_level", ["repository", "snapshots", "revision"])
+def test_windows_snapshot_layout_rejects_every_reparse_level_before_resolve(
+    tmp_path, monkeypatch, reparse_level
+):
+    repository = tmp_path / "models--org--model"
+    snapshots = repository / "snapshots"
+    revision = snapshots / "revision"
+    paths = {
+        repository: _fake_directory_stat(1, reparse=reparse_level == "repository"),
+        snapshots: _fake_directory_stat(2, reparse=reparse_level == "snapshots"),
+        revision: _fake_directory_stat(3, reparse=reparse_level == "revision"),
+    }
+    resolve_calls: list[Path] = []
+    monkeypatch.setattr(model_evidence, "_path_lstat", paths.__getitem__, raising=False)
+    monkeypatch.setattr(
+        model_evidence,
+        "_resolve_strict",
+        lambda path: resolve_calls.append(path) or path,
+        raising=False,
+    )
+
+    layout = model_evidence._windows_huggingface_snapshot_layout(revision)
+
+    assert layout is None
+    assert resolve_calls == []
+
+
+@pytest.mark.parametrize("replaced_level", ["repository", "snapshots", "revision"])
+def test_windows_snapshot_layout_detects_path_identity_replacement(
+    tmp_path, monkeypatch, replaced_level
+):
+    repository = tmp_path / "models--org--model"
+    snapshots = repository / "snapshots"
+    revision = snapshots / "revision"
+    paths = {
+        "repository": repository,
+        "snapshots": snapshots,
+        "revision": revision,
+    }
+    current = {
+        repository: _fake_directory_stat(1),
+        snapshots: _fake_directory_stat(2),
+        revision: _fake_directory_stat(3),
+    }
+    monkeypatch.setattr(model_evidence, "_path_lstat", current.__getitem__, raising=False)
+    monkeypatch.setattr(model_evidence, "_resolve_strict", lambda path: path, raising=False)
+    layout = model_evidence._windows_huggingface_snapshot_layout(revision)
+    assert layout is not None
+    current[paths[replaced_level]] = _fake_directory_stat(99)
+
+    assert model_evidence._windows_snapshot_hierarchy_unchanged(layout) is False
+
+
+def test_windows_snapshot_layout_converts_resolve_runtime_error_to_rejection(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "models--org--model"
+    snapshots = repository / "snapshots"
+    revision = snapshots / "revision"
+    current = {
+        repository: _fake_directory_stat(1),
+        snapshots: _fake_directory_stat(2),
+        revision: _fake_directory_stat(3),
+    }
+    monkeypatch.setattr(model_evidence, "_path_lstat", current.__getitem__, raising=False)
+
+    def fail_resolve(_path):
+        raise RuntimeError("simulated symlink loop")
+
+    monkeypatch.setattr(model_evidence, "_resolve_strict", fail_resolve, raising=False)
+
+    assert model_evidence._windows_huggingface_snapshot_layout(revision) is None
+
+
+def test_snapshot_repository_converts_resolve_runtime_error_to_rejection(monkeypatch):
+    root = Path("models--org--model") / "snapshots" / "revision"
+
+    def fail_resolve(_self, *, strict=False):
+        raise RuntimeError("simulated replacement race")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+
+    assert model_evidence._huggingface_snapshot_repository(root) is None
+
+
+@pytest.mark.skipif(os.name == "posix", reason="Exercises the Windows fallback")
+def test_windows_candidate_resolve_runtime_error_becomes_an_unreadable_warning(
+    tmp_path, monkeypatch
+):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text('{"hidden_size":4096}', encoding="utf-8")
+    original_resolve = Path.resolve
+
+    def fail_candidate_resolve(self, *, strict=False):
+        if self.name == "config.json":
+            raise RuntimeError("simulated replacement race")
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_candidate_resolve)
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+    assert evidence.config == {}
+    assert evidence.warnings == ["config.json is not a safe regular file"]
+
+
+def test_loader_keeps_the_unresolved_absolute_root_for_evidence_boundary_checks(
+    tmp_path, monkeypatch
+):
+    original = tmp_path / "original" / "models--org--model" / "snapshots" / "revision"
+    replacement = (
+        tmp_path / "replacement" / "models--org--model" / "snapshots" / "revision"
+    )
+    original.mkdir(parents=True)
+    replacement.mkdir(parents=True)
+    original_resolve = Path.resolve
+
+    def replace_model_root(self, *, strict=False):
+        if self == original:
+            return replacement
+        return original_resolve(self, strict=strict)
+
+    evidence_roots: list[Path] = []
+
+    def read_json(root, _filename, _warnings):
+        evidence_roots.append(root)
+        return {}
+
+    def read_card(root, *_args):
+        evidence_roots.append(root)
+        return ""
+
+    def fingerprint(root):
+        evidence_roots.append(root)
+        return None, []
+
+    monkeypatch.setattr(Path, "resolve", replace_model_root)
+    monkeypatch.setattr(model_evidence, "_read_json_dict", read_json)
+    monkeypatch.setattr(model_evidence, "_read_card", read_card)
+    monkeypatch.setattr(model_evidence, "_tokenizer_fingerprint", fingerprint)
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(original)
+
+    assert evidence.model_path == str(replacement)
+    assert evidence_roots == [original.absolute()] * 4
+
+
+def test_windows_blob_resolve_runtime_error_is_converted_at_the_read_boundary(
+    tmp_path, monkeypatch
+):
+    repository, snapshot = _hub_snapshot(tmp_path)
+    digest = "a" * 40
+    blob = repository / "blobs" / digest
+    blob.write_text('{"hidden_size":4096}', encoding="utf-8")
+    candidate = snapshot / "config.json"
+    candidate.write_text("placeholder", encoding="utf-8")
+    candidate_stat = os.stat(candidate, follow_symlinks=False)
+    fake_link_stat = SimpleNamespace(
+        st_mode=stat.S_IFLNK,
+        st_dev=candidate_stat.st_dev,
+        st_ino=candidate_stat.st_ino,
+        st_file_attributes=0,
+    )
+    original_stat = os.stat
+    original_readlink = os.readlink
+    original_resolve = Path.resolve
+
+    def fake_stat(path, *args, **kwargs):
+        if Path(path) == candidate:
+            return fake_link_stat
+        return original_stat(path, *args, **kwargs)
+
+    def fake_readlink(path, *args, **kwargs):
+        if Path(path) == candidate:
+            return f"../../blobs/{digest}"
+        return original_readlink(path, *args, **kwargs)
+
+    def fail_blob_resolve(self, *, strict=False):
+        if self == blob:
+            raise RuntimeError("simulated blob replacement race")
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+    monkeypatch.setattr(os, "readlink", fake_readlink)
+    monkeypatch.setattr(Path, "resolve", fail_blob_resolve)
+
+    assert model_evidence._read_model_file(snapshot, "config.json", 1024) == (
+        None,
+        "unreadable",
+    )
+
+
+def test_safe_evidence_resolve_does_not_swallow_programming_errors(tmp_path, monkeypatch):
+    target = tmp_path / "config.json"
+
+    def fail_runtime(_path):
+        raise RuntimeError("simulated symlink loop")
+
+    monkeypatch.setattr(model_evidence, "_resolve_strict", fail_runtime)
+    with pytest.raises(ValueError, match="resolved safely"):
+        model_evidence._resolve_evidence_path(target)
+
+    def fail_type(_path):
+        raise TypeError("programming error")
+
+    monkeypatch.setattr(model_evidence, "_resolve_strict", fail_type)
+    with pytest.raises(TypeError, match="programming error"):
+        model_evidence._resolve_evidence_path(target)
+
+
+def test_loader_converts_model_root_resolve_runtime_error_to_value_error(
+    tmp_path, monkeypatch
+):
+    model = tmp_path / "model"
+    model.mkdir()
+
+    def fail_resolve(_self, *, strict=False):
+        raise RuntimeError("simulated model root replacement race")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+
+    with pytest.raises(ValueError, match="model directory could not be resolved safely"):
+        ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+
+@pytest.mark.skipif(os.name == "posix", reason="Exercises the Windows fallback")
+@pytest.mark.parametrize("reparse_level", ["repository", "snapshots", "revision"])
+def test_windows_model_file_open_applies_snapshot_reparse_checks_to_regular_files(
+    tmp_path, monkeypatch, reparse_level
+):
+    repository, snapshot = _hub_snapshot(tmp_path)
+    snapshots = repository / "snapshots"
+    candidate = snapshot / "config.json"
+    candidate.write_text('{"hidden_size":4096}', encoding="utf-8")
+    paths = {
+        "repository": repository,
+        "snapshots": snapshots,
+        "revision": snapshot,
+    }
+    original_lstat = model_evidence._path_lstat
+
+    def fake_lstat(path):
+        value = original_lstat(path)
+        if path == paths[reparse_level]:
+            return SimpleNamespace(
+                st_mode=value.st_mode,
+                st_dev=value.st_dev,
+                st_ino=value.st_ino,
+                st_file_attributes=0x400,
+            )
+        return value
+
+    monkeypatch.setattr(model_evidence, "_path_lstat", fake_lstat)
+
+    with pytest.raises(ValueError, match="snapshot hierarchy|model root"):
+        with model_evidence._open_model_file(snapshot, "config.json"):
+            pass
 
 
 @pytest.mark.parametrize(
