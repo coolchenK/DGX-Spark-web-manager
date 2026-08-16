@@ -52,7 +52,7 @@ VALID_APPROVAL = {
     "plan_id": "plan-1",
     "step_id": "step-1",
     "approved_by": "admin",
-    "approved_at": "2026-08-17T00:00:00Z",
+    "approved_at": "2026-08-16T00:00:00Z",
 }
 
 READ_ACTION_CASES = {
@@ -172,6 +172,8 @@ def test_policy_read_only_actions_reject_unknown_parameter_keys(action):
         ("systemd.status", {"service": "../user.service"}),
         ("systemd.status", {"service": "user/service"}),
         ("systemd.status", {"service": "user.service;id"}),
+        ("systemd.status", {"service": "1"}),
+        ("systemd.journal", {"service": "0001", "tail": 10}),
         ("systemd.status", {"service": "a" * 257}),
         ("systemd.journal", {"service": "docker.service", "tail": False}),
     ],
@@ -197,6 +199,13 @@ def test_policy_read_tools_enforce_exact_required_types(action, parameters):
         validate_action(action, parameters, approval=None)
 
 
+@pytest.mark.parametrize("service", ["ssh", "nginx.service", "worker@.service"])
+def test_policy_systemd_accepts_non_numeric_unit_names(service):
+    validated = validate_action("systemd.status", {"service": service}, approval=None)
+
+    assert validated.argv[-1] == service
+
+
 def test_policy_shell_requires_complete_approval_and_binds_bash_argv():
     parameters = {"command": "printf ok", "cwd": "/var/tmp", "timeout": 30}
 
@@ -206,7 +215,13 @@ def test_policy_shell_requires_complete_approval_and_binds_bash_argv():
     validated = validate_action("shell.execute", parameters, approval=VALID_APPROVAL)
 
     assert validated.action == "shell.execute"
-    assert validated.argv == ("/bin/bash", "-lc", "printf ok")
+    assert validated.argv == (
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        "printf ok",
+    )
     assert validated.cwd == "/var/tmp"
     assert validated.timeout == 30
     assert validated.read_only is False
@@ -214,7 +229,7 @@ def test_policy_shell_requires_complete_approval_and_binds_bash_argv():
     assert validated.approval.plan_id == "plan-1"
     assert validated.approval.step_id == "step-1"
     assert validated.approval.approved_by == "admin"
-    assert validated.approval.approved_at == "2026-08-17T00:00:00Z"
+    assert validated.approval.approved_at == "2026-08-16T00:00:00Z"
 
 
 def test_policy_shell_defaults_timeout_but_still_requires_approval():
@@ -356,6 +371,89 @@ def test_policy_shell_approval_has_exact_bounded_utc_schema(approval):
             {"command": "id", "cwd": "/", "timeout": 30},
             approval=approval,
         )
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        " leading",
+        "contains space",
+        "-leading-option",
+        "unicode-\u8bb0",
+        "control-\x85",
+        "bidi-\u202e",
+        "line-\u2028separator",
+        "paragraph-\u2029separator",
+        "path/segment",
+    ],
+)
+def test_policy_approval_identifiers_are_strict_ascii(identifier):
+    approval = dict(VALID_APPROVAL, approved_by=identifier)
+
+    with pytest.raises(PolicyError, match="^invalid approval$") as exc_info:
+        validate_action(
+            "shell.execute",
+            {"command": "id", "cwd": "/"},
+            approval=approval,
+        )
+
+    assert identifier not in str(exc_info.value)
+
+
+def test_policy_approval_rejects_more_than_five_minutes_in_request_future():
+    at_boundary = dict(VALID_APPROVAL, approved_at="2026-08-17T00:05:00Z")
+    too_far = dict(VALID_APPROVAL, approved_at="2026-08-17T00:05:01Z")
+    reference = 1_786_924_800
+
+    accepted = validate_action(
+        "shell.execute",
+        {"command": "id", "cwd": "/"},
+        approval=at_boundary,
+        request_timestamp=reference,
+    )
+
+    assert accepted.approval is not None
+    assert accepted.approval.approved_at == "2026-08-17T00:05:00Z"
+    with pytest.raises(PolicyError, match="^invalid approval$"):
+        validate_action(
+            "shell.execute",
+            {"command": "id", "cwd": "/"},
+            approval=too_far,
+            request_timestamp=reference,
+        )
+
+
+def test_policy_approval_rejects_far_future_timestamp_against_system_time():
+    approval = dict(VALID_APPROVAL, approved_at="9999-12-31T23:59:59Z")
+
+    with pytest.raises(PolicyError, match="^invalid approval$"):
+        validate_action(
+            "shell.execute",
+            {"command": "id", "cwd": "/"},
+            approval=approval,
+        )
+
+
+@pytest.mark.parametrize("request_timestamp", [True, 1.0, "1786924800", -1, 10**100])
+def test_policy_shell_rejects_invalid_request_timestamp(request_timestamp):
+    with pytest.raises(PolicyError, match="^invalid request timestamp$"):
+        validate_action(
+            "shell.execute",
+            {"command": "id", "cwd": "/"},
+            approval=VALID_APPROVAL,
+            request_timestamp=request_timestamp,
+        )
+
+
+def test_policy_read_tools_ignore_request_timestamp():
+    validated = validate_action(
+        "host.memory",
+        {},
+        approval=None,
+        request_timestamp=10**100,
+    )
+
+    assert validated.read_only is True
 
 
 def test_policy_fails_closed_without_echoing_action_or_command_secrets():

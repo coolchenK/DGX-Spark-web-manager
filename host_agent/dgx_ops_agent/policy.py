@@ -6,7 +6,7 @@ import posixpath
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any
 
@@ -16,6 +16,7 @@ MAX_ENVIRONMENT_VARIABLES = 16
 MAX_ENVIRONMENT_VALUE_LENGTH = 256
 MAX_IDENTIFIER_LENGTH = 128
 MAX_SERVICE_LENGTH = 256
+APPROVAL_FUTURE_SKEW_SECONDS = 300
 DEFAULT_TIMEOUT = 30
 MIN_TIMEOUT = 1
 MAX_TIMEOUT = 3_600
@@ -26,6 +27,9 @@ _CONTAINER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SERVICE_PATTERN = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 _UTC_TIMESTAMP_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z"
+)
+_APPROVAL_IDENTIFIER_PATTERN = re.compile(
+    rf"[A-Za-z0-9][A-Za-z0-9._@:-]{{0,{MAX_IDENTIFIER_LENGTH - 1}}}\Z"
 )
 _ALLOWED_ENVIRONMENT_KEYS = frozenset(
     {
@@ -180,6 +184,8 @@ def validate_action(
     action: str,
     parameters: dict[str, Any],
     approval: dict[str, Any] | None,
+    *,
+    request_timestamp: int | None = None,
 ) -> ValidatedAction:
     """Validate an action and bind it to a fixed executable invocation."""
 
@@ -195,10 +201,11 @@ def validate_action(
         raise PolicyError("unknown action")
 
     command, cwd, timeout, environment = _validate_shell_parameters(parameters)
-    approval_metadata = _validate_approval(approval)
+    reference_time = _approval_reference_time(request_timestamp)
+    approval_metadata = _validate_approval(approval, reference_time)
     return ValidatedAction(
         action=action,
-        argv=("/bin/bash", "-lc", command),
+        argv=("/bin/bash", "--noprofile", "--norc", "-c", command),
         cwd=cwd,
         timeout=timeout,
         read_only=False,
@@ -223,6 +230,7 @@ def _validate_service(value: Any) -> str:
         not isinstance(value, str)
         or len(value) > MAX_SERVICE_LENGTH
         or value.startswith("-")
+        or value.isdecimal()
         or _SERVICE_PATTERN.fullmatch(value) is None
     ):
         raise PolicyError("invalid parameters")
@@ -288,7 +296,21 @@ def _validate_environment(value: Any) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(environment))
 
 
-def _validate_approval(approval: dict[str, Any] | None) -> ApprovalMetadata:
+def _approval_reference_time(request_timestamp: int | None) -> datetime:
+    if request_timestamp is None:
+        return datetime.now(UTC)
+    if type(request_timestamp) is not int or request_timestamp < 0:
+        raise PolicyError("invalid request timestamp")
+    try:
+        return datetime.fromtimestamp(request_timestamp, UTC)
+    except (OSError, OverflowError, ValueError):
+        raise PolicyError("invalid request timestamp") from None
+
+
+def _validate_approval(
+    approval: dict[str, Any] | None,
+    reference_time: datetime,
+) -> ApprovalMetadata:
     if type(approval) is not dict:
         raise PolicyError("invalid approval")
     expected = frozenset({"plan_id", "step_id", "approved_by", "approved_at"})
@@ -305,9 +327,11 @@ def _validate_approval(approval: dict[str, Any] | None) -> ApprovalMetadata:
     ):
         raise PolicyError("invalid approval")
     try:
-        datetime.fromisoformat(approved_at[:-1] + "+00:00")
+        approved_time = datetime.fromisoformat(approved_at[:-1] + "+00:00")
     except ValueError:
         raise PolicyError("invalid approval") from None
+    if (approved_time - reference_time).total_seconds() > APPROVAL_FUTURE_SKEW_SECONDS:
+        raise PolicyError("invalid approval")
 
     return ApprovalMetadata(
         plan_id=plan_id,
@@ -320,16 +344,14 @@ def _validate_approval(approval: dict[str, Any] | None) -> ApprovalMetadata:
 def _validate_approval_identifier(value: Any) -> str:
     if (
         not isinstance(value, str)
-        or not value
-        or len(value) > MAX_IDENTIFIER_LENGTH
-        or value != value.strip()
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or _APPROVAL_IDENTIFIER_PATTERN.fullmatch(value) is None
     ):
         raise PolicyError("invalid approval")
     return value
 
 
 __all__ = [
+    "APPROVAL_FUTURE_SKEW_SECONDS",
     "ApprovalMetadata",
     "PolicyError",
     "READ_ONLY_ACTIONS",
