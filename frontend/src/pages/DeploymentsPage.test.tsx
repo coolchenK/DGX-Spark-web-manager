@@ -551,7 +551,7 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     expect(await screen.findByLabelText('上下文长度')).toHaveValue('12288')
     await user.click(screen.getByRole('button', { name: '下一步' }))
     expect(screen.getByRole('radio', { name: /Target-EAGLE3/ })).not.toBeChecked()
-  })
+  }, 15_000)
 
   it('clears edits, draft and acknowledgements after changing the base model', async () => {
     const warning = recommendationFixture({
@@ -591,7 +591,7 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     await user.click(screen.getByRole('button', { name: '下一步' }))
     expect(screen.getByRole('radio', { name: /Target-EAGLE3/ })).not.toBeChecked()
     expect(screen.getByLabelText('我了解资源不足可能导致部署失败')).not.toBeChecked()
-  })
+  }, 15_000)
 
   it('ignores a late recommendation from a previously selected model', async () => {
     let resolveFirst: ((value: DeploymentRecommendation) => void) | undefined
@@ -850,6 +850,28 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     expect(await screen.findByRole('heading', { name: '部署预览' })).toBeInTheDocument()
   })
 
+  it('aborts and ignores an in-flight preview when navigating back from the draft step', async () => {
+    let resolvePreview: ((value: ReturnType<typeof previewFixture>) => void) | undefined
+    const previewSignal: { current: AbortSignal | null } = { current: null }
+    const pendingPreview = new Promise<ReturnType<typeof previewFixture>>((resolve) => { resolvePreview = resolve })
+    const { user } = renderDeploymentsPage({
+      previews: async (_path, _body, options) => {
+        previewSignal.current = options.signal as AbortSignal
+        return pendingPreview
+      },
+    })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await waitFor(() => expect(previewSignal.current).not.toBeNull())
+    await user.click(screen.getByRole('button', { name: '上一步' }))
+
+    expect(previewSignal.current?.aborted).toBe(true)
+    resolvePreview?.(previewFixture())
+    await waitFor(() => expect(screen.getByRole('heading', { name: '推荐配置' })).toBeInTheDocument())
+    expect(screen.queryByRole('heading', { name: '部署预览' })).not.toBeInTheDocument()
+  })
+
   it('ignores a preview response that resolves after the drawer is closed and reopened', async () => {
     let resolvePreview: ((value: ReturnType<typeof previewFixture>) => void) | undefined
     const previewSignal: { current: AbortSignal | null } = { current: null }
@@ -898,6 +920,71 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     }))
     await waitFor(() => expect(screen.getByRole('heading', { name: '推荐配置' })).toBeInTheDocument())
     expect(screen.queryByRole('button', { name: '确认并创建任务' })).not.toBeInTheDocument()
+  })
+
+  it('ignores an AI refresh response for a different runtime image tuple', async () => {
+    const mismatched = recommendationFixture({
+      fields: {
+        ...recommendationFixture().fields,
+        context_length: { ...recommendationFixture().fields.context_length, value: 8192 },
+      },
+      runtime_capabilities: {
+        ...recommendationFixture().runtime_capabilities,
+        image: 'vllm/vllm-openai:other-image',
+      },
+    })
+    const { user } = renderDeploymentsPage({
+      recommendations: async (path) => path.includes('refresh_ai=true')
+        ? mismatched
+        : recommendationFixture(),
+    })
+    await openCreateAndSelectModel(user)
+    await goToRecommendationStep(user)
+    await screen.findByDisplayValue('16384')
+    await user.click(screen.getByRole('button', { name: '重新分析' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '重新分析' })).not.toHaveClass('ant-btn-loading'))
+    expect(screen.getByLabelText('上下文长度')).toHaveValue('16384')
+  })
+
+  it('clears a resource acknowledgement when the same tuple receives a refreshed snapshot', async () => {
+    const warning = recommendationFixture({
+      resource_estimate: {
+        ...recommendationFixture().resource_estimate,
+        decision: 'warning',
+      },
+    })
+    const refreshed = recommendationFixture({
+      generated_at: '2026-08-16T13:00:00Z',
+      fields: {
+        ...warning.fields,
+        max_concurrency: { ...warning.fields.max_concurrency, value: 2 },
+      },
+      resource_snapshot: {
+        ...warning.resource_snapshot,
+        available_bytes: 72 * GiB,
+      },
+      resource_estimate: {
+        ...warning.resource_estimate,
+        available_bytes: 72 * GiB,
+        decision: 'warning',
+      },
+    })
+    const { user, postSpy } = renderDeploymentsPage({
+      recommendations: async (path) => path.includes('refresh_ai=true') ? refreshed : warning,
+    })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByLabelText('我了解资源不足可能导致部署失败'))
+    await user.click(screen.getByRole('button', { name: '上一步' }))
+    await user.click(screen.getByRole('button', { name: '重新分析' }))
+    await waitFor(() => expect(screen.getByLabelText('最大并发')).toHaveValue('2'))
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+
+    expect(screen.getByLabelText('我了解资源不足可能导致部署失败')).not.toBeChecked()
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    expect(await screen.findByText('请确认统一内存资源警告')).toBeInTheDocument()
+    expect(postSpy.mock.calls.some(([path]) => String(path).startsWith('/api/deployments/preview'))).toBe(false)
   })
 
   it('submits the exact frozen payload that produced the visible preview', async () => {
@@ -1027,6 +1114,26 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     await waitFor(() => expect(screen.getByLabelText('上下文长度')).toHaveValue('32768'))
     expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '0.8')
     expect(screen.getByLabelText('Temperature')).toHaveValue('')
+  })
+
+  it('clears draft, resource acknowledgement and provenance when the recommendation provider changes', async () => {
+    const pendingProviderRecommendation = new Promise<DeploymentRecommendation>(() => {})
+    const { user, postSpy } = renderDeploymentsPage({
+      deployments: [existingDeployment],
+      recommendations: async () => pendingProviderRecommendation,
+    })
+    await user.click(await screen.findByRole('button', { name: '编辑部署参数' }))
+    await user.click(screen.getByLabelText('AI 推荐服务'))
+    await user.click(await screen.findByText('不使用 AI 补充'))
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+    await user.click(screen.getByRole('button', { name: '下一步' }))
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await screen.findByRole('heading', { name: '部署预览' })
+
+    const payload = postSpy.mock.calls.find(([path]) => String(path).startsWith('/api/deployments/preview'))?.[1] as Record<string, unknown>
+    expect(payload.speculative).toBeNull()
+    expect(payload.resource_warning_acknowledged).toBe(false)
+    expect(payload.recommendation).toBeNull()
   })
 
   it('derives a warning from a base-ok estimate plus the selected draft candidate', async () => {

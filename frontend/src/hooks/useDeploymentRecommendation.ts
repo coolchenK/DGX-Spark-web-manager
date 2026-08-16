@@ -206,6 +206,16 @@ export function useDeploymentRecommendation({
         { signal: token.controller.signal },
       )
       assertOwnership()
+      if (
+        result.model_id !== activeTuple.modelId
+        || result.runtime !== activeTuple.runtime
+        || (
+          result.runtime_capabilities.image != null
+          && result.runtime_capabilities.image !== activeTuple.image
+        )
+      ) {
+        throw new Error('AI recommendation refresh returned for a different tuple')
+      }
       await queryClient.cancelQueries({ queryKey, exact: true })
       assertOwnership()
       queryClient.setQueryData(queryKey, result)

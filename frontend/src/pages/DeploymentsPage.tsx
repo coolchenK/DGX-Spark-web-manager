@@ -150,6 +150,16 @@ function isAbortError(error: unknown): boolean {
 }
 
 
+function recommendationTupleKey(
+  modelId: string | undefined,
+  runtime: 'vllm' | 'sglang',
+  image: string | undefined,
+  providerId: string | null | undefined,
+): string {
+  return JSON.stringify([modelId ?? '', runtime, image ?? '', providerId || null])
+}
+
+
 function recommendationPaths(recommendation: DeploymentRecommendation): Set<string> {
   return new Set([
     ...Object.keys(recommendation.fields),
@@ -305,7 +315,7 @@ export function DeploymentsPage() {
   const providerId = Form.useWatch('provider_id', watchOptions)
   const selectedDraftId = Form.useWatch(['speculative', 'draft_model_id'], watchOptions)
   const currentTupleKey = useMemo(
-    () => JSON.stringify([modelId ?? '', runtime, image ?? '', providerId || null]),
+    () => recommendationTupleKey(modelId, runtime, image, providerId),
     [image, modelId, providerId, runtime],
   )
 
@@ -389,12 +399,16 @@ export function DeploymentsPage() {
     clearRecommendationValues(stalePaths, force ? stalePaths : new Set())
     invalidatePreview(1)
     applyingRecommendation.current = true
-    form.setFieldsValue(valuesFromRecommendation(result, currentEdited, force))
+    form.setFieldsValue({
+      ...valuesFromRecommendation(result, currentEdited, force),
+      resource_warning_acknowledged: false,
+    })
     applyingRecommendation.current = false
     lastAppliedRecommendation.current = result
-    if (force) {
-      replaceEditedFields(new Set([...editedFieldsRef.current].filter((path) => !nextPaths.has(path))))
-    }
+    replaceEditedFields(new Set([...editedFieldsRef.current].filter((path) => (
+      path !== 'resource_warning_acknowledged'
+      && (!force || !nextPaths.has(path))
+    ))))
   }, [clearRecommendationValues, form, invalidatePreview, replaceEditedFields])
 
   useEffect(() => {
@@ -640,9 +654,29 @@ export function DeploymentsPage() {
   })
 
   const handleRetryAI = async () => {
+    const requestedTupleKey = recommendation.activeTupleKey
+    if (!requestedTupleKey || requestedTupleKey !== currentTupleKey) return
     try {
       const refreshed = await recommendation.refreshAI()
-      if (refreshed.model_id === form.getFieldValue('model_id') && refreshed.runtime === form.getFieldValue('runtime')) {
+      const currentModelId = form.getFieldValue('model_id') as string | undefined
+      const currentRuntime = form.getFieldValue('runtime') as 'vllm' | 'sglang'
+      const currentImage = form.getFieldValue('image') as string | undefined
+      const currentProviderId = form.getFieldValue('provider_id') as string | null | undefined
+      const formTupleKey = recommendationTupleKey(
+        currentModelId,
+        currentRuntime,
+        currentImage,
+        currentProviderId,
+      )
+      if (
+        requestedTupleKey === formTupleKey
+        && refreshed.model_id === currentModelId
+        && refreshed.runtime === currentRuntime
+        && (
+          refreshed.runtime_capabilities.image == null
+          || refreshed.runtime_capabilities.image === currentImage
+        )
+      ) {
         applyRecommendation(refreshed, false)
       }
     } catch (error) {
@@ -778,6 +812,11 @@ export function DeploymentsPage() {
       setStep(2)
       return
     }
+    if (step === 2) {
+      invalidatePreview()
+      setStep(1)
+      return
+    }
     setStep((current) => Math.max(0, current - 1))
   }
 
@@ -841,9 +880,18 @@ export function DeploymentsPage() {
       const previousPaths = priorRecommendationPaths()
       clearRecommendationValues(previousPaths)
       lastAppliedRecommendation.current = null
+      restoredTupleKey.current = null
       applyingRecommendation.current = true
-      form.setFieldValue('recommendation', null)
+      form.setFieldsValue({
+        speculative: null,
+        resource_warning_acknowledged: false,
+        recommendation: null,
+      })
       applyingRecommendation.current = false
+      replaceEditedFields(new Set([...editedFieldsRef.current].filter((path) => (
+        !path.startsWith('speculative.')
+        && path !== 'resource_warning_acknowledged'
+      ))))
     }
   }
 
