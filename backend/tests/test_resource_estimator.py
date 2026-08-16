@@ -4,6 +4,9 @@ import math
 
 import pytest
 from app.services.resource_estimator import (
+    MAX_KV_CACHE_BYTES,
+    MAX_RESERVE_MIN_BYTES,
+    ContextClampResult,
     ResourceEstimate,
     ResourceEstimator,
     clamp_context_length,
@@ -151,9 +154,11 @@ def test_kv_overflow_lowers_estimate_confidence() -> None:
         max_concurrency=1_048_576,
         system_memory={"total_bytes": 128 * GiB},
     )
-    assert estimate.kv_cache_bytes == 0
+    assert estimate.kv_cache_bytes == MAX_KV_CACHE_BYTES
     assert estimate.confidence == "low"
-    assert any("invalid" in reason.lower() for reason in estimate.reasons)
+    assert estimate.decision == "blocked"
+    assert any("overflow" in reason.lower() for reason in estimate.reasons)
+    assert any("physical" in reason.lower() for reason in estimate.reasons)
 
 
 def test_reserve_bytes_uses_floor_and_minimum() -> None:
@@ -218,10 +223,7 @@ def test_missing_architecture_lowers_confidence_with_reason() -> None:
         system_memory={"total_bytes": 128 * GiB},
     )
     assert estimate.confidence == "low"
-    assert any(
-        "architecture" in reason.lower() or "kv" in reason.lower()
-        for reason in estimate.reasons
-    )
+    assert any("missing" in reason.lower() for reason in estimate.reasons)
 
 
 @pytest.mark.parametrize(
@@ -275,6 +277,50 @@ def test_estimator_options_are_strictly_validated(kwargs: dict[str, object]) -> 
         ResourceEstimator(**kwargs)
 
 
+def test_reserve_minimum_has_a_consistent_one_pib_upper_bound() -> None:
+    assert MAX_RESERVE_MIN_BYTES == 1 << 50
+    assert ResourceEstimator(reserve_min_bytes=1 << 50).reserve_min_bytes == 1 << 50
+    with pytest.raises(ValueError, match="1 PiB"):
+        ResourceEstimator(reserve_min_bytes=(1 << 50) + 1)
+
+
+@pytest.mark.parametrize(("field", "value"), [("total_bytes", "1"), ("available_bytes", True)])
+def test_resource_estimate_rejects_coerced_field_types(field: str, value: object) -> None:
+    payload = {
+        "total_bytes": 1,
+        "available_bytes": 1,
+        "reserved_bytes": 0,
+        "weight_bytes": 0,
+        "draft_weight_bytes": 0,
+        "kv_cache_bytes": 0,
+        "runtime_overhead_bytes": 0,
+        "required_bytes": 0,
+        "decision": "ok",
+        "confidence": "high",
+        "reasons": [],
+    }
+    payload[field] = value
+    with pytest.raises(ValueError):
+        ResourceEstimate.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("original_context_length", "1024"), ("final_context_length", True)],
+)
+def test_context_clamp_result_rejects_coerced_field_types(field: str, value: object) -> None:
+    payload = {
+        "original_context_length": 1024,
+        "final_context_length": 1024,
+        "final_decision": "ok",
+        "fits": True,
+        "explanation": "fits",
+    }
+    payload[field] = value
+    with pytest.raises(ValueError):
+        ContextClampResult.model_validate(payload)
+
+
 def test_context_clamp_retries_until_not_blocked() -> None:
     calls: list[int] = []
 
@@ -299,6 +345,8 @@ def test_context_clamp_retries_until_not_blocked() -> None:
     result = clamp_context_length(20000, 16384, factory)
     assert result.original_context_length == 20000
     assert result.final_context_length == 4096
+    assert result.final_decision == "ok"
+    assert result.fits is True
     assert "blocked estimates" in result.explanation
     assert calls == [16384, 8192, 4096]
 
@@ -330,6 +378,34 @@ def test_context_clamp_reports_hard_limit_without_claiming_blocked_estimates() -
     assert calls == [8192]
 
 
+def test_context_clamp_explains_non_aligned_hard_limit() -> None:
+    calls: list[int] = []
+
+    def factory(context: int) -> ResourceEstimate:
+        calls.append(context)
+        return ResourceEstimate(
+            total_bytes=1,
+            available_bytes=1,
+            reserved_bytes=0,
+            weight_bytes=0,
+            draft_weight_bytes=0,
+            kv_cache_bytes=0,
+            runtime_overhead_bytes=0,
+            required_bytes=0,
+            decision="ok",
+            confidence="high",
+            reasons=[],
+        )
+
+    result = clamp_context_length(8000, 5000, factory)
+    assert result.original_context_length == 8000
+    assert result.final_context_length == 4096
+    assert "hard limit 5000" in result.explanation
+    assert "aligned" in result.explanation
+    assert "4096" in result.explanation
+    assert calls == [4096]
+
+
 def test_context_clamp_respects_lower_bound() -> None:
     calls: list[int] = []
 
@@ -339,7 +415,23 @@ def test_context_clamp_respects_lower_bound() -> None:
 
     result = clamp_context_length(2048, 2048, factory)
     assert result.final_context_length == 1024
+    assert result.final_decision == "blocked"
+    assert result.fits is False
+    assert "minimum" in result.explanation
+    assert "still blocked" in result.explanation
     assert calls == [2048, 1024]
+
+
+def test_context_clamp_reports_requested_minimum_still_blocked() -> None:
+    result = clamp_context_length(
+        1024, 4096, lambda _: ResourceEstimate.blocked("physical memory exceeded")
+    )
+    assert result.final_context_length == 1024
+    assert result.final_decision == "blocked"
+    assert result.fits is False
+    assert "minimum" in result.explanation
+    assert "still blocked" in result.explanation
+    assert "fits" not in result.explanation
 
 
 def test_context_clamp_validates_requested_and_hard_limit() -> None:

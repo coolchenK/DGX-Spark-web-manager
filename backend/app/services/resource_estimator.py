@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,11 +12,17 @@ RUNTIME_WORKSPACE_BYTES = 2 * GiB
 MAX_CONTEXT_LENGTH = 1_048_576
 MAX_CONCURRENCY = 1_048_576
 MAX_SIZE_BYTES = 1 << 60
-MAX_RESERVE_MIN_BYTES = 1 << 60
+MAX_RESERVE_MIN_BYTES = 1 << 50
 MAX_HIDDEN_SIZE = 1_048_576
 MAX_NUM_LAYERS = 4096
 MAX_NUM_HEADS = 4096
 MAX_KV_CACHE_BYTES = (1 << 63) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class _KvCacheResult:
+    bytes: int
+    status: Literal["ok", "missing", "invalid", "overflow"]
 
 
 def _positive_int(value: Any, *, maximum: int | None = None) -> int | None:
@@ -48,18 +55,21 @@ def _size_bytes(value: Any, *, name: str, allow_zero: bool = True) -> int:
     return _bounded_int(value, name=name, minimum=minimum, maximum=MAX_SIZE_BYTES)
 
 
-def kv_cache_bytes(
+def _estimate_kv_cache(
     config: Mapping[str, Any] | None,
     context_length: int,
     max_concurrency: int,
-) -> int:
-    """Estimate fp16 KV cache bytes for one request batch.
-
-    Missing or malformed architecture metadata deliberately returns zero. The
-    caller can then lower confidence and surface that the estimate is partial.
-    """
+) -> _KvCacheResult:
     if not isinstance(config, Mapping):
-        return 0
+        status: Literal["missing", "invalid"] = "missing" if config is None else "invalid"
+        return _KvCacheResult(bytes=0, status=status)
+    required_fields = (
+        ("hidden_size", MAX_HIDDEN_SIZE),
+        ("num_hidden_layers", MAX_NUM_LAYERS),
+        ("num_attention_heads", MAX_NUM_HEADS),
+    )
+    if any(key not in config or config.get(key) is None for key, _ in required_fields):
+        return _KvCacheResult(bytes=0, status="missing")
     hidden = _positive_int(config.get("hidden_size"), maximum=MAX_HIDDEN_SIZE)
     layers = _positive_int(config.get("num_hidden_layers"), maximum=MAX_NUM_LAYERS)
     attention_heads = _positive_int(
@@ -71,7 +81,7 @@ def kv_cache_bytes(
     else:
         kv_heads = _positive_int(raw_kv_heads, maximum=MAX_NUM_HEADS)
         if kv_heads is None:
-            return 0
+            return _KvCacheResult(bytes=0, status="invalid")
     context = _positive_int(context_length, maximum=MAX_CONTEXT_LENGTH)
     concurrency = _positive_int(max_concurrency, maximum=MAX_CONCURRENCY)
     if (
@@ -81,17 +91,28 @@ def kv_cache_bytes(
         or not context
         or not concurrency
     ):
-        return 0
+        return _KvCacheResult(bytes=0, status="invalid")
     if hidden % attention_heads != 0:
-        return 0
+        return _KvCacheResult(bytes=0, status="invalid")
     head_dim = hidden // attention_heads
     if head_dim <= 0:
-        return 0
+        return _KvCacheResult(bytes=0, status="invalid")
     result = _checked_product(
         (2, layers, kv_heads, head_dim, context, concurrency, 2),
         maximum=MAX_KV_CACHE_BYTES,
     )
-    return result or 0
+    if result is None:
+        return _KvCacheResult(bytes=0, status="overflow")
+    return _KvCacheResult(bytes=result, status="ok")
+
+
+def kv_cache_bytes(
+    config: Mapping[str, Any] | None,
+    context_length: int,
+    max_concurrency: int,
+) -> int:
+    """Estimate fp16 KV bytes, returning zero when metadata is not safely usable."""
+    return _estimate_kv_cache(config, context_length, max_concurrency).bytes
 
 
 def reserve_bytes(total_bytes: int, fraction: float, minimum: int) -> int:
@@ -100,7 +121,7 @@ def reserve_bytes(total_bytes: int, fraction: float, minimum: int) -> int:
 
 
 class ResourceEstimate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     total_bytes: int = Field(ge=0)
     available_bytes: int = Field(ge=0)
@@ -132,10 +153,12 @@ class ResourceEstimate(BaseModel):
 
 
 class ContextClampResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     original_context_length: int = Field(ge=1024)
     final_context_length: int = Field(ge=1024)
+    final_decision: Literal["ok", "warning", "blocked"]
+    fits: bool
     explanation: str
 
 
@@ -196,11 +219,20 @@ class ResourceEstimator:
             available = total
             reasons.append("available memory exceeded total memory and was clamped")
 
-        kv_cache = kv_cache_bytes(config, context, concurrency)
+        kv_result = _estimate_kv_cache(config, context, concurrency)
+        kv_cache = MAX_KV_CACHE_BYTES if kv_result.status == "overflow" else kv_result.bytes
         confidence: Literal["high", "low"] = "high"
-        if kv_cache == 0:
+        if kv_result.status == "missing":
             confidence = "low"
-            reasons.append("architecture fields were unavailable or invalid; KV cache is omitted")
+            reasons.append("architecture fields are missing; KV cache is omitted")
+        elif kv_result.status == "invalid":
+            confidence = "low"
+            reasons.append("architecture fields are invalid; KV cache is omitted")
+        elif kv_result.status == "overflow":
+            confidence = "low"
+            reasons.append(
+                "physical KV cache estimate overflow exceeds the supported int64 memory range"
+            )
 
         # 1.15 weight multiplier is rounded up using integer arithmetic so the
         # result is deterministic and never underestimates model storage.
@@ -208,8 +240,11 @@ class ResourceEstimator:
         draft_weight_bytes = (draft_size * 115 + 99) // 100
         required = weight_bytes + draft_weight_bytes + kv_cache + RUNTIME_WORKSPACE_BYTES
         reserved = reserve_bytes(total, self.reserve_fraction, self.reserve_min_bytes)
-        if required > total:
-            decision: Literal["ok", "warning", "blocked"] = "blocked"
+        decision: Literal["ok", "warning", "blocked"]
+        if kv_result.status == "overflow":
+            decision = "blocked"
+        elif required > total:
+            decision = "blocked"
             reasons.insert(0, "physical memory requirement exceeds total memory")
         elif required > max(0, available - reserved):
             decision = "warning"
@@ -252,15 +287,25 @@ def clamp_context_length(
     blocked_reductions = 0
     while True:
         attempts.append(current)
-        estimate = estimate_factory(current)
-        if estimate.decision != "blocked" or current == 1024:
+        final_estimate = estimate_factory(current)
+        if final_estimate.decision != "blocked" or current == 1024:
             break
         blocked_reductions += 1
         current = max(1024, ((current // 2) // 1024) * 1024)
-    if blocked_reductions:
+    fits = final_estimate.decision != "blocked"
+    if not fits:
+        explanation = (
+            f"minimum context length {current} is still blocked after resource estimates "
+            f"({', '.join(map(str, attempts))})"
+        )
+    elif blocked_reductions:
         explanation = (
             f"context length reduced from {original} to {current} after blocked estimates "
             f"({', '.join(map(str, attempts))})"
+        )
+    elif capped_by_hard_limit and aligned_down:
+        explanation = (
+            f"context length capped by hard limit {limit} and aligned down to {current}"
         )
     elif capped_by_hard_limit:
         explanation = f"context length capped at hard limit {limit}"
@@ -271,5 +316,7 @@ def clamp_context_length(
     return ContextClampResult(
         original_context_length=original,
         final_context_length=current,
+        final_decision=final_estimate.decision,
+        fits=fits,
         explanation=explanation,
     )
