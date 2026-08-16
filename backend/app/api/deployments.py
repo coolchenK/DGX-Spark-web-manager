@@ -222,7 +222,12 @@ def deployment_action(
             if action == "delete"
             else f"{action} {deployment.name}"
         ),
-        input_json={"deployment_id": deployment_id, "action": action},
+        input_json={
+            "deployment_id": deployment_id,
+            "action": action,
+            "expected_container_id": deployment.container_id,
+            "expected_container_name": deployment.container_name,
+        },
         idempotency_key=f"deployment:{deployment_id}:{action}",
     )
     record_audit(

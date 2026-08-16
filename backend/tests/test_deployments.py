@@ -286,6 +286,8 @@ def build_action_service(database, model_root, target):
             get_calls.append(identifier)
             if isinstance(target, BaseException):
                 raise target
+            if callable(target):
+                return target(identifier)
             return target
 
     client = type("Client", (), {"containers": Containers()})()
@@ -359,7 +361,12 @@ def test_discovered_delete_confirmation_is_not_persisted(authenticated_client):
     with authenticated_client.app.state.database.session_factory() as db:
         task = db.get(TaskRecord, response.json()["id"])
         assert task.title == "卸载服务 discovered"
-        assert task.input_json == {"deployment_id": deployment_id, "action": "delete"}
+        assert task.input_json == {
+            "deployment_id": deployment_id,
+            "action": "delete",
+            "expected_container_id": "a" * 64,
+            "expected_container_name": "dgx-discovered",
+        }
         audit = db.query(AuditEvent).filter_by(action="deployment.delete").one()
         assert "confirm" not in json.dumps(audit.details).lower()
 
@@ -2991,6 +2998,186 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
 
     assert container.removed is True
     assert container.remove_force is True
+
+
+def test_queued_delete_rejects_deployment_rebound_to_same_named_container(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'queued-rebound.db'}")
+    database.create_schema()
+    container_a_id = "3a" * 32
+    container_b = ActionContainer("3b" * 32, "shared-name")
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name="discovered",
+            container_id=container_a_id,
+            container_name=container_b.name,
+        )
+        deployment_id = deployment.id
+        deployment.container_id = container_b.id
+        db.commit()
+    service, _, get_calls = build_action_service(database, tmp_path, container_b)
+
+    with pytest.raises(ValueError, match="identity changed concurrently"):
+        service.action_handler(
+            HandlerContext(),
+            {
+                "deployment_id": deployment_id,
+                "action": "delete",
+                "expected_container_id": container_a_id,
+                "expected_container_name": container_b.name,
+            },
+        )
+
+    assert get_calls == []
+    assert container_b.removed is False
+    with database.session_factory() as db:
+        current = db.get(Deployment, deployment_id)
+        assert current.container_id == container_b.id
+
+
+def test_not_found_cleanup_cas_preserves_concurrently_rebound_deployment(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'not-found-rebound.db'}")
+    database.create_schema()
+    container_a_id = "4a" * 32
+    container_b_id = "4b" * 32
+    container_name = "shared-name"
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name="discovered",
+            container_id=container_a_id,
+            container_name=container_name,
+        )
+        deployment_id = deployment.id
+
+    def rebind_then_report_missing(_identifier):
+        with database.session_factory() as db:
+            current = db.get(Deployment, deployment_id)
+            current.container_id = container_b_id
+            current.status = "running"
+            current.health = "healthy"
+            db.commit()
+        raise docker.errors.NotFound("container A disappeared")
+
+    service, _, _ = build_action_service(database, tmp_path, rebind_then_report_missing)
+
+    with pytest.raises(ValueError, match="identity changed concurrently"):
+        service.action_handler(
+            HandlerContext(),
+            {
+                "deployment_id": deployment_id,
+                "action": "delete",
+                "expected_container_id": container_a_id,
+                "expected_container_name": container_name,
+            },
+        )
+
+    with database.session_factory() as db:
+        current = db.get(Deployment, deployment_id)
+        assert current is not None
+        assert current.container_id == container_b_id
+        assert current.status == "running"
+        assert current.health == "healthy"
+
+
+def test_failed_action_recovery_cas_does_not_pollute_rebound_deployment(
+    tmp_path, monkeypatch
+):
+    database = Database(f"sqlite:///{tmp_path / 'failed-rebound.db'}")
+    database.create_schema()
+    container_a = ActionContainer("5a" * 32, "shared-name")
+    container_b_id = "5b" * 32
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=container_a.id,
+            container_name=container_a.name,
+        )
+        deployment_id = deployment.id
+    service, adapter, _ = build_action_service(database, tmp_path, container_a)
+
+    def rebind_then_fail(_container, **_kwargs):
+        with database.session_factory() as db:
+            current = db.get(Deployment, deployment_id)
+            current.container_id = container_b_id
+            current.status = "running"
+            current.health = "healthy"
+            db.commit()
+        raise RuntimeError("container A stop failed")
+
+    monkeypatch.setattr(adapter, "stop", rebind_then_fail)
+    context = HandlerContext()
+
+    with pytest.raises(RuntimeError, match="container A stop failed"):
+        service.action_handler(
+            context,
+            {
+                "deployment_id": deployment_id,
+                "action": "stop",
+                "expected_container_id": container_a.id,
+                "expected_container_name": container_a.name,
+            },
+        )
+
+    with database.session_factory() as db:
+        current = db.get(Deployment, deployment_id)
+        assert current.container_id == container_b_id
+        assert current.status == "running"
+        assert current.health == "healthy"
+    assert "identity changed concurrently" in "\n".join(context.messages)
+
+
+def test_successful_delete_cas_does_not_delete_rebound_deployment(
+    tmp_path, monkeypatch
+):
+    database = Database(f"sqlite:///{tmp_path / 'success-rebound.db'}")
+    database.create_schema()
+    container_a = ActionContainer("6a" * 32, "shared-name")
+    container_b_id = "6b" * 32
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=container_a.id,
+            container_name=container_a.name,
+        )
+        deployment_id = deployment.id
+    service, adapter, _ = build_action_service(database, tmp_path, container_a)
+
+    def uninstall_a_then_rebind(_container):
+        container_a.removed = True
+        with database.session_factory() as db:
+            current = db.get(Deployment, deployment_id)
+            current.container_id = container_b_id
+            current.status = "running"
+            current.health = "healthy"
+            db.commit()
+
+    monkeypatch.setattr(adapter, "uninstall", uninstall_a_then_rebind)
+
+    with pytest.raises(ValueError, match="identity changed concurrently"):
+        service.action_handler(
+            HandlerContext(),
+            {
+                "deployment_id": deployment_id,
+                "action": "delete",
+                "expected_container_id": container_a.id,
+                "expected_container_name": container_a.name,
+            },
+        )
+
+    assert container_a.removed is True
+    with database.session_factory() as db:
+        current = db.get(Deployment, deployment_id)
+        assert current is not None
+        assert current.container_id == container_b_id
+        assert current.status == "running"
+        assert current.health == "healthy"
 
 
 @pytest.mark.parametrize(

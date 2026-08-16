@@ -76,8 +76,10 @@ the exact current container name as confirmation:
 {"confirm_container_name":"external-inference"}
 ```
 
-Missing or mismatched confirmation returns `422` and does not create a task. The confirmation value
-is used only to authorize the request and is not stored in the task input or audit event.
+Missing or mismatched confirmation returns `422` and does not create a task. The submitted
+confirmation field is used only to authorize the request and is not copied into the task input or
+audit event. The server stores its own container ID and name snapshot in the task so a queued action
+cannot be redirected to a replacement container.
 
 ### Permanent model deletion
 

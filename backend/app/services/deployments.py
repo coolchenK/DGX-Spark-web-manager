@@ -13,7 +13,7 @@ import docker
 import httpx
 from docker.errors import NotFound
 from docker.types import DeviceRequest, LogConfig
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Deployment, ModelAsset
@@ -37,6 +37,7 @@ PROTECTED_CONTAINER_NAMES = {
     "dgx-spark-web-manager",
     "dgx-spark-ops-agent",
 }
+CONCURRENT_DEPLOYMENT_CHANGE_ERROR = "Deployment container identity changed concurrently"
 
 
 def resolve_host_model_mount(
@@ -1121,13 +1122,39 @@ class DeploymentService:
             return fallback
         return "unknown"
 
+    @staticmethod
+    def _deployment_identity_filters(
+        deployment_id: str,
+        *,
+        expected_container_id: str | None,
+        expected_container_name: str | None,
+    ) -> tuple[Any, ...]:
+        container_id_filter = (
+            Deployment.container_id.is_(None)
+            if expected_container_id is None
+            else Deployment.container_id == expected_container_id
+        )
+        container_name_filter = (
+            Deployment.container_name.is_(None)
+            if expected_container_name is None
+            else Deployment.container_name == expected_container_name
+        )
+        return (
+            Deployment.id == deployment_id,
+            container_id_filter,
+            container_name_filter,
+        )
+
     def _recover_action_failure(
         self,
         deployment_id: str,
         *,
         container: Any | None,
         original_status: str,
-    ) -> None:
+        expected_container_id: str | None,
+        expected_container_name: str | None,
+        transient_status: str,
+    ) -> bool:
         actual_status = None
         if container is not None:
             try:
@@ -1140,18 +1167,47 @@ class DeploymentService:
             fallback=original_status,
         )
         with self.session_factory() as db:
-            deployment = db.get(Deployment, deployment_id)
-            if deployment is not None:
-                deployment.status = recovered_status
-                deployment.health = "unhealthy"
-                db.commit()
+            result = db.execute(
+                update(Deployment)
+                .where(
+                    *self._deployment_identity_filters(
+                        deployment_id,
+                        expected_container_id=expected_container_id,
+                        expected_container_name=expected_container_name,
+                    ),
+                    Deployment.status == transient_status,
+                )
+                .values(status=recovered_status, health="unhealthy")
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                return False
+            db.commit()
+            return True
 
-    def _delete_stale_deployment(self, deployment_id: str) -> None:
+    def _delete_stale_deployment(
+        self,
+        deployment_id: str,
+        *,
+        expected_container_id: str | None,
+        expected_container_name: str | None,
+        transient_status: str,
+    ) -> None:
         with self.session_factory() as db:
-            deployment = db.get(Deployment, deployment_id)
-            if deployment is not None:
-                db.delete(deployment)
-                db.commit()
+            result = db.execute(
+                delete(Deployment).where(
+                    *self._deployment_identity_filters(
+                        deployment_id,
+                        expected_container_id=expected_container_id,
+                        expected_container_name=expected_container_name,
+                    ),
+                    Deployment.status == transient_status,
+                )
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                raise ValueError(CONCURRENT_DEPLOYMENT_CHANGE_ERROR)
+            db.commit()
 
     def _best_effort_recover_action_failure(
         self,
@@ -1159,15 +1215,52 @@ class DeploymentService:
         *,
         container: Any | None,
         original_status: str,
-    ) -> None:
+        expected_container_id: str | None,
+        expected_container_name: str | None,
+        transient_status: str,
+    ) -> bool | None:
         try:
-            self._recover_action_failure(
+            return self._recover_action_failure(
                 deployment_id,
                 container=container,
                 original_status=original_status,
+                expected_container_id=expected_container_id,
+                expected_container_name=expected_container_name,
+                transient_status=transient_status,
             )
         except Exception:
-            pass
+            return None
+
+    def _finalize_action(
+        self,
+        deployment_id: str,
+        *,
+        action: str,
+        expected_container_id: str | None,
+        expected_container_name: str | None,
+        transient_status: str,
+        status: str,
+        health: str,
+    ) -> None:
+        filters = (
+            *self._deployment_identity_filters(
+                deployment_id,
+                expected_container_id=expected_container_id,
+                expected_container_name=expected_container_name,
+            ),
+            Deployment.status == transient_status,
+        )
+        statement = (
+            delete(Deployment).where(*filters)
+            if action == "delete"
+            else update(Deployment).where(*filters).values(status=status, health=health)
+        )
+        with self.session_factory() as db:
+            result = db.execute(statement)
+            if result.rowcount != 1:
+                db.rollback()
+                raise ValueError(CONCURRENT_DEPLOYMENT_CHANGE_ERROR)
+            db.commit()
 
     @staticmethod
     def _action_result(
@@ -1191,37 +1284,73 @@ class DeploymentService:
         action = str(payload["action"])
         if action not in {"start", "stop", "restart", "delete"}:
             raise ValueError("Unsupported deployment action")
+        has_expected_id = "expected_container_id" in payload
+        has_expected_name = "expected_container_name" in payload
+        if has_expected_id != has_expected_name:
+            raise ValueError("Deployment action container snapshot is incomplete")
         with self.session_factory() as db:
             deployment = db.get(Deployment, deployment_id)
             if not deployment:
                 raise ValueError("Deployment was not found")
-            container_id = deployment.container_id
-            container_name = deployment.container_name
+            expected_container_id = (
+                payload["expected_container_id"]
+                if has_expected_id
+                else deployment.container_id
+            )
+            expected_container_name = (
+                payload["expected_container_name"]
+                if has_expected_name
+                else deployment.container_name
+            )
+            if (
+                deployment.container_id != expected_container_id
+                or deployment.container_name != expected_container_name
+            ):
+                raise ValueError(CONCURRENT_DEPLOYMENT_CHANGE_ERROR)
+            container_id = expected_container_id
+            container_name = expected_container_name
             endpoint_url = deployment.endpoint_url
             runtime = deployment.runtime
             original_status = deployment.status
-            if action == "delete" and not container_id:
-                db.delete(deployment)
-                db.commit()
-                return self._action_result(
-                    deployment_id,
-                    action,
-                    "deleted",
-                    "unknown",
-                    container_missing=True,
-                )
-            if not container_id:
+            if action != "delete" and not container_id:
                 raise ValueError("Deployment or container was not found")
-            if action in {"start", "restart"}:
-                deployment.status = "starting"
-                deployment.health = "unknown"
-            elif action == "stop":
-                deployment.status = "stopping"
-                deployment.health = "unknown"
-            elif action == "delete":
-                deployment.status = "deleting"
-                deployment.health = "unknown"
+            transient_status = {
+                "start": "starting",
+                "restart": "starting",
+                "stop": "stopping",
+                "delete": "deleting",
+            }[action]
+            result = db.execute(
+                update(Deployment)
+                .where(
+                    *self._deployment_identity_filters(
+                        deployment_id,
+                        expected_container_id=expected_container_id,
+                        expected_container_name=expected_container_name,
+                    ),
+                    Deployment.status == original_status,
+                )
+                .values(status=transient_status, health="unknown")
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                raise ValueError(CONCURRENT_DEPLOYMENT_CHANGE_ERROR)
             db.commit()
+
+        if action == "delete" and not container_id:
+            self._delete_stale_deployment(
+                deployment_id,
+                expected_container_id=expected_container_id,
+                expected_container_name=expected_container_name,
+                transient_status=transient_status,
+            )
+            return self._action_result(
+                deployment_id,
+                action,
+                "deleted",
+                "unknown",
+                container_missing=True,
+            )
 
         container = None
         try:
@@ -1247,7 +1376,12 @@ class DeploymentService:
                 new_status = "deleted"
         except NotFound:
             if action == "delete":
-                self._delete_stale_deployment(deployment_id)
+                self._delete_stale_deployment(
+                    deployment_id,
+                    expected_container_id=expected_container_id,
+                    expected_container_name=expected_container_name,
+                    transient_status=transient_status,
+                )
                 return self._action_result(
                     deployment_id,
                     action,
@@ -1255,18 +1389,34 @@ class DeploymentService:
                     "unknown",
                     container_missing=True,
                 )
-            self._best_effort_recover_action_failure(
+            recovered = self._best_effort_recover_action_failure(
                 deployment_id,
                 container=container,
                 original_status=original_status,
+                expected_container_id=expected_container_id,
+                expected_container_name=expected_container_name,
+                transient_status=transient_status,
             )
+            if recovered is False:
+                try:
+                    context.update(message=CONCURRENT_DEPLOYMENT_CHANGE_ERROR)
+                except Exception:
+                    pass
             raise
         except Exception:
-            self._best_effort_recover_action_failure(
+            recovered = self._best_effort_recover_action_failure(
                 deployment_id,
                 container=container,
                 original_status=original_status,
+                expected_container_id=expected_container_id,
+                expected_container_name=expected_container_name,
+                transient_status=transient_status,
             )
+            if recovered is False:
+                try:
+                    context.update(message=CONCURRENT_DEPLOYMENT_CHANGE_ERROR)
+                except Exception:
+                    pass
             raise
         health = "unknown"
         if action in {"start", "restart"}:
@@ -1279,27 +1429,31 @@ class DeploymentService:
                 progress_end=95,
             ):
                 logs = self._startup_logs(adapter, container)
-                with self.session_factory() as db:
-                    deployment = db.get(Deployment, deployment_id)
-                    if deployment:
-                        deployment.status = "running"
-                        deployment.health = "unhealthy"
-                        db.commit()
+                recovered = self._recover_action_failure(
+                    deployment_id,
+                    container=container,
+                    original_status=original_status,
+                    expected_container_id=expected_container_id,
+                    expected_container_name=expected_container_name,
+                    transient_status=transient_status,
+                )
+                if not recovered:
+                    raise ValueError(CONCURRENT_DEPLOYMENT_CHANGE_ERROR)
                 context.update(message=f"Runtime health check failed:\n{logs}")
                 raise RuntimeError(
                     f"Runtime did not become healthy within "
                     f"{self.startup_timeout_seconds} seconds. Last logs:\n{logs}"
                 )
             health = "healthy"
-        with self.session_factory() as db:
-            deployment = db.get(Deployment, deployment_id)
-            if deployment:
-                if action == "delete":
-                    db.delete(deployment)
-                else:
-                    deployment.status = new_status
-                    deployment.health = health
-                db.commit()
+        self._finalize_action(
+            deployment_id,
+            action=action,
+            expected_container_id=expected_container_id,
+            expected_container_name=expected_container_name,
+            transient_status=transient_status,
+            status=new_status,
+            health=health,
+        )
         return self._action_result(
             deployment_id,
             action,
