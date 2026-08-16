@@ -6,10 +6,48 @@ from sqlalchemy import or_, select
 from app.api.tasks import serialize_task
 from app.audit import record_audit
 from app.dependencies import Admin, CsrfAdmin, DbSession
-from app.models import Deployment
+from app.models import Deployment, Provider
 from app.runtime.base import DeploymentSpec
+from app.services.deployment_recommendations import RecommendationRequest
 
 router = APIRouter(prefix="/api/deployments", tags=["deployments"])
+
+
+@router.post("/recommendations")
+def recommend_deployment(
+    payload: RecommendationRequest,
+    request: Request,
+    db: DbSession,
+    admin: CsrfAdmin,
+    refresh_ai: bool = Query(default=False),
+) -> dict[str, Any]:
+    provider = db.get(Provider, payload.provider_id) if payload.provider_id else None
+    if provider is not None and (not provider.enabled or provider.last_test_status == "failed"):
+        provider = None
+    result = request.app.state.deployment_recommendation_service.recommend(
+        db=db,
+        model_id=payload.model_id,
+        runtime=payload.runtime,
+        image=payload.image,
+        provider=provider,
+        refresh_ai=refresh_ai,
+    )
+    record_audit(
+        db,
+        actor=str(admin["username"]),
+        action="deployment.recommendation.generate",
+        resource_type="model",
+        resource_id=payload.model_id,
+        outcome="failed" if result.status == "unavailable" else "success",
+        details={
+            "runtime": payload.runtime,
+            "status": result.status,
+            "provider_used": provider is not None,
+            "refresh": refresh_ai,
+        },
+    )
+    db.commit()
+    return result.model_dump(mode="json")
 
 
 @router.post("/preview")
@@ -44,8 +82,7 @@ def create_deployment(
         raise HTTPException(
             status_code=409,
             detail=(
-                "A deployment already uses this name or API model name; "
-                "edit or clone it instead"
+                "A deployment already uses this name or API model name; edit or clone it instead"
             ),
         )
     task = request.app.state.task_engine.create_task(
@@ -160,4 +197,3 @@ def deployment_logs(
         return {"logs": request.app.state.deployment_service.logs(deployment, tail)}
     except (ValueError, Exception) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-

@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,13 +28,30 @@ from app.operations.executor import OperationExecutor
 from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
 from app.security import PasswordManager, SecretBox, SessionManager
+from app.services.deployment_recommendations import DeploymentRecommendationService
 from app.services.deployments import DeploymentService
 from app.services.diagnostics import DiagnosticService
 from app.services.discovery import DiscoveryService
+from app.services.draft_models import DraftCompatibilityService
+from app.services.model_evidence import ModelEvidenceLoader
 from app.services.providers import ProviderService
+from app.services.resource_estimator import ResourceEstimator
+from app.services.runtime_capabilities import RuntimeCapabilityService
 from app.services.system import SystemService
 from app.tasks.engine import TaskEngine
 from app.tasks.huggingface import HuggingFaceService
+
+
+class _LazyDockerClient:
+    def __init__(self) -> None:
+        self._client: Any | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._client is None:
+            import docker
+
+            self._client = docker.from_env()
+        return getattr(self._client, name)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -62,6 +80,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         startup_timeout_seconds=app_settings.deployment_startup_timeout_seconds,
     )
     provider_service = ProviderService(SecretBox(app_settings.secret_key))
+    evidence_loader = ModelEvidenceLoader(card_max_chars=app_settings.recommendation_card_max_chars)
+    resource_estimator = ResourceEstimator(
+        reserve_fraction=app_settings.memory_reserve_fraction,
+        reserve_min_bytes=app_settings.memory_reserve_min_bytes,
+    )
+    deployment_recommendation_service = DeploymentRecommendationService(
+        evidence_loader=evidence_loader,
+        runtime_capability_service=RuntimeCapabilityService(
+            settings=app_settings, docker_client=_LazyDockerClient()
+        ),
+        resource_estimator=resource_estimator,
+        draft_service=DraftCompatibilityService(
+            evidence_loader=evidence_loader,
+            resource_estimator=resource_estimator,
+        ),
+        system_snapshot=system_service.snapshot,
+        huggingface_service=huggingface_service,
+        provider_service=provider_service,
+        cache_ttl_seconds=app_settings.recommendation_cache_ttl_seconds,
+        card_max_chars=app_settings.recommendation_card_max_chars,
+    )
     diagnostic_service = DiagnosticService(
         provider_service,
         system_service,
@@ -117,6 +156,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.task_engine = task_engine
     app.state.deployment_service = deployment_service
     app.state.provider_service = provider_service
+    app.state.deployment_recommendation_service = deployment_recommendation_service
     app.state.diagnostic_service = diagnostic_service
     app.state.operation_executor = operation_executor
     app.state.gateway_activity = GatewayActivity()
