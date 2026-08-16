@@ -77,26 +77,33 @@ def delete_model(
 
     source = asset.source
     repository_id = asset.repository_id
-    task = request.app.state.task_engine.create_task(
-        db,
-        task_type="model.delete",
-        title=f"删除模型 {asset.name}",
-        input_json={"model_id": model_id},
-        idempotency_key=f"model:{model_id}:delete",
-    )
-    record_audit(
-        db,
-        actor=str(admin["username"]),
-        action="model.delete.create",
-        resource_type="model",
-        resource_id=model_id,
-        details={
-            "task_id": task.id,
-            "source": source,
-            "repository_id": repository_id,
-        },
-    )
-    db.commit()
+    try:
+        task = request.app.state.task_engine.create_task(
+            db,
+            task_type="model.delete",
+            title=f"删除模型 {asset.name}",
+            input_json={"model_id": model_id},
+            idempotency_key=f"model:{model_id}:delete",
+            commit=False,
+        )
+        record_audit(
+            db,
+            actor=str(admin["username"]),
+            action="model.delete.create",
+            resource_type="model",
+            resource_id=model_id,
+            details={
+                "task_id": task.id,
+                "source": source,
+                "repository_id": repository_id,
+            },
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(task)
+    request.app.state.task_engine.notify()
     return serialize_task(task)
 
 

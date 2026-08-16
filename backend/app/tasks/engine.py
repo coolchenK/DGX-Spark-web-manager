@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import TaskRecord
@@ -99,6 +100,9 @@ class TaskEngine:
     def register(self, task_type: str, handler: TaskHandler) -> None:
         self.handlers[task_type] = handler
 
+    def notify(self) -> None:
+        self._wake.set()
+
     def create_task(
         self,
         db: Session,
@@ -107,6 +111,7 @@ class TaskEngine:
         title: str,
         input_json: dict[str, Any],
         idempotency_key: str | None = None,
+        commit: bool = True,
     ) -> TaskRecord:
         if idempotency_key:
             existing = db.scalar(
@@ -124,9 +129,24 @@ class TaskEngine:
             idempotency_key=idempotency_key,
         )
         db.add(task)
-        db.commit()
-        db.refresh(task)
-        self._wake.set()
+        try:
+            if commit:
+                db.commit()
+                db.refresh(task)
+                self.notify()
+            else:
+                db.flush()
+        except IntegrityError:
+            db.rollback()
+            if idempotency_key:
+                existing = db.scalar(
+                    select(TaskRecord).where(
+                        TaskRecord.idempotency_key == idempotency_key
+                    )
+                )
+                if existing and existing.status not in TERMINAL_STATES:
+                    return existing
+            raise
         return task
 
     def recover_interrupted(self) -> int:
@@ -227,7 +247,7 @@ class TaskEngine:
         task.cancel_requested = False
         task.result_json = {}
         db.commit()
-        self._wake.set()
+        self.notify()
 
     def request_cancel(self, db: Session, task: TaskRecord) -> None:
         if task.status in {"queued", "paused"}:

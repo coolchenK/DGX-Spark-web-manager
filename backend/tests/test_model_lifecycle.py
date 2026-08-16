@@ -19,6 +19,7 @@ from app.services.model_lifecycle import (
     _resolved,
 )
 from app.tasks.engine import TaskCancelled, TaskPaused
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 
@@ -1451,6 +1452,50 @@ def test_delete_model_creates_bounded_audited_task(stopped_task_client, tmp_path
         assert str(secret_path) not in serialized_audit
         assert "confirmation" not in serialized_audit
         assert "token" not in serialized_audit
+
+
+def test_delete_model_audit_failure_rolls_back_task_and_does_not_notify(
+    settings, tmp_path, monkeypatch
+):
+    app = create_app(settings)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        app.state.task_engine.stop()
+        login = client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "Test-password-1234"},
+        )
+        client.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+        _add_asset(
+            app.state.database,
+            tmp_path / "models" / "target",
+            name="Target Model",
+        )
+        notifications = []
+        monkeypatch.setattr(
+            app.state.task_engine,
+            "notify",
+            lambda: notifications.append("notified"),
+            raising=False,
+        )
+
+        def fail_audit(*_args, **_kwargs):
+            raise RuntimeError("audit unavailable")
+
+        monkeypatch.setattr("app.api.inventory.record_audit", fail_audit)
+
+        response = _delete_model(client, "target", "Target Model")
+
+        assert response.status_code == 500
+        assert notifications == []
+        with app.state.database.session_factory() as db:
+            assert list(db.scalars(select(TaskRecord))) == []
+            assert list(
+                db.scalars(
+                    select(AuditEvent).where(
+                        AuditEvent.action == "model.delete.create"
+                    )
+                )
+            ) == []
 
 
 def test_delete_model_reuses_queued_task_before_worker_start(
