@@ -12,12 +12,27 @@ MAX_CONTEXT_LENGTH = 1_048_576
 MAX_CONCURRENCY = 1_048_576
 MAX_SIZE_BYTES = 1 << 60
 MAX_RESERVE_MIN_BYTES = 1 << 60
+MAX_HIDDEN_SIZE = 1_048_576
+MAX_NUM_LAYERS = 4096
+MAX_NUM_HEADS = 4096
+MAX_KV_CACHE_BYTES = (1 << 63) - 1
 
 
-def _positive_int(value: Any) -> int | None:
+def _positive_int(value: Any, *, maximum: int | None = None) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
+    if maximum is not None and value > maximum:
+        return None
     return value
+
+
+def _checked_product(values: tuple[int, ...], *, maximum: int) -> int | None:
+    result = 1
+    for value in values:
+        if value > maximum // result:
+            return None
+        result *= value
+    return result
 
 
 def _bounded_int(value: Any, *, name: str, minimum: int, maximum: int) -> int:
@@ -45,26 +60,36 @@ def kv_cache_bytes(
     """
     if not isinstance(config, Mapping):
         return 0
-    hidden = _positive_int(config.get("hidden_size"))
-    layers = _positive_int(config.get("num_hidden_layers"))
-    attention_heads = _positive_int(config.get("num_attention_heads"))
-    kv_heads = _positive_int(config.get("num_key_value_heads")) or attention_heads
-    context = _positive_int(context_length)
-    concurrency = _positive_int(max_concurrency)
+    hidden = _positive_int(config.get("hidden_size"), maximum=MAX_HIDDEN_SIZE)
+    layers = _positive_int(config.get("num_hidden_layers"), maximum=MAX_NUM_LAYERS)
+    attention_heads = _positive_int(
+        config.get("num_attention_heads"), maximum=MAX_NUM_HEADS
+    )
+    raw_kv_heads = config.get("num_key_value_heads")
+    kv_heads = _positive_int(raw_kv_heads, maximum=MAX_NUM_HEADS)
+    context = _positive_int(context_length, maximum=MAX_CONTEXT_LENGTH)
+    concurrency = _positive_int(max_concurrency, maximum=MAX_CONCURRENCY)
     if (
         not hidden
         or not layers
         or not attention_heads
-        or not kv_heads
         or not context
         or not concurrency
     ):
         return 0
+    if _positive_int(raw_kv_heads) and kv_heads is None:
+        return 0
+    kv_heads = kv_heads or attention_heads
+    if hidden % attention_heads != 0:
+        return 0
     head_dim = hidden // attention_heads
     if head_dim <= 0:
         return 0
-    tokens = context * concurrency
-    return 2 * layers * kv_heads * head_dim * tokens * 2
+    result = _checked_product(
+        (2, layers, kv_heads, head_dim, context, concurrency, 2),
+        maximum=MAX_KV_CACHE_BYTES,
+    )
+    return result or 0
 
 
 def reserve_bytes(total_bytes: int, fraction: float, minimum: int) -> int:
@@ -216,24 +241,31 @@ def clamp_context_length(
     limit = _bounded_int(
         hard_limit, name="hard_limit", minimum=1024, maximum=MAX_CONTEXT_LENGTH
     )
+    capped_by_hard_limit = original > limit
     current = min(original, limit)
-    current = max(1024, (current // 1024) * 1024)
+    aligned_context = max(1024, (current // 1024) * 1024)
+    aligned_down = aligned_context < current
+    current = aligned_context
     attempts: list[int] = []
+    blocked_reductions = 0
     while True:
         attempts.append(current)
         estimate = estimate_factory(current)
         if estimate.decision != "blocked" or current == 1024:
             break
+        blocked_reductions += 1
         current = max(1024, ((current // 2) // 1024) * 1024)
-    if current == original:
-        explanation = "requested context length fits the hard limit and resource estimate"
-    elif current < original:
+    if blocked_reductions:
         explanation = (
             f"context length reduced from {original} to {current} after blocked estimates "
             f"({', '.join(map(str, attempts))})"
         )
-    else:
+    elif capped_by_hard_limit:
         explanation = f"context length capped at hard limit {limit}"
+    elif aligned_down:
+        explanation = f"context length aligned down from {original} to {current}"
+    else:
+        explanation = "requested context length fits the hard limit and resource estimate"
     return ContextClampResult(
         original_context_length=original,
         final_context_length=current,

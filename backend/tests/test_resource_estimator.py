@@ -49,6 +49,70 @@ def test_kv_cache_rejects_invalid_architecture_values(value: object) -> None:
     ) == 0
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+    ],
+)
+def test_kv_cache_rejects_extreme_architecture_values(field: str) -> None:
+    config = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+    }
+    config[field] = 10**1000
+    assert kv_cache_bytes(config, context_length=8192, max_concurrency=2) == 0
+
+
+def test_kv_cache_rejects_fractional_head_dimension() -> None:
+    assert kv_cache_bytes(
+        {
+            "hidden_size": 4097,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+        },
+        context_length=8192,
+        max_concurrency=2,
+    ) == 0
+
+
+def test_kv_cache_checked_arithmetic_rejects_int64_overflow() -> None:
+    assert kv_cache_bytes(
+        {
+            "hidden_size": 1_048_576,
+            "num_hidden_layers": 4096,
+            "num_attention_heads": 4096,
+            "num_key_value_heads": 4096,
+        },
+        context_length=1_048_576,
+        max_concurrency=1_048_576,
+    ) == 0
+
+
+def test_kv_overflow_lowers_estimate_confidence() -> None:
+    estimate = ResourceEstimator().estimate(
+        model_size_bytes=1 * GiB,
+        config={
+            "hidden_size": 1_048_576,
+            "num_hidden_layers": 4096,
+            "num_attention_heads": 4096,
+            "num_key_value_heads": 4096,
+        },
+        context_length=1_048_576,
+        max_concurrency=1_048_576,
+        system_memory={"total_bytes": 128 * GiB},
+    )
+    assert estimate.kv_cache_bytes == 0
+    assert estimate.confidence == "low"
+    assert any("invalid" in reason.lower() for reason in estimate.reasons)
+
+
 def test_reserve_bytes_uses_floor_and_minimum() -> None:
     assert reserve_bytes(128 * GiB, 0.10, 8 * GiB) == 13_743_895_347
     assert reserve_bytes(1, 0.10, 8 * GiB) == 8 * GiB
@@ -192,8 +256,35 @@ def test_context_clamp_retries_until_not_blocked() -> None:
     result = clamp_context_length(20000, 16384, factory)
     assert result.original_context_length == 20000
     assert result.final_context_length == 4096
-    assert result.explanation
+    assert "blocked estimates" in result.explanation
     assert calls == [16384, 8192, 4096]
+
+
+def test_context_clamp_reports_hard_limit_without_claiming_blocked_estimates() -> None:
+    calls: list[int] = []
+
+    def factory(context: int) -> ResourceEstimate:
+        calls.append(context)
+        return ResourceEstimate(
+            total_bytes=1,
+            available_bytes=1,
+            reserved_bytes=0,
+            weight_bytes=0,
+            draft_weight_bytes=0,
+            kv_cache_bytes=0,
+            runtime_overhead_bytes=0,
+            required_bytes=0,
+            decision="ok",
+            confidence="high",
+            reasons=[],
+        )
+
+    result = clamp_context_length(32768, 8192, factory)
+    assert result.original_context_length == 32768
+    assert result.final_context_length == 8192
+    assert result.explanation == "context length capped at hard limit 8192"
+    assert "blocked" not in result.explanation
+    assert calls == [8192]
 
 
 def test_context_clamp_respects_lower_bound() -> None:
