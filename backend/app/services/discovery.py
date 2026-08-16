@@ -357,18 +357,32 @@ class DiscoveryService:
                         capabilities=[],
                     )
                     db.add(existing)
+                lifecycle_status = (
+                    existing.status
+                    if existing.status in {"deleting", "delete_failed"}
+                    else None
+                )
+                lifecycle_metadata = (
+                    dict(existing.metadata_json or {})
+                    if lifecycle_status is not None
+                    else None
+                )
                 if repository_id and snapshot is None:
                     _mark_model_unavailable(
                         existing,
                         local_path=child,
                         size_bytes=directory_size(child),
                     )
+                    if lifecycle_status is not None:
+                        existing.status = lifecycle_status
+                        existing.metadata_json = lifecycle_metadata
                     discovered.append(existing)
                     continue
                 metadata = infer_model_metadata(local_path, repository_id or child.name)
                 existing.local_path = str(local_path)
                 existing.size_bytes = directory_size(child)
-                existing.status = "available"
+                if lifecycle_status is None:
+                    existing.status = "available"
                 existing.commit_hash = metadata["commit_hash"]
                 revision = None
                 if repository_id and metadata["commit_hash"]:
@@ -386,6 +400,9 @@ class DiscoveryService:
                 existing.quantization = metadata["quantization"]
                 existing.parameter_count = metadata["parameter_count"]
                 existing.capabilities = metadata["capabilities"]
+                if lifecycle_status is not None:
+                    existing.status = lifecycle_status
+                    existing.metadata_json = lifecycle_metadata
                 discovered.append(existing)
         db.flush()
         discovered_ids = {asset.id for asset in discovered}

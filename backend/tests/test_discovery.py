@@ -1,6 +1,7 @@
 import json
 import os
 
+import pytest
 from app.db import Database
 from app.models import ModelAsset
 from app.services import discovery
@@ -73,6 +74,75 @@ def test_scan_hf_repository_without_snapshot_creates_unavailable_asset(settings)
     assert asset.quantization is None
     assert asset.parameter_count is None
     assert asset.capabilities == []
+
+
+def test_scan_existing_local_model_preserves_deleting_state_and_metadata(settings):
+    root = settings.model_root_paths[0]
+    model_path = root / "local-model"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text(
+        '{"architectures":["LocalForCausalLM"]}', encoding="utf-8"
+    )
+    database = Database(settings.database_url)
+    database.create_schema()
+    metadata = {
+        "keep": "value",
+        "_delete_task_id": "task-1",
+        "_delete_original_status": "available",
+    }
+
+    with database.session_factory() as db:
+        asset = ModelAsset(
+            name="local-model",
+            source="local",
+            local_path=str(model_path),
+            status="deleting",
+            metadata_json=metadata,
+        )
+        db.add(asset)
+        db.commit()
+
+        discovered = DiscoveryService((root,)).scan_models(db)
+        db.refresh(asset)
+
+    assert discovered == [asset]
+    assert asset.status == "deleting"
+    assert asset.metadata_json == metadata
+
+
+@pytest.mark.parametrize("lifecycle_status", ["deleting", "delete_failed"])
+def test_scan_hf_without_snapshot_preserves_lifecycle_state_and_metadata(
+    settings, lifecycle_status
+):
+    root = settings.model_root_paths[0]
+    repository = root / "models--org--model"
+    repository.mkdir(parents=True)
+    database = Database(settings.database_url)
+    database.create_schema()
+    metadata = {
+        "keep": "value",
+        "_delete_task_id": "task-1",
+        "_delete_original_status": "available",
+    }
+
+    with database.session_factory() as db:
+        asset = ModelAsset(
+            name="org/model",
+            source="huggingface",
+            repository_id="org/model",
+            local_path=str(repository / "missing-snapshot"),
+            status=lifecycle_status,
+            metadata_json=metadata,
+        )
+        db.add(asset)
+        db.commit()
+
+        discovered = DiscoveryService((root,)).scan_models(db)
+        db.refresh(asset)
+
+    assert discovered == [asset]
+    assert asset.status == lifecycle_status
+    assert asset.metadata_json == metadata
 
 
 def test_scan_marks_missing_asset_unavailable_and_recovers_when_snapshot_returns(settings):

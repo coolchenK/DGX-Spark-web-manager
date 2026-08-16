@@ -443,6 +443,52 @@ def test_validate_local_target_rejects_target_equal_to_any_nested_root(
         service.validate_local_target(child)
 
 
+def test_local_delete_ignores_unrelated_missing_model_root(database, tmp_path):
+    valid_root = tmp_path / "models"
+    target = valid_root / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target)
+    service = ModelLifecycleService(
+        model_roots=(tmp_path / "missing-root", valid_root),
+        hf_cache_dir=tmp_path / "hf-cache",
+        session_factory=database.session_factory,
+        local_remover=_test_local_remover,
+    )
+
+    assert service.validate_local_target(target) == target.resolve()
+    service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert not target.exists()
+    assert _model_status(database) is None
+
+
+def test_local_delete_ignores_unrelated_reparse_root(database, tmp_path, monkeypatch):
+    valid_root = tmp_path / "models"
+    target = valid_root / "target"
+    target.mkdir(parents=True)
+    _add_asset(database, target)
+    unrelated_root = tmp_path / "unrelated"
+    unrelated_root.mkdir()
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda self: self == unrelated_root or original_is_symlink(self),
+    )
+    service = ModelLifecycleService(
+        (unrelated_root, valid_root),
+        tmp_path / "hf-cache",
+        session_factory=database.session_factory,
+        local_remover=_test_local_remover,
+    )
+
+    assert service.validate_local_target(target) == target.resolve()
+    service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert not target.exists()
+    assert _model_status(database) is None
+
+
 @pytest.mark.parametrize("destination", ["inside", "outside"])
 def test_validate_local_target_rejects_symlinks(tmp_path, destination, monkeypatch):
     root = tmp_path / "models"
@@ -734,7 +780,7 @@ def test_huggingface_dry_run_rejects_target_plus_extra_target(database, tmp_path
 
 
 def test_huggingface_malformed_yes_json_reconciles_deleted_repository(
-    database, tmp_path
+    database, tmp_path, monkeypatch
 ):
     repository_root = tmp_path / "hf-cache" / "models--org--model"
     snapshot = repository_root / "snapshots" / "abc"
@@ -746,6 +792,11 @@ def test_huggingface_malformed_yes_json_reconciles_deleted_repository(
         repository_id="org/model",
     )
     calls = []
+    disk_free = iter((100, 125))
+    monkeypatch.setattr(
+        "app.services.model_lifecycle.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=next(disk_free)),
+    )
 
     def runner(argv):
         calls.append(argv)
@@ -762,7 +813,7 @@ def test_huggingface_malformed_yes_json_reconciles_deleted_repository(
 
     assert len(calls) == 2
     assert _model_status(database) is None
-    assert result["released_bytes"] >= 0
+    assert result["released_bytes"] == 25
     assert result["warnings"] == ["Model files were removed before completion"]
 
 
@@ -860,6 +911,50 @@ def test_delete_rechecks_references_at_execution_time(database, tmp_path):
     assert caught.value.references == [ModelReference("live", "live", "base")]
     assert target.exists()
     assert _model_status(database) == "available"
+
+
+@pytest.mark.parametrize("usage", ["base", "draft", "legacy_path"])
+def test_same_owner_reentry_with_new_reference_restores_original_state(
+    database, tmp_path, usage
+):
+    target = tmp_path / "models" / "target"
+    target.mkdir(parents=True)
+    _add_asset(
+        database,
+        target,
+        status="deleting",
+        metadata_json={
+            "keep": "value",
+            "_delete_task_id": "task-1",
+            "_delete_original_status": "available",
+        },
+    )
+    deployment_values = {
+        "model_id": "target" if usage == "base" else None,
+        "config": (
+            {"speculative": {"draft_model_id": "target"}}
+            if usage == "draft"
+            else ({"model_path": str(target)} if usage == "legacy_path" else {})
+        ),
+    }
+    with database.session_factory() as db:
+        db.add(
+            _deployment(
+                deployment_id=f"ref-{usage}",
+                name=f"ref-{usage}",
+                **deployment_values,
+            )
+        )
+        db.commit()
+    service = _deletion_service(database, tmp_path)
+
+    with pytest.raises(ModelInUseError):
+        service.delete_handler(HandlerContext(task_id="task-1"), {"model_id": "target"})
+
+    assert _model_status(database) == "available"
+    assert _model_metadata(database) == {"keep": "value"}
+    with pytest.raises(ModelInUseError):
+        service.delete_handler(HandlerContext(task_id="task-2"), {"model_id": "target"})
 
 
 @pytest.mark.parametrize("control_error", [TaskCancelled(), TaskPaused()])

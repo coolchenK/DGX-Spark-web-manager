@@ -121,23 +121,41 @@ class ModelLifecycleService:
     def _validated_local_paths(self, target: Path) -> tuple[Path, Path, Path]:
         try:
             lexical_target = Path(os.path.abspath(target))
+            lexical_roots = [
+                Path(os.path.abspath(configured_root))
+                for configured_root in self.model_roots
+            ]
+            if any(lexical_target == lexical_root for lexical_root in lexical_roots):
+                raise ValueError(
+                    "Local model target must be inside a configured model root"
+                )
             if not lexical_target.exists() or not lexical_target.is_dir():
                 raise ValueError("Local model target must be an existing directory")
 
+            resolved_target = lexical_target.resolve(strict=True)
             normalized_roots: list[tuple[Path, Path]] = []
-            for configured_root in self.model_roots:
-                lexical_root = Path(os.path.abspath(configured_root))
-                if self._is_link_or_reparse(lexical_root):
+            for lexical_root in lexical_roots:
+                relevant = lexical_target.is_relative_to(lexical_root)
+                try:
+                    invalid_root = self._is_link_or_reparse(lexical_root)
+                    resolved_root = lexical_root.resolve(strict=True)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    if relevant:
+                        raise ValueError(
+                            "Unable to resolve the configured model root"
+                        ) from exc
+                    continue
+                if invalid_root:
+                    if not relevant:
+                        continue
                     raise ValueError(
                         "Local model path cannot contain a symbolic link or reparse point"
                     )
-                resolved_root = lexical_root.resolve(strict=True)
                 normalized_roots.append((lexical_root, resolved_root))
 
-            resolved_target = lexical_target.resolve(strict=True)
             if any(
-                lexical_target == lexical_root or resolved_target == resolved_root
-                for lexical_root, resolved_root in normalized_roots
+                resolved_target == resolved_root
+                for _lexical_root, resolved_root in normalized_roots
             ):
                 raise ValueError(
                     "Local model target must be inside a configured model root"
@@ -460,6 +478,15 @@ class ModelLifecycleService:
                 )
             references = self.references(db, model_id)
             if references:
+                if reentry:
+                    restored_status = original_status
+                    if restored_status not in {"available", "unavailable"}:
+                        restored_status = "available"
+                    metadata.pop("_delete_task_id", None)
+                    metadata.pop("_delete_original_status", None)
+                    model.metadata_json = metadata
+                    model.status = restored_status
+                    db.commit()
                 raise ModelInUseError(references)
 
             source = model.source
@@ -487,8 +514,22 @@ class ModelLifecycleService:
         usage_path: Path | None = None
         free_before: int | None = None
 
+        def measure_released() -> None:
+            nonlocal released_bytes
+            if not destructive_started or usage_path is None:
+                return
+            free_after = self._disk_free(usage_path)
+            if free_before is None or free_after is None:
+                warning = "Disk usage could not be measured"
+                if warning not in warnings:
+                    warnings.append(warning)
+                released_bytes = 0
+            else:
+                released_bytes = max(0, free_after - free_before)
+
         def complete_deletion() -> dict[str, Any]:
             self._remove_database_record(model_id)
+            measure_released()
             return self._deletion_result(
                 model_id=model_id,
                 source=source,
@@ -558,12 +599,7 @@ class ModelLifecycleService:
                         raise RuntimeError("Local model deletion did not remove the target")
 
             self._remove_database_record(model_id)
-            if usage_path is not None:
-                free_after = self._disk_free(usage_path)
-                if free_before is None or free_after is None:
-                    warnings.append("Disk usage could not be measured")
-                else:
-                    released_bytes = max(0, free_after - free_before)
+            measure_released()
             return self._deletion_result(
                 model_id=model_id,
                 source=source,
