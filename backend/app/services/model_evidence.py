@@ -475,6 +475,21 @@ class ModelEvidenceLoader:
         self.card_max_chars = card_max_chars
 
     def load(self, model_path: Path | str) -> ModelEvidence:
+        return self._load(model_path, card_text_override=None)
+
+    def load_with_card(
+        self, model_path: Path | str, card_text: str
+    ) -> ModelEvidence:
+        if not isinstance(card_text, str):
+            raise ValueError("card_text must be a string")
+        return self._load(model_path, card_text_override=card_text)
+
+    def _load(
+        self,
+        model_path: Path | str,
+        *,
+        card_text_override: str | None,
+    ) -> ModelEvidence:
         supplied_path = Path(model_path)
         if not supplied_path.exists() or not supplied_path.is_dir():
             raise ValueError("model directory must exist")
@@ -484,7 +499,12 @@ class ModelEvidenceLoader:
         warnings: list[str] = []
         config = _read_json_dict(model_root, "config.json", warnings)
         generation_config = _read_json_dict(model_root, "generation_config.json", warnings)
-        raw_card_text = _read_card(model_root, self.card_max_chars, warnings)
+        if card_text_override is None:
+            raw_card_text = _read_card(model_root, self.card_max_chars, warnings)
+        else:
+            raw_card_text = card_text_override[: self.card_max_chars]
+            if len(card_text_override) > self.card_max_chars:
+                warnings.append("Remote model card was truncated to configured limit")
         card_data = _extract_card_data(raw_card_text, warnings)
         card_deployment_values, card_generation_values = _card_values(raw_card_text, warnings)
         card_text = _sanitize_shell_fences(raw_card_text)

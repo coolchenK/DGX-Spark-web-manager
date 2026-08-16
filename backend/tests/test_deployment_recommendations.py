@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from app.db import Database
-from app.models import ModelAsset
+from app.models import ModelAsset, Provider
 from app.services.deployment_recommendations import (
     DeploymentRecommendation,
     DeploymentRecommendationService,
@@ -17,8 +17,8 @@ from app.services.deployment_recommendations import (
     select_generation_defaults,
 )
 from app.services.draft_models import DraftCandidate
-from app.services.model_evidence import ModelEvidence
-from app.services.resource_estimator import ResourceEstimate
+from app.services.model_evidence import ModelEvidence, ModelEvidenceLoader
+from app.services.resource_estimator import ResourceEstimate, ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilities
 from pydantic import ValidationError
 
@@ -282,10 +282,15 @@ class FakeDraftService:
 class FakeHuggingFace:
     def __init__(self, text: str):
         self.text = text
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, str, int]] = []
 
-    def model_card_text(self, repository_id: str) -> str:
-        self.calls.append(repository_id)
+    def model_card_text(
+        self,
+        repository_id: str,
+        revision: str = "main",
+        max_chars: int = 100_000,
+    ) -> str:
+        self.calls.append((repository_id, revision, max_chars))
         return self.text
 
 
@@ -447,18 +452,213 @@ def test_minimal_model_is_partial_and_remote_card_fallback_only_runs_when_needed
     assert result.status == "partial"
     assert result.evidence_hash == "b" * 64
     assert any("AI" in warning for warning in result.warnings)
+    assert result.fields["quantization"].source == "runtime_default"
+    assert result.fields["quantization"].confidence == "low"
     assert result.resource_snapshot["reserved_bytes"] > 0
     assert result.resource_snapshot["deployments"] == [
         {"id": "running", "memory_bytes": 4 * GiB}
     ]
-    assert huggingface.calls == ["org/target"]
+    assert huggingface.calls == [("org/target", "main", 100_000)]
     assert remote_calls == [(str(model_path), "remote card")]
 
     local_with_card = evidence(str(model_path), card_text="already local")
     service.evidence_loader = FakeEvidenceLoader(local_with_card)
     with database.session_factory() as db:
         service.recommend(db, "target", "sglang", "sglang:test")
-    assert huggingface.calls == ["org/target"]
+    assert huggingface.calls == [("org/target", "main", 100_000)]
+    database.dispose()
+
+
+def test_terminal_and_ai_warnings_survive_a_saturated_warning_list(
+    settings, tmp_path: Path
+) -> None:
+    database = Database(settings.database_url)
+    database.create_schema()
+    model_path = tmp_path / "target"
+    model_path.mkdir()
+    add_asset(database, model_path)
+    saturated = [f"evidence warning {index}" for index in range(40)]
+    partial_evidence = evidence(str(model_path), card_text="").model_copy(
+        update={"warnings": saturated}
+    )
+    unavailable_evidence = evidence(
+        str(model_path), config={"max_position_embeddings": 8192}
+    ).model_copy(update={"warnings": saturated})
+
+    partial_service = DeploymentRecommendationService(
+        evidence_loader=FakeEvidenceLoader(partial_evidence),
+        runtime_capability_service=FakeCapabilities(capabilities()),
+        resource_estimator=FakeEstimator(),
+        draft_service=FakeDraftService([]),
+        system_snapshot=lambda: {
+            "memory": {"total_bytes": 128 * GiB, "available_bytes": 100 * GiB}
+        },
+    )
+    unavailable_service = DeploymentRecommendationService(
+        evidence_loader=FakeEvidenceLoader(unavailable_evidence),
+        runtime_capability_service=FakeCapabilities(capabilities()),
+        resource_estimator=FakeEstimator(fail=True),
+        draft_service=FakeDraftService([]),
+        system_snapshot=lambda: {
+            "memory": {"total_bytes": 128 * GiB, "available_bytes": 100 * GiB}
+        },
+    )
+
+    with database.session_factory() as db:
+        partial = partial_service.recommend(db, "target", "vllm", "vllm:test")
+        unavailable = unavailable_service.recommend(
+            db, "target", "vllm", "vllm:test"
+        )
+
+    assert len(partial.warnings) == 32
+    assert partial.warnings[0].startswith("AI analysis")
+    assert len(unavailable.warnings) == 32
+    assert unavailable.warnings[0] == (
+        "Deployment resource requirements could not be verified"
+    )
+    database.dispose()
+
+
+def test_real_estimator_reduces_concurrency_then_clamps_batch_tokens(
+    settings, tmp_path: Path
+) -> None:
+    database = Database(settings.database_url)
+    database.create_schema()
+    model_path = tmp_path / "target"
+    model_path.mkdir()
+    add_asset(database, model_path, size_bytes=GiB)
+    model_config = {
+        "max_position_embeddings": 8192,
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+    }
+    target_evidence = evidence(
+        str(model_path),
+        config=model_config,
+        card_deployment={
+            "context_length": 8192,
+            "max_concurrency": 32,
+            "max_batched_tokens": 1_048_576,
+        },
+    )
+    estimator = ResourceEstimator()
+    memory = {"total_bytes": 16 * GiB, "available_bytes": 16 * GiB}
+    assert (
+        estimator.estimate(
+            model_size_bytes=GiB,
+            config=model_config,
+            context_length=1024,
+            max_concurrency=32,
+            system_memory=memory,
+        ).decision
+        == "blocked"
+    )
+    service = DeploymentRecommendationService(
+        evidence_loader=FakeEvidenceLoader(target_evidence),
+        runtime_capability_service=FakeCapabilities(capabilities()),
+        resource_estimator=estimator,
+        draft_service=FakeDraftService([]),
+        system_snapshot=lambda: {"memory": memory},
+    )
+
+    with database.session_factory() as db:
+        result = service.recommend(db, "target", "vllm", "vllm:test")
+
+    assert result.status == "complete"
+    assert result.fields["max_concurrency"].value == 16
+    assert result.fields["max_concurrency"].source == "device_rule"
+    assert "32" in result.fields["max_concurrency"].reason
+    assert "16" in result.fields["max_concurrency"].reason
+    assert result.fields["context_length"].value == 1024
+    assert result.fields["context_length"].source == "device_rule"
+    assert result.fields["max_batched_tokens"].value == 16_384
+    assert result.fields["max_batched_tokens"].source == "device_rule"
+    assert "1048576" in result.fields["max_batched_tokens"].reason
+    assert "16384" in result.fields["max_batched_tokens"].reason
+    database.dispose()
+
+
+def test_explicit_empty_runtime_defaults_remain_empty_and_provider_object_is_accepted(
+    settings, tmp_path: Path
+) -> None:
+    database = Database(settings.database_url)
+    database.create_schema()
+    model_path = tmp_path / "target"
+    model_path.mkdir()
+    add_asset(database, model_path, quantization=None)
+    target_evidence = evidence(
+        str(model_path), config={"max_position_embeddings": 8192}
+    )
+    provider = Provider(
+        id="provider-id",
+        name="Provider",
+        base_url="https://provider.invalid/v1",
+        default_model="manager",
+        encrypted_api_key="encrypted",
+        timeout_seconds=30,
+        headers={},
+        enabled=True,
+    )
+    service = DeploymentRecommendationService(
+        evidence_loader=FakeEvidenceLoader(target_evidence),
+        runtime_capability_service=FakeCapabilities(capabilities()),
+        resource_estimator=FakeEstimator(),
+        draft_service=FakeDraftService([]),
+        system_snapshot=lambda: {
+            "memory": {"total_bytes": 128 * GiB, "available_bytes": 100 * GiB}
+        },
+        runtime_defaults={},
+    )
+
+    with database.session_factory() as db:
+        result = service.recommend(
+            db, "target", "vllm", "vllm:test", provider=provider
+        )
+
+    assert result.status == "partial"
+    assert "memory_fraction" not in result.fields
+    assert "max_concurrency" not in result.fields
+    assert "quantization" not in result.fields
+    assert any("AI" in warning for warning in result.warnings)
+    database.dispose()
+
+
+def test_remote_card_overlay_uses_pinned_commit_and_real_loader(
+    settings, tmp_path: Path
+) -> None:
+    database = Database(settings.database_url)
+    database.create_schema()
+    model_path = tmp_path / "target"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"max_position_embeddings":16384}', encoding="utf-8"
+    )
+    add_asset(database, model_path, commit_hash="pinned-commit")
+    huggingface = FakeHuggingFace(
+        "```bash\nvllm serve org/target --gpu-memory-utilization 0.72\n```"
+    )
+    loader = ModelEvidenceLoader(card_max_chars=12_345)
+    service = DeploymentRecommendationService(
+        evidence_loader=loader,
+        runtime_capability_service=FakeCapabilities(capabilities()),
+        resource_estimator=FakeEstimator(),
+        draft_service=FakeDraftService([]),
+        system_snapshot=lambda: {
+            "memory": {"total_bytes": 128 * GiB, "available_bytes": 100 * GiB}
+        },
+        huggingface_service=huggingface,
+    )
+
+    local_hash = loader.load(model_path).evidence_hash
+    with database.session_factory() as db:
+        result = service.recommend(db, "target", "vllm", "vllm:test")
+
+    assert huggingface.calls == [("org/target", "pinned-commit", 12_345)]
+    assert result.fields["memory_fraction"].value == 0.72
+    assert result.fields["memory_fraction"].source == "model_card"
+    assert result.evidence_hash != local_hash
     database.dispose()
 
 

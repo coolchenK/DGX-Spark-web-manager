@@ -16,12 +16,13 @@ from pydantic import (
 )
 from sqlalchemy.orm import Session
 
-from app.models import ModelAsset
+from app.models import ModelAsset, Provider
 from app.runtime.base import GenerationDefaults, RecommendationSource
 from app.services.draft_models import DraftCandidate
 from app.services.model_evidence import ModelEvidence, ModelEvidenceLoader
 from app.services.resource_estimator import (
     MAX_CONTEXT_LENGTH,
+    ContextClampResult,
     GiB,
     ResourceEstimate,
     ResourceEstimator,
@@ -125,7 +126,12 @@ class _DraftService(Protocol):
 
 
 class _HuggingFaceService(Protocol):
-    def model_card_text(self, repository_id: str) -> str: ...
+    def model_card_text(
+        self,
+        repository_id: str,
+        revision: str = "main",
+        max_chars: int = 100_000,
+    ) -> str: ...
 
 
 RemoteEvidenceLoader = Callable[[Path | str, str], ModelEvidence]
@@ -152,6 +158,13 @@ def _merge_warnings(*groups: list[str]) -> list[str]:
             if len(merged) == MAX_WARNINGS:
                 return merged
     return merged
+
+
+def _halving_values(value: int) -> list[int]:
+    values = [value]
+    while values[-1] > 1:
+        values.append(max(1, (values[-1] + 1) // 2))
+    return values
 
 
 def _recommended(
@@ -212,7 +225,7 @@ def _select_quantization(
     capabilities: RuntimeCapabilities,
     runtime_defaults: Mapping[str, Any],
     detected_quantization: str | None,
-) -> tuple[RecommendedValue, list[str]]:
+) -> tuple[RecommendedValue | None, list[str]]:
     raw: str | None = None
     source: RecommendationSource = "runtime_default"
     reason = "Runtime default quantization"
@@ -232,12 +245,22 @@ def _select_quantization(
             reason = "Local model asset metadata declares quantization"
         else:
             default = runtime_defaults.get("quantization")
-            raw = default if isinstance(default, str) else "auto"
+            if not isinstance(default, str) or not default.strip():
+                return None, []
+            raw = default.strip()
 
     normalized = raw.casefold()
     mapped = capabilities.quantization_mapping.get(normalized, normalized)
     if mapped in capabilities.quantization_methods:
-        return _recommended(mapped, source, reason), []
+        return (
+            _recommended(
+                mapped,
+                source,
+                reason,
+                confidence="low" if source == "runtime_default" else "high",
+            ),
+            [],
+        )
 
     warning = (
         f"Quantization {raw} maps to unsupported runtime method {mapped}; using auto"
@@ -315,7 +338,8 @@ def select_deployment_values(
         defaults,
         detected_quantization,
     )
-    values["quantization"] = quantization
+    if quantization is not None:
+        values["quantization"] = quantization
     warnings.extend(quantization_warnings)
 
     context = values.get("context_length")
@@ -428,8 +452,14 @@ class DeploymentRecommendationService:
         self.system_snapshot = system_snapshot
         self.huggingface_service = huggingface_service
         self.remote_evidence_loader = remote_evidence_loader
-        self.runtime_defaults = dict(runtime_defaults or DEFAULT_DEPLOYMENT_VALUES)
-        self.generation_runtime_defaults = dict(generation_runtime_defaults or {})
+        self.runtime_defaults = dict(
+            DEFAULT_DEPLOYMENT_VALUES
+            if runtime_defaults is None
+            else runtime_defaults
+        )
+        self.generation_runtime_defaults = dict(
+            {} if generation_runtime_defaults is None else generation_runtime_defaults
+        )
 
     @staticmethod
     def _unavailable(
@@ -462,7 +492,7 @@ class DeploymentRecommendationService:
                 capabilities.model_dump(mode="json") if capabilities else {}
             ),
             draft_candidates=[],
-            warnings=_merge_warnings(warnings or [], [warning]),
+            warnings=_merge_warnings([warning], warnings or []),
         )
 
     def _load_evidence(
@@ -476,13 +506,19 @@ class DeploymentRecommendationService:
             and self.huggingface_service is not None
         ):
             try:
+                max_chars = getattr(self.evidence_loader, "card_max_chars", 100_000)
+                revision = target.commit_hash or target.revision or "main"
                 remote_card = self.huggingface_service.model_card_text(
-                    target.repository_id
+                    target.repository_id,
+                    revision=revision,
+                    max_chars=max_chars,
                 )
-                if remote_card and self.remote_evidence_loader is not None:
-                    evidence = self.remote_evidence_loader(
-                        target.local_path, remote_card
-                    )
+                overlay_loader = self.remote_evidence_loader
+                if overlay_loader is None:
+                    candidate = getattr(self.evidence_loader, "load_with_card", None)
+                    overlay_loader = candidate if callable(candidate) else None
+                if remote_card and overlay_loader is not None:
+                    evidence = overlay_loader(target.local_path, remote_card)
                 elif remote_card:
                     warnings.append(
                         "Remote model card was available but no safe evidence adapter is configured"
@@ -497,13 +533,20 @@ class DeploymentRecommendationService:
         model_id: str,
         runtime: RuntimeName,
         image: str,
-        provider: str | None = None,
+        provider: Provider | str | None = None,
     ) -> DeploymentRecommendation:
+        provider_id = (
+            provider
+            if isinstance(provider, str)
+            else getattr(provider, "id", None)
+        )
+        if not isinstance(provider_id, str):
+            provider_id = None
         request = RecommendationRequest(
             model_id=model_id,
             runtime=runtime,
             image=image,
-            provider_id=provider,
+            provider_id=provider_id,
         )
         target = db.get(ModelAsset, request.model_id)
         if target is None:
@@ -588,32 +631,53 @@ class DeploymentRecommendationService:
         context_value = fields.get("context_length")
         concurrency_value = fields.get("max_concurrency")
         if context_value is not None and concurrency_value is not None:
-            estimates: dict[int, ResourceEstimate] = {}
-
-            def estimate_context(context: int) -> ResourceEstimate:
-                estimate_result = self.resource_estimator.estimate(
-                    model_size_bytes=target.size_bytes,
-                    config=evidence.config,
-                    context_length=context,
-                    max_concurrency=concurrency_value.value,
-                    system_memory=memory,
-                    draft_size_bytes=0,
-                )
-                estimates[context] = estimate_result
-                return estimate_result
-
             hard_limit = _valid_int(
                 evidence.config.get("max_position_embeddings"),
                 1024,
                 MAX_CONTEXT_LENGTH,
             ) or context_value.value
+            final_clamp: ContextClampResult | None = None
+            final_concurrency: int | None = None
+            last_clamp: ContextClampResult | None = None
+            last_concurrency = concurrency_value.value
             try:
-                clamp = clamp_context_length(
-                    context_value.value,
-                    hard_limit,
-                    estimate_context,
-                )
-                estimate = estimates[clamp.final_context_length]
+                for candidate_concurrency in _halving_values(
+                    concurrency_value.value
+                ):
+                    estimates: dict[int, ResourceEstimate] = {}
+
+                    def estimate_context(
+                        context: int,
+                        *,
+                        concurrency: int = candidate_concurrency,
+                        estimate_cache: dict[int, ResourceEstimate] = estimates,
+                    ) -> ResourceEstimate:
+                        estimate_result = self.resource_estimator.estimate(
+                            model_size_bytes=target.size_bytes,
+                            config=evidence.config,
+                            context_length=context,
+                            max_concurrency=concurrency,
+                            system_memory=memory,
+                            draft_size_bytes=0,
+                        )
+                        estimate_cache[context] = estimate_result
+                        return estimate_result
+
+                    candidate_clamp = clamp_context_length(
+                        context_value.value,
+                        hard_limit,
+                        estimate_context,
+                    )
+                    candidate_estimate = estimates[
+                        candidate_clamp.final_context_length
+                    ]
+                    last_clamp = candidate_clamp
+                    last_concurrency = candidate_concurrency
+                    estimate = candidate_estimate
+                    if candidate_clamp.fits:
+                        final_clamp = candidate_clamp
+                        final_concurrency = candidate_concurrency
+                        break
             except Exception:
                 return self._unavailable(
                     request,
@@ -626,17 +690,30 @@ class DeploymentRecommendationService:
                     resource_snapshot=resource_snapshot,
                     warnings=warnings,
                 )
+            assert estimate is not None
             resource_snapshot["reserved_bytes"] = estimate.reserved_bytes
-            if clamp.final_context_length != context_value.value:
+            applied_clamp = final_clamp or last_clamp
+            assert applied_clamp is not None
+            applied_concurrency = final_concurrency or last_concurrency
+            if applied_clamp.final_context_length != context_value.value:
                 original = context_value.value
                 fields["context_length"] = _recommended(
-                    clamp.final_context_length,
+                    applied_clamp.final_context_length,
                     "device_rule",
                     f"{context_value.reason}; resource rule reduced {original} to "
-                    f"{clamp.final_context_length}: {clamp.explanation}",
-                    confidence="high" if clamp.fits else "low",
+                    f"{applied_clamp.final_context_length}: "
+                    f"{applied_clamp.explanation}",
+                    confidence="high" if applied_clamp.fits else "low",
                 )
-            if not clamp.fits or estimate.decision == "blocked":
+            if applied_concurrency != concurrency_value.value:
+                fields["max_concurrency"] = _recommended(
+                    applied_concurrency,
+                    "device_rule",
+                    f"{concurrency_value.reason}; resource rule reduced "
+                    f"{concurrency_value.value} to {applied_concurrency}",
+                    confidence="high" if applied_clamp.fits else "low",
+                )
+            if not applied_clamp.fits or estimate.decision == "blocked":
                 return self._unavailable(
                     request,
                     "Deployment is blocked by unified memory requirements",
@@ -649,6 +726,20 @@ class DeploymentRecommendationService:
                     resource_estimate=estimate,
                     warnings=warnings,
                 )
+            batch_value = fields.get("max_batched_tokens")
+            if batch_value is not None:
+                batch_limit = (
+                    applied_clamp.final_context_length * applied_concurrency
+                )
+                if batch_value.value > batch_limit:
+                    fields["max_batched_tokens"] = _recommended(
+                        batch_limit,
+                        "device_rule",
+                        f"{batch_value.reason}; device rule reduced "
+                        f"{batch_value.value} to {batch_limit} for final context "
+                        f"{applied_clamp.final_context_length} and concurrency "
+                        f"{applied_concurrency}",
+                    )
             if estimate.decision == "warning":
                 warnings = _merge_warnings(
                     warnings,
@@ -668,12 +759,13 @@ class DeploymentRecommendationService:
         unresolved = sorted(CRITICAL_FIELDS - set(fields))
         if unresolved:
             status: Literal["complete", "partial"] = "partial"
+            ai_warning = (
+                "AI analysis may complete unresolved deployment fields: "
+                + ", ".join(unresolved)
+            )
             warnings = _merge_warnings(
+                [ai_warning],
                 warnings,
-                [
-                    "AI analysis may complete unresolved deployment fields: "
-                    + ", ".join(unresolved)
-                ],
             )
         else:
             status = "complete"

@@ -212,6 +212,64 @@ def test_card_is_truncated_and_only_allowlisted_json_keys_are_extracted(tmp_path
     )
 
 
+def test_remote_card_overlay_reuses_local_evidence_and_has_a_stable_hash(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"max_position_embeddings":16384,"hidden_size":4096}', encoding="utf-8"
+    )
+    (model / "generation_config.json").write_text(
+        '{"temperature":0.7}', encoding="utf-8"
+    )
+    (model / "tokenizer.json").write_text('{"version":1}', encoding="utf-8")
+    (model / "README.md").write_text(
+        "```bash\nvllm serve org/model --max-model-len 4096\n```",
+        encoding="utf-8",
+    )
+    remote_card = (
+        "```bash\nvllm serve org/model --max-model-len 8192 "
+        "--gpu-memory-utilization 0.75 --unknown secret\n```\n"
+        '```json\n{"temperature":0.6,"unknown":"discard"}\n```'
+    )
+    loader = ModelEvidenceLoader(card_max_chars=100_000)
+
+    local = loader.load(model)
+    first = loader.load_with_card(model, remote_card)
+    second = loader.load_with_card(model, remote_card)
+
+    assert first.config == local.config
+    assert first.local_generation_values == {"temperature": 0.7}
+    assert first.tokenizer_fingerprint == local.tokenizer_fingerprint
+    assert first.card_deployment_values == {
+        "context_length": 8192,
+        "memory_fraction": 0.75,
+    }
+    assert first.card_generation_values == {"temperature": 0.6}
+    assert "unknown" not in json.dumps(
+        {
+            "card_data": first.card_data,
+            "deployment": first.card_deployment_values,
+            "generation": first.card_generation_values,
+        }
+    )
+    assert first.evidence_hash == second.evidence_hash
+    assert first.evidence_hash != local.evidence_hash
+
+
+def test_remote_card_overlay_is_bounded_without_temporary_files(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    loader = ModelEvidenceLoader(card_max_chars=64)
+    remote_card = "# Remote\n" + "x" * 500
+
+    before = set(model.iterdir())
+    result = loader.load_with_card(model, remote_card)
+
+    assert len(result.card_text) == 64
+    assert result.warnings == ["Remote model card was truncated to configured limit"]
+    assert set(model.iterdir()) == before
+
+
 def test_malformed_shell_and_later_explicit_values_are_handled_deterministically(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
