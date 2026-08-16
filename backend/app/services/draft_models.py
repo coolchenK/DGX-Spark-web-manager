@@ -28,6 +28,9 @@ STATUS_ORDER: dict[CandidateStatus, int] = {
     "review": 1,
     "incompatible": 2,
 }
+RESOURCE_ESTIMATE_UNAVAILABLE = (
+    "Resource estimate is unavailable; manual review is required"
+)
 
 
 class DraftCandidate(BaseModel):
@@ -72,6 +75,7 @@ def classify_draft_candidate(
     draft_evidence: ModelEvidence | None,
     supported_methods: Iterable[str],
     resource_estimate: ResourceEstimate | None = None,
+    resource_error: bool = False,
 ) -> DraftCandidate:
     """Classify a local Draft Model from bounded, structured evidence only."""
     supported = frozenset(supported_methods)
@@ -132,8 +136,12 @@ def classify_draft_candidate(
         return _candidate(
             draft,
             method=method,
-            status="compatible",
-            reasons=["Auxiliary Draft Model explicitly matches the target repository"],
+            status="review" if resource_error else "compatible",
+            reasons=(
+                [RESOURCE_ESTIMATE_UNAVAILABLE]
+                if resource_error
+                else ["Auxiliary Draft Model explicitly matches the target repository"]
+            ),
             resource_estimate=resource_estimate,
         )
 
@@ -150,6 +158,14 @@ def classify_draft_candidate(
                 method=method,
                 status="incompatible",
                 reasons=["Target and Draft Model tokenizer fingerprints conflict"],
+                resource_estimate=resource_estimate,
+            )
+        if resource_error:
+            return _candidate(
+                draft,
+                method=method,
+                status="review",
+                reasons=[RESOURCE_ESTIMATE_UNAVAILABLE],
                 resource_estimate=resource_estimate,
             )
         if (
@@ -170,6 +186,8 @@ def classify_draft_candidate(
             review_reason = "Draft Model target pairing evidence is missing"
         else:
             review_reason = "Draft Model pairing requires manual review"
+    elif resource_error:
+        review_reason = RESOURCE_ESTIMATE_UNAVAILABLE
     elif target_repository_missing:
         review_reason = "Target repository ID is missing; explicit pairing cannot be verified"
     else:
@@ -216,18 +234,21 @@ class DraftCompatibilityService:
         target_evidence: ModelEvidence,
         draft: ModelAsset,
         system_snapshot: Mapping[str, Any] | BaseModel,
-    ) -> ResourceEstimate | None:
+    ) -> tuple[ResourceEstimate | None, bool]:
         try:
-            return self.resource_estimator.estimate(
-                model_size_bytes=target.size_bytes,
-                config=target_evidence.config,
-                context_length=_context_length(target_evidence),
-                max_concurrency=1,
-                system_memory=_system_memory(system_snapshot),
-                draft_size_bytes=draft.size_bytes,
+            return (
+                self.resource_estimator.estimate(
+                    model_size_bytes=target.size_bytes,
+                    config=target_evidence.config,
+                    context_length=_context_length(target_evidence),
+                    max_concurrency=1,
+                    system_memory=_system_memory(system_snapshot),
+                    draft_size_bytes=draft.size_bytes,
+                ),
+                False,
             )
         except Exception:
-            return None
+            return None, True
 
     def list_candidates(
         self,
@@ -236,7 +257,14 @@ class DraftCompatibilityService:
         runtime_capabilities: RuntimeCapabilities,
         system_snapshot: Mapping[str, Any] | BaseModel,
     ) -> list[DraftCandidate]:
-        assets = list(db.scalars(select(ModelAsset)).all())
+        assets = list(
+            db.scalars(
+                select(ModelAsset).where(
+                    ModelAsset.status == "available",
+                    ModelAsset.id != target.id,
+                )
+            ).all()
+        )
         try:
             target_evidence = self.evidence_loader.load(target.local_path)
         except Exception:
@@ -244,17 +272,14 @@ class DraftCompatibilityService:
 
         candidates: list[DraftCandidate] = []
         for draft in assets:
-            if draft.id == target.id:
-                draft_evidence = target_evidence
-            else:
-                try:
-                    draft_evidence = self.evidence_loader.load(draft.local_path)
-                except Exception:
-                    draft_evidence = None
-            resource_estimate = (
+            try:
+                draft_evidence = self.evidence_loader.load(draft.local_path)
+            except Exception:
+                draft_evidence = None
+            resource_estimate, resource_error = (
                 self._estimate(target, target_evidence, draft, system_snapshot)
                 if target_evidence is not None and draft_evidence is not None
-                else None
+                else (None, False)
             )
             candidates.append(
                 classify_draft_candidate(
@@ -264,6 +289,7 @@ class DraftCompatibilityService:
                     draft_evidence,
                     supported_methods=runtime_capabilities.speculative_methods,
                     resource_estimate=resource_estimate,
+                    resource_error=resource_error,
                 )
             )
 

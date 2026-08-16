@@ -86,14 +86,20 @@ def classify(
     draft_evidence: ModelEvidence | None = None,
     supported: set[str] | None = None,
     resource: ResourceEstimate | None = None,
+    resource_error: bool = False,
 ) -> DraftCandidate:
     return classify_draft_candidate(
         target,
         target_evidence if target_evidence is not None else evidence(target),
         draft,
         draft_evidence,
-        supported_methods=supported or {"draft_model", "eagle", "eagle3", "mtp"},
+        supported_methods=(
+            supported
+            if supported is not None
+            else {"draft_model", "eagle", "eagle3", "mtp"}
+        ),
         resource_estimate=resource,
+        resource_error=resource_error,
     )
 
 
@@ -323,6 +329,72 @@ def test_blocked_resource_estimate_overrides_explicit_compatibility() -> None:
     assert any("memory" in reason.lower() for reason in result.reasons)
 
 
+def test_resource_estimate_failure_requires_review_for_explicit_eagle_pair() -> None:
+    target = asset("org/Target-8B", model_id="target")
+    draft = asset("org/eagle", model_id="draft")
+
+    result = classify(
+        target,
+        draft,
+        draft_evidence=evidence(
+            draft,
+            targets=["org/Target-8B"],
+            method="eagle",
+        ),
+        supported={"eagle"},
+        resource_error=True,
+    )
+
+    assert result.status == "review"
+    assert result.estimated_total_bytes is None
+    assert result.reasons == [
+        "Resource estimate is unavailable; manual review is required"
+    ]
+
+
+def test_resource_estimate_failure_requires_review_for_explicit_standalone_pair() -> None:
+    target = asset("org/Target-8B", model_id="target")
+    draft = asset("org/draft", model_id="draft")
+
+    result = classify(
+        target,
+        draft,
+        target_evidence=evidence(target, tokenizer="same"),
+        draft_evidence=evidence(
+            draft,
+            tokenizer="same",
+            targets=["org/Target-8B"],
+            method="draft_model",
+        ),
+        supported={"draft_model"},
+        resource_error=True,
+    )
+
+    assert result.status == "review"
+    assert result.reasons == [
+        "Resource estimate is unavailable; manual review is required"
+    ]
+
+
+def test_empty_runtime_method_set_rejects_known_method() -> None:
+    target = asset("org/Target-8B", model_id="target")
+    draft = asset("org/eagle", model_id="draft")
+
+    result = classify(
+        target,
+        draft,
+        draft_evidence=evidence(
+            draft,
+            targets=["org/Target-8B"],
+            method="eagle",
+        ),
+        supported=set(),
+    )
+
+    assert result.status == "incompatible"
+    assert any("runtime" in reason.lower() for reason in result.reasons)
+
+
 def test_warning_resource_estimate_does_not_block_candidate() -> None:
     target = asset("org/Target-8B", model_id="target")
     draft = asset("org/eagle", model_id="draft")
@@ -405,7 +477,7 @@ def capabilities() -> RuntimeCapabilities:
     )
 
 
-def test_service_lists_all_assets_isolates_evidence_failures_and_sorts(settings) -> None:
+def test_service_lists_available_non_target_assets_and_isolates_failures(settings) -> None:
     database = Database(settings.database_url)
     database.create_schema()
     target = asset(
@@ -457,7 +529,10 @@ def test_service_lists_all_assets_isolates_evidence_failures_and_sorts(settings)
                 method="eagle3",
             ),
             review_large.local_path: evidence(
-                review_large, tokenizer="same", method="draft_model"
+                review_large,
+                tokenizer="different",
+                targets=["org/Target-8B"],
+                method="eagle3",
             ),
             review_small_b.local_path: evidence(
                 review_small_b, tokenizer="same", method="draft_model"
@@ -501,16 +576,21 @@ def test_service_lists_all_assets_isolates_evidence_failures_and_sorts(settings)
         "review-b",
         "review-z",
         "broken",
-        "unavailable",
-        "target",
         "blocked",
     ]
     by_id = {candidate.model_id: candidate for candidate in candidates}
     assert by_id["blocked"].estimated_total_bytes == 32 * GiB
     assert by_id["broken"].status == "incompatible"
     assert all("secret" not in reason for reason in by_id["broken"].reasons)
-    assert by_id["unavailable"].status == "incompatible"
-    assert len(loader.calls) == len(assets)
+    assert by_id["review-z"].status == "review"
+    assert by_id["review-z"].reasons == [
+        "Resource estimate is unavailable; manual review is required"
+    ]
+    assert target.id not in by_id
+    assert unavailable.id not in by_id
+    assert loader.calls.count(target.local_path) == 1
+    assert unavailable.local_path not in loader.calls
+    assert len(loader.calls) == 7
     assert any(
         call["model_size_bytes"] == 8 * GiB
         and call["draft_size_bytes"] == 2 * GiB
