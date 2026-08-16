@@ -89,8 +89,10 @@ On startup the manager scans Docker without restarting or recreating existing co
 ## Administrator Workflow
 
 1. In **Settings**, optionally store a Hugging Face token for gated repositories. In **Hugging
-   Face**, search for a model and inspect its repository metadata. DGX Spark compatibility ranking
-   puts NVFP4 candidates first, but remains discovery guidance rather than a deployment guarantee.
+   Face**, search for a model and inspect its repository metadata. Results sort first by compatibility
+   level (`recommended`, `compatible`, then `review`) and then by score within that level. NVFP4 gets
+   the strongest positive score signal, but a `compatible` AWQ result can still rank above a `review`
+   NVFP4 result. Ranking remains discovery guidance rather than a deployment guarantee.
 2. Start a download and follow its persistent task. Pause, resume, cancellation, and restart recovery
    reuse the Hugging Face cache. After inventory refresh marks the asset available, open
    **Deployments** and create a deployment.

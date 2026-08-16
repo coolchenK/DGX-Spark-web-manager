@@ -68,8 +68,10 @@ capability snapshot and runtime adapter rules.
 Quantization choices are restricted to the selected image's returned `quantization_methods`.
 Model-card or local values not in that list are clamped to `auto` with a warning. The canonical
 `nvfp4` evidence value maps to `modelopt_fp4` when the runtime exposes that mapping. Hugging Face
-search ranks NVFP4 models first, but search rank is not proof that a particular repository/image
-combination will pass capability and resource preflight.
+search sorts first by compatibility level (`recommended`, `compatible`, then `review`) and then by
+score within the same level. NVFP4 receives the strongest positive score signal, but a `compatible`
+AWQ result can rank above a `review` NVFP4 result. Search rank is not proof that a particular
+repository/image combination will pass capability and resource preflight.
 
 ## Speculative and Draft Model Support
 
