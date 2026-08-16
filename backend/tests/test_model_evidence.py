@@ -50,6 +50,29 @@ def _fake_directory_stat(inode: int, *, reparse: bool = False) -> SimpleNamespac
     )
 
 
+def _posix_snapshot_with_linked_ancestor(
+    tmp_path: Path, linked_level: str
+) -> tuple[Path, Path]:
+    if os.name != "posix":
+        pytest.skip("POSIX directory-fd semantics are unavailable")
+    visible_hub = tmp_path / "visible-hub"
+    visible_hub.mkdir()
+    visible_repository = visible_hub / "models--org--model"
+    real_repository = tmp_path / "real-hub" / "models--org--model"
+    real_snapshot = real_repository / "snapshots" / "revision"
+    (real_repository / "blobs").mkdir(parents=True)
+    real_snapshot.mkdir(parents=True)
+    if linked_level == "repository":
+        _symlink_or_skip(visible_repository, real_repository)
+    else:
+        visible_repository.mkdir()
+        _symlink_or_skip(
+            visible_repository / "snapshots",
+            real_repository / "snapshots",
+        )
+    return visible_repository / "snapshots" / "revision", real_repository
+
+
 def test_model_evidence_loads_structured_files_and_allowlisted_card_values(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
@@ -172,6 +195,48 @@ def test_huggingface_snapshot_blob_links_are_read_as_model_evidence(tmp_path):
     assert evidence.card_deployment_values == {"context_length": 16384}
     assert evidence.tokenizer_fingerprint is not None
     assert evidence.warnings == []
+
+
+@pytest.mark.parametrize("linked_level", ["repository", "snapshots"])
+@pytest.mark.parametrize("filename", ["config.json", "README.md"])
+def test_posix_huggingface_snapshot_rejects_linked_ancestors_for_regular_evidence(
+    tmp_path, linked_level, filename
+):
+    snapshot, _repository = _posix_snapshot_with_linked_ancestor(tmp_path, linked_level)
+    resolved_snapshot = snapshot.resolve(strict=True)
+    payload = (
+        '{"hidden_size":4096}'
+        if filename == "config.json"
+        else "```bash\nvllm serve org/model --max-model-len 8192\n```\n"
+    )
+    (resolved_snapshot / filename).write_text(payload, encoding="utf-8")
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(snapshot)
+
+    if filename == "config.json":
+        assert evidence.config == {}
+        assert "config.json is not a safe regular file" in evidence.warnings
+    else:
+        assert evidence.card_text == ""
+        assert "README.md is not a safe regular file" in evidence.warnings
+
+
+@pytest.mark.parametrize("linked_level", ["repository", "snapshots"])
+def test_posix_huggingface_snapshot_rejects_linked_ancestors_for_canonical_blobs(
+    tmp_path, linked_level
+):
+    snapshot, repository = _posix_snapshot_with_linked_ancestor(tmp_path, linked_level)
+    digest = "a" * 40
+    (repository / "blobs" / digest).write_text('{"hidden_size":4096}', encoding="utf-8")
+    _symlink_or_skip(
+        snapshot.resolve(strict=True) / "config.json",
+        Path("..") / ".." / "blobs" / digest,
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(snapshot)
+
+    assert evidence.config == {}
+    assert "config.json is not a safe regular file" in evidence.warnings
 
 
 def test_huggingface_blob_link_parser_accepts_only_canonical_posix_targets():

@@ -229,16 +229,49 @@ def _is_windows_reparse_point(value: os.stat_result) -> bool:
 
 
 @contextmanager
+def _open_posix_huggingface_snapshot(model_root: Path) -> Iterator[tuple[int, int]]:
+    paths = _huggingface_snapshot_paths(model_root)
+    if paths is None:
+        raise ValueError("model root is not a Hugging Face snapshot")
+    repository, snapshots, revision = paths
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    directory_fds: list[int] = []
+
+    def open_directory(path: Path | str, dir_fd: int | None = None) -> int:
+        if dir_fd is None:
+            opened_fd = os.open(path, directory_flags)
+        else:
+            opened_fd = os.open(path, directory_flags, dir_fd=dir_fd)
+        if not stat.S_ISDIR(os.fstat(opened_fd).st_mode):
+            os.close(opened_fd)
+            raise ValueError("Hugging Face snapshot path is not a directory")
+        directory_fds.append(opened_fd)
+        return opened_fd
+
+    try:
+        anchor_fd = open_directory(repository.parent)
+        repository_fd = open_directory(repository.name, anchor_fd)
+        snapshots_fd = open_directory(snapshots.name, repository_fd)
+        revision_fd = open_directory(revision.name, snapshots_fd)
+        yield repository_fd, revision_fd
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+@contextmanager
 def _open_posix_huggingface_blob(
-    model_root: Path,
-    root_fd: int,
+    repository_fd: int,
+    revision_fd: int,
     filename: str,
     link_stat: os.stat_result,
 ) -> Iterator[Any]:
-    repository = _huggingface_snapshot_repository(model_root)
-    if repository is None:
-        raise ValueError("model evidence symlink is outside a Hugging Face snapshot")
-    link_target = os.readlink(filename, dir_fd=root_fd)
+    link_target = os.readlink(filename, dir_fd=revision_fd)
     digest = _parse_huggingface_blob_link_target(link_target)
     if digest is None:
         raise ValueError("model evidence symlink target is not a Hugging Face blob")
@@ -254,28 +287,20 @@ def _open_posix_huggingface_blob(
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
-    directory_fds: list[int] = []
+    blobs_fd: int | None = None
     blob_fd: int | None = None
     try:
-        repository_fd = os.open(repository, directory_flags)
-        directory_fds.append(repository_fd)
-        snapshots_fd = os.open("snapshots", directory_flags, dir_fd=repository_fd)
-        directory_fds.append(snapshots_fd)
-        revision_fd = os.open(model_root.name, directory_flags, dir_fd=snapshots_fd)
-        directory_fds.append(revision_fd)
-        if _stat_identity(os.fstat(root_fd)) != _stat_identity(os.fstat(revision_fd)):
-            raise ValueError("model evidence snapshot changed while opening")
-
         blobs_fd = os.open("blobs", directory_flags, dir_fd=repository_fd)
-        directory_fds.append(blobs_fd)
+        if not stat.S_ISDIR(os.fstat(blobs_fd).st_mode):
+            raise ValueError("Hugging Face blob directory is not a directory")
         blob_fd = os.open(digest, file_flags, dir_fd=blobs_fd)
         if not stat.S_ISREG(os.fstat(blob_fd).st_mode):
             raise ValueError("model evidence blob is not regular")
-        link_after = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+        link_after = os.stat(filename, dir_fd=revision_fd, follow_symlinks=False)
         if (
             not stat.S_ISLNK(link_after.st_mode)
             or _stat_identity(link_stat) != _stat_identity(link_after)
-            or os.readlink(filename, dir_fd=root_fd) != link_target
+            or os.readlink(filename, dir_fd=revision_fd) != link_target
         ):
             raise ValueError("model evidence symlink changed while opening")
         with os.fdopen(blob_fd, "rb") as stream:
@@ -284,8 +309,47 @@ def _open_posix_huggingface_blob(
     finally:
         if blob_fd is not None:
             os.close(blob_fd)
-        for directory_fd in reversed(directory_fds):
-            os.close(directory_fd)
+        if blobs_fd is not None:
+            os.close(blobs_fd)
+
+
+@contextmanager
+def _open_posix_model_file_at(
+    revision_fd: int,
+    filename: str,
+    repository_fd: int | None = None,
+) -> Iterator[Any]:
+    file_stat = os.stat(filename, dir_fd=revision_fd, follow_symlinks=False)
+    if stat.S_ISLNK(file_stat.st_mode):
+        if repository_fd is None:
+            raise ValueError("model evidence file is a symlink")
+        with _open_posix_huggingface_blob(
+            repository_fd, revision_fd, filename, file_stat
+        ) as stream:
+            yield stream
+        return
+
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(
+            filename,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=revision_fd,
+        )
+        opened_stat = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _stat_identity(file_stat) != _stat_identity(opened_stat)
+        ):
+            raise ValueError("model evidence file is not regular")
+        with os.fdopen(file_fd, "rb") as stream:
+            file_fd = None
+            yield stream
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
 
 
 def _windows_link_target(target: str) -> str:
@@ -377,6 +441,17 @@ def iter_fences(card_text: str) -> Iterator[Fence]:
 @contextmanager
 def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
     if os.name == "posix":
+        if _huggingface_snapshot_paths(model_root) is not None:
+            with _open_posix_huggingface_snapshot(model_root) as (
+                repository_fd,
+                revision_fd,
+            ):
+                with _open_posix_model_file_at(
+                    revision_fd, filename, repository_fd
+                ) as stream:
+                    yield stream
+            return
+
         root_flags = (
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
@@ -386,34 +461,10 @@ def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
         if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
             os.close(root_fd)
             raise ValueError("model root is not a directory")
-        file_fd: int | None = None
         try:
-            file_stat = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
-            if stat.S_ISLNK(file_stat.st_mode):
-                with _open_posix_huggingface_blob(
-                    model_root, root_fd, filename, file_stat
-                ) as stream:
-                    yield stream
-                return
-            file_fd = os.open(
-                filename,
-                os.O_RDONLY
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=root_fd,
-            )
-            opened_stat = os.fstat(file_fd)
-            if (
-                not stat.S_ISREG(opened_stat.st_mode)
-                or _stat_identity(file_stat) != _stat_identity(opened_stat)
-            ):
-                raise ValueError("model evidence file is not regular")
-            with os.fdopen(file_fd, "rb") as stream:
-                file_fd = None
+            with _open_posix_model_file_at(root_fd, filename) as stream:
                 yield stream
         finally:
-            if file_fd is not None:
-                os.close(file_fd)
             os.close(root_fd)
         return
 
