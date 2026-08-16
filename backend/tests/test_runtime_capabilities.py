@@ -297,6 +297,36 @@ def test_probe_failure_falls_back_to_conservative_manifest():
     assert capabilities.method_mapping["draft_model"] == "STANDALONE"
 
 
+def test_probe_fallback_preserves_bounded_cleanup_diagnostics():
+    class Images:
+        @staticmethod
+        def get(_image: str):
+            return type("Image", (), {"id": "sha256:cleanup-failed"})()
+
+    client = type("Client", (), {"images": Images()})()
+
+    def failed_probe(_runtime: str, _image: str) -> str:
+        error = RuntimeError("wait failed " + "x" * 2_000)
+        error.add_note("Runtime probe container cleanup failed: " + "y" * 2_000)
+        error.__notes__.append({"not": "a string"})
+        raise error
+
+    service = RuntimeCapabilityService(
+        settings=make_settings(),
+        docker_client=client,
+        probe_runner=failed_probe,
+    )
+
+    capabilities = service.get("vllm", "vllm:test")
+
+    assert capabilities.source == "manifest"
+    assert len(capabilities.warnings) == 2
+    assert capabilities.warnings[0].startswith("Runtime capability probe failed: wait failed")
+    assert capabilities.warnings[1].startswith("Runtime probe container cleanup failed:")
+    assert all(len(warning) <= 500 for warning in capabilities.warnings)
+    assert "{'not': 'a string'}" not in " ".join(capabilities.warnings)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

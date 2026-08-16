@@ -40,6 +40,8 @@ QUANTIZATION_METHODS = (
 )
 
 MAX_PROBE_LOG_BYTES = 128 * 1024
+MAX_PROBE_WARNING_CHARS = 500
+MAX_PROBE_WARNINGS = 8
 
 
 class RuntimeCapabilities(BaseModel):
@@ -200,6 +202,30 @@ def _read_bounded_logs(logs: bytes | str | Iterable[bytes | str]) -> bytes:
                 primary_error.add_note(f"Runtime probe log stream cleanup failed: {cleanup_error}")
 
 
+def _bounded_warning(value: str) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= MAX_PROBE_WARNING_CHARS:
+        return normalized
+    return normalized[: MAX_PROBE_WARNING_CHARS - 3] + "..."
+
+
+def _probe_failure_warnings(exc: Exception) -> list[str]:
+    try:
+        message = str(exc).strip() or type(exc).__name__
+    except Exception:
+        message = type(exc).__name__
+    warnings = [_bounded_warning(f"Runtime capability probe failed: {message}")]
+
+    notes = getattr(exc, "__notes__", None)
+    if isinstance(notes, (list, tuple)):
+        for note in notes:
+            if len(warnings) >= MAX_PROBE_WARNINGS:
+                break
+            if isinstance(note, str) and note.strip():
+                warnings.append(_bounded_warning(note))
+    return warnings
+
+
 def run_runtime_probe(
     client: Any,
     settings: Settings,
@@ -318,7 +344,7 @@ class RuntimeCapabilityService:
                     image_digest=image_digest,
                     source="manifest",
                     **CONSERVATIVE_MANIFESTS[runtime],
-                    warnings=[f"Runtime capability probe failed: {exc}"],
+                    warnings=_probe_failure_warnings(exc),
                 )
 
             self._cache[cache_key] = capabilities.model_copy(deep=True)
