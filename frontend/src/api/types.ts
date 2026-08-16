@@ -43,6 +43,17 @@ export interface ModelAsset {
   updated_at: string
 }
 
+export interface ModelReference {
+  deployment_id: string
+  deployment_name: string
+  usage: 'base' | 'draft' | 'legacy_path'
+}
+
+export interface ModelInUseDetail {
+  code: 'model_in_use'
+  references: ModelReference[]
+}
+
 export interface Deployment {
   id: string
   name: string
