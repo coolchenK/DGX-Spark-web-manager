@@ -222,6 +222,9 @@ def spark_compatibility(
     if has_capacity_risk:
         score -= 120
         reasons.append("模型规模需评估")
+    if gguf_only:
+        score -= 40
+        reasons.append("需要额外运行时")
     if has_compressed_tensors:
         score += 30
         reasons.append("压缩权重格式")
@@ -234,9 +237,6 @@ def spark_compatibility(
     if (pipeline_tag or "").casefold() in {"text-generation", "image-text-to-text"}:
         score += 10
         reasons.append("生成任务")
-    if gguf_only:
-        score -= 40
-        reasons.append("需要额外运行时")
 
     if has_capacity_risk or gguf_only:
         level = "review"

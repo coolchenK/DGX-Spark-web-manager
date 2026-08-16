@@ -322,7 +322,28 @@ def test_search_forces_positive_scoring_gguf_only_model_to_review(tmp_path):
     assert compatibility == {
         "level": "review",
         "score": 100,
-        "reasons": ["NVFP4 量化", "适配当前推理运行时", "需要额外运行时"],
+        "reasons": ["NVFP4 量化", "需要额外运行时", "适配当前推理运行时"],
+    }
+
+
+def test_search_puts_gguf_only_downgrade_before_runtime_and_pipeline_reasons(tmp_path):
+    service = huggingface.HuggingFaceService(tmp_path)
+    service.api = FakeHuggingFaceApi(
+        [
+            model_result(
+                "org/model-NVFP4",
+                tags=["vllm", "gguf"],
+                pipeline_tag="text-generation",
+            )
+        ]
+    )
+
+    compatibility = service.search("model", limit=1)[0]["spark_compatibility"]
+
+    assert compatibility == {
+        "level": "review",
+        "score": 110,
+        "reasons": ["NVFP4 量化", "需要额外运行时", "适配当前推理运行时"],
     }
 
 

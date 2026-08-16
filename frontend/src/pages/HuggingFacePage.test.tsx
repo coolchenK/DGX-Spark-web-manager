@@ -11,22 +11,39 @@ import { HuggingFacePage } from './HuggingFacePage'
 
 describe('HuggingFacePage', () => {
   test('renders Spark compatibility metadata with stable styling hooks', async () => {
-    const model: HuggingFaceModel = {
-      id: 'nvidia/DGX-Spark-ready-model',
-      downloads: 12_345,
-      likes: 678,
-      pipeline_tag: 'text-generation',
-      private: false,
-      gated: false,
-      last_modified: '2026-08-16T00:00:00Z',
-      tags: [],
-      spark_compatibility: {
-        level: 'recommended',
-        score: 100,
-        reasons: ['统一内存满足模型需求', '原生支持 ARM64'],
+    const models: HuggingFaceModel[] = [
+      {
+        id: 'nvidia/DGX-Spark-ready-model',
+        downloads: 12_345,
+        likes: 678,
+        pipeline_tag: 'text-generation',
+        private: false,
+        gated: false,
+        last_modified: '2026-08-16T00:00:00Z',
+        tags: [],
+        spark_compatibility: {
+          level: 'recommended',
+          score: 100,
+          reasons: ['统一内存满足模型需求', '原生支持 ARM64'],
+        },
       },
-    }
-    vi.spyOn(api, 'get').mockResolvedValue([model])
+      {
+        id: 'example/model-requiring-review',
+        downloads: 42,
+        likes: 3,
+        pipeline_tag: 'image-classification',
+        private: false,
+        gated: false,
+        last_modified: '2026-08-15T00:00:00Z',
+        tags: [],
+        spark_compatibility: {
+          level: 'review',
+          score: 25,
+          reasons: ['NVFP4 量化', '需要额外运行时', '生成任务'],
+        },
+      },
+    ]
+    vi.spyOn(api, 'get').mockResolvedValue(models)
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     })
@@ -49,5 +66,8 @@ describe('HuggingFacePage', () => {
     expect(screen.getByText('678 赞')).toBeInTheDocument()
     expect(screen.getByText('DGX Spark 推荐').closest('.ant-tag')).toHaveClass('hf-spark-tag', 'hf-spark-tag-recommended')
     expect(screen.getByText('统一内存满足模型需求 · 原生支持 ARM64')).toHaveClass('hf-compatibility-reason')
+    expect(screen.getByText('需评估').closest('.ant-tag')).toHaveClass('hf-spark-tag', 'hf-spark-tag-review')
+    expect(screen.getByText('NVFP4 量化 · 需要额外运行时')).toHaveClass('hf-compatibility-reason')
+    expect(screen.queryByText(/生成任务/)).not.toBeInTheDocument()
   })
 })
