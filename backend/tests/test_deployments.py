@@ -27,6 +27,7 @@ from app.services.model_evidence import ModelEvidenceLoader
 from app.services.resource_estimator import ResourceEstimate, ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilities
 from app.tasks.engine import TaskCancelled
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 
@@ -2340,11 +2341,148 @@ def test_committed_recovery_rejects_wrong_deployment_label(
             )
 
 
-def test_committed_recovery_does_not_overwrite_concurrent_deployment_change(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("db_status", "db_health", "expected_stops"),
+    [("exited", "unhealthy", 1), ("running", "healthy", 0)],
+)
+def test_committed_recovery_cas_rejects_race_and_coordinates_started_container(
+    tmp_path, monkeypatch, db_status, db_health, expected_stops
 ):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'concurrent-recovery.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    service = build_preflight_service(database, (root,))
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+    with database.session_factory() as db:
+        preview = service.preview(db, spec)
+        deployment = Deployment(
+            name=spec.name,
+            model_id=model_id,
+            runtime=spec.runtime,
+            container_id="replacement-container",
+            container_name="dgx-base",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name=spec.api_model_name,
+            status=db_status,
+            health=db_health,
+            managed=True,
+            image=spec.image,
+            port=spec.port,
+            config=preview,
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+    labels = service._expected_container_labels(
+        spec,
+        task_id="original-task",
+        spec_fingerprint=deployment_service.deployment_spec_fingerprint(spec),
+        deployment_id=deployment_id,
+    )
+
+    class Container:
+        id = "replacement-container"
+        name = "dgx-base"
+        status = "exited"
+        attrs = {"Config": {"Labels": labels}}
+        starts = 0
+        stops = 0
+
+        def start(self):
+            self.starts += 1
+            self.status = "running"
+
+        def stop(self, **_kwargs):
+            self.stops += 1
+            self.status = "exited"
+
+    container = Container()
+
+    class Containers:
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise docker.errors.NotFound("missing")
+
+    recovery_updates = []
+
+    def capture_update(_connection, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().upper().startswith("UPDATE DEPLOYMENTS"):
+            recovery_updates.append(statement)
+
+    original_session_factory = service.session_factory
+    session_calls = 0
+
+    class RacingSessionFactory:
+        def __call__(self):
+            nonlocal session_calls
+            session_calls += 1
+            if session_calls == 3:
+                with original_session_factory() as concurrent_db:
+                    changed = concurrent_db.get(Deployment, deployment_id)
+                    changed.status = "concurrent"
+                    concurrent_db.commit()
+            return original_session_factory()
+
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": Containers()})(),
+    )
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(service, "session_factory", RacingSessionFactory())
+    event.listen(database.engine, "before_cursor_execute", capture_update)
+
+    try:
+        with pytest.raises(ValueError, match="changed while recovery was running"):
+            service.update_handler(
+                HandlerContext(),
+                {
+                    "deployment_id": deployment_id,
+                    "spec": spec.model_dump(mode="json"),
+                },
+            )
+    finally:
+        event.remove(database.engine, "before_cursor_execute", capture_update)
+
+    assert container.starts == 1
+    assert container.stops == expected_stops
+    assert len(recovery_updates) == 2
+    normalized_update = " ".join(recovery_updates[-1].lower().split())
+    assert " where " in normalized_update
+    where_clause = normalized_update.split(" where ", 1)[1]
+    for field in (
+        "updated_at",
+        "container_id",
+        "status",
+        "health",
+        "container_name",
+        "endpoint_url",
+    ):
+        assert field in where_clause
+    with database.session_factory() as db:
+        changed = db.get(Deployment, deployment_id)
+        assert changed.container_id == "replacement-container"
+        assert changed.status == "concurrent"
+        assert changed.health == db_health
+
+
+def test_committed_recovery_health_failure_stops_container_started_by_retry(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'recovery-health-failure.db'}")
     database.create_schema()
     with database.session_factory() as db:
         target = add_model_asset(db, root / "base")
@@ -2389,44 +2527,39 @@ def test_committed_recovery_does_not_overwrite_concurrent_deployment_change(
     class Container:
         id = "replacement-container"
         name = "dgx-base"
-        status = "running"
+        status = "exited"
         attrs = {"Config": {"Labels": labels}}
+        starts = 0
+        stops = 0
+
+        def start(self):
+            self.starts += 1
+            self.status = "running"
+
+        def stop(self, **_kwargs):
+            self.stops += 1
+            self.status = "exited"
 
     container = Container()
-
-    class Containers:
-        def get(self, identifier):
-            if identifier == container.id:
-                return container
-            raise docker.errors.NotFound("missing")
-
-    def concurrent_change(*_args, **_kwargs):
-        with database.session_factory() as db:
-            changed = db.get(Deployment, deployment_id)
-            changed.container_id = "concurrent-container"
-            changed.container_name = "concurrent-name"
-            changed.status = "starting"
-            db.commit()
-        return True
-
+    containers = type(
+        "Containers", (), {"get": lambda _self, _identifier: container}
+    )()
     monkeypatch.setattr(
         service,
         "docker_client",
-        lambda: type("Client", (), {"containers": Containers()})(),
+        lambda: type("Client", (), {"containers": containers})(),
     )
-    monkeypatch.setattr(service, "wait_for_health", concurrent_change)
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: False)
 
-    with pytest.raises(ValueError, match="changed while recovery was running"):
+    with pytest.raises(RuntimeError, match="replacement container is unhealthy"):
         service.update_handler(
             HandlerContext(),
             {"deployment_id": deployment_id, "spec": spec.model_dump(mode="json")},
         )
 
-    with database.session_factory() as db:
-        changed = db.get(Deployment, deployment_id)
-        assert changed.container_id == "concurrent-container"
-        assert changed.container_name == "concurrent-name"
-        assert changed.status == "starting"
+    assert container.starts == 1
+    assert container.stops == 1
+    assert container.status == "exited"
 
 
 def test_create_app_shares_preflight_dependencies(settings):

@@ -11,7 +11,7 @@ from typing import Any
 import docker
 import httpx
 from docker.types import DeviceRequest, LogConfig
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Deployment, ModelAsset
@@ -443,12 +443,19 @@ class DeploymentService:
     ) -> dict[str, Any]:
         deployment_id = deployment.id
         container_id = deployment.container_id
-        original_state = (
-            deployment.status,
-            deployment.health,
-            deployment.container_name,
-            deployment.endpoint_url,
-        )
+        original = {
+            "updated_at": deployment.updated_at,
+            "status": deployment.status,
+            "health": deployment.health,
+            "container_name": deployment.container_name,
+            "endpoint_url": deployment.endpoint_url,
+            "name": deployment.name,
+            "model_id": deployment.model_id,
+            "runtime": deployment.runtime,
+            "api_model_name": deployment.api_model_name,
+            "image": deployment.image,
+            "port": deployment.port,
+        }
         adapter = self._adapter_for_spec(spec)
         client = self.docker_client()
         target = self._get_container_optional(client, container_id)
@@ -467,36 +474,27 @@ class DeploymentService:
             require_deployment=cleanup_backup,
             accepted_fingerprints=self._stored_container_fingerprints(deployment),
         )
-        if target.status != "running":
-            adapter.start(target)
         endpoint = f"http://127.0.0.1:{spec.port}"
-        if not self.wait_for_health(context, endpoint, adapter=adapter):
-            raise RuntimeError("Persisted replacement container is unhealthy")
-        with self.session_factory() as db:
-            current = db.scalar(
-                select(Deployment)
-                .where(Deployment.id == deployment_id)
-                .with_for_update()
+        started_here = target.status != "running"
+        try:
+            if started_here:
+                adapter.start(target)
+            if not self.wait_for_health(context, endpoint, adapter=adapter):
+                raise RuntimeError("Persisted replacement container is unhealthy")
+            self._sync_recovered_deployment(
+                deployment_id=deployment_id,
+                container_id=container_id,
+                original=original,
+                spec=spec,
+                container_name=target.name,
+                endpoint=endpoint,
             )
-            current_state = (
-                current.status,
-                current.health,
-                current.container_name,
-                current.endpoint_url,
-            ) if current is not None else None
-            if (
-                current is None
-                or current.container_id != container_id
-                or not current.managed
-                or current_state != original_state
-                or not self._deployment_matches_spec(current, spec)
-            ):
-                raise ValueError("Deployment changed while recovery was running")
-            current.status = "running"
-            current.health = "healthy"
-            current.container_name = target.name
-            current.endpoint_url = endpoint
-            db.commit()
+        except BaseException:
+            if started_here:
+                self._coordinate_failed_recovery_start(
+                    adapter, target, deployment_id, container_id
+                )
+            raise
         if cleanup_backup:
             self._cleanup_committed_backup(context, client, target, deployment_id)
         return {
@@ -505,6 +503,101 @@ class DeploymentService:
             "endpoint_url": endpoint,
             "idempotent": True,
         }
+
+    def _sync_recovered_deployment(
+        self,
+        *,
+        deployment_id: str,
+        container_id: str,
+        original: Mapping[str, Any],
+        spec: DeploymentSpec,
+        container_name: str,
+        endpoint: str,
+    ) -> None:
+        with self.session_factory() as db:
+            current = db.get(Deployment, deployment_id)
+            if (
+                current is None
+                or current.container_id != container_id
+                or not current.managed
+                or current.updated_at != original["updated_at"]
+                or current.status != original["status"]
+                or current.health != original["health"]
+                or current.container_name != original["container_name"]
+                or current.endpoint_url != original["endpoint_url"]
+                or not self._deployment_matches_spec(current, spec)
+            ):
+                raise ValueError("Deployment changed while recovery was running")
+
+        conditions = (
+            Deployment.id == deployment_id,
+            Deployment.managed.is_(True),
+            Deployment.container_id == container_id,
+            Deployment.updated_at == original["updated_at"],
+            Deployment.status == original["status"],
+            Deployment.health == original["health"],
+            Deployment.container_name == original["container_name"],
+            Deployment.endpoint_url == original["endpoint_url"],
+            Deployment.name == original["name"],
+            Deployment.model_id == original["model_id"],
+            Deployment.runtime == original["runtime"],
+            Deployment.api_model_name == original["api_model_name"],
+            Deployment.image == original["image"],
+            Deployment.port == original["port"],
+        )
+        with self.session_factory() as db:
+            result = db.execute(
+                update(Deployment)
+                .where(*conditions)
+                .values(
+                    status="running",
+                    health="healthy",
+                    container_name=container_name,
+                    endpoint_url=endpoint,
+                )
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                db.expire_all()
+                db.get(Deployment, deployment_id)
+                raise ValueError("Deployment changed while recovery was running")
+            db.expire_all()
+            updated = db.get(Deployment, deployment_id)
+            if (
+                updated is None
+                or updated.container_id != container_id
+                or not updated.managed
+                or not self._deployment_matches_spec(updated, spec)
+            ):
+                db.rollback()
+                raise ValueError("Deployment changed while recovery was running")
+            db.commit()
+
+    def _coordinate_failed_recovery_start(
+        self,
+        adapter: RuntimeAdapter,
+        target: Any,
+        deployment_id: str,
+        container_id: str,
+    ) -> None:
+        try:
+            with self.session_factory() as db:
+                reference = db.scalar(
+                    select(Deployment).where(
+                        Deployment.container_id == container_id
+                    )
+                )
+                should_stop = reference is None or (
+                    reference.id == deployment_id
+                    and (
+                        reference.status in {"deleted", "dead", "exited", "stopped"}
+                        or reference.health == "unhealthy"
+                    )
+                )
+            if should_stop:
+                adapter.stop(target, timeout=30)
+        except BaseException:
+            pass
 
     @staticmethod
     def _remove_owned_container(container: Any) -> None:
@@ -712,6 +805,7 @@ class DeploymentService:
 
     def create_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         spec = DeploymentSpec.model_validate(payload)
+        committed = None
         with self.session_factory() as db:
             matches = list(
                 db.scalars(
@@ -734,11 +828,14 @@ class DeploymentService:
                     raise ValueError("Deployment identity conflicts with an existing deployment")
                 if not self._deployment_matches_spec(existing, spec):
                     raise ValueError("Existing deployment uses a different deployment spec")
-                return self._recover_committed_deployment(
-                    context, existing, spec, cleanup_backup=False
-                )
-            resolved, preview = self._preflight(db, spec)
-            fingerprint = preview["spec_fingerprint"]
+                committed = existing
+            else:
+                resolved, preview = self._preflight(db, spec)
+                fingerprint = preview["spec_fingerprint"]
+        if committed is not None:
+            return self._recover_committed_deployment(
+                context, committed, spec, cleanup_backup=False
+            )
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
         name = deterministic_container_name(resolved.name)
@@ -817,6 +914,7 @@ class DeploymentService:
     def update_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         deployment_id = str(payload["deployment_id"])
         spec = DeploymentSpec.model_validate(payload["spec"])
+        committed = None
         with self.session_factory() as db:
             deployment = db.get(Deployment, deployment_id)
             if not deployment or not deployment.container_id:
@@ -835,19 +933,24 @@ class DeploymentService:
             if conflict:
                 raise ValueError("Another deployment uses this name or API model name")
             if self._deployment_matches_spec(deployment, spec):
-                return self._recover_committed_deployment(
-                    context, deployment, spec, cleanup_backup=True
+                committed = deployment
+            else:
+                resolved, preview = self._preflight(
+                    db,
+                    spec,
+                    exclude_deployment_id=deployment_id,
                 )
-            resolved, preview = self._preflight(
-                db,
-                spec,
-                exclude_deployment_id=deployment_id,
+                current_container_id = deployment.container_id
+                current_container_name = (
+                    deployment.container_name
+                    or deterministic_container_name(deployment.name)
+                )
+                current_status = deployment.status
+
+        if committed is not None:
+            return self._recover_committed_deployment(
+                context, committed, spec, cleanup_backup=True
             )
-            current_container_id = deployment.container_id
-            current_container_name = deployment.container_name or deterministic_container_name(
-                deployment.name
-            )
-            current_status = deployment.status
 
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
