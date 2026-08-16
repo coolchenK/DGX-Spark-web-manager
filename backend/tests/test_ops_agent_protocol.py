@@ -97,7 +97,7 @@ READ_ACTION_CASES = {
     ),
     "docker.inspect": (
         {"container": "web-1"},
-        ("/usr/bin/docker", "inspect", "web-1"),
+        ("/usr/bin/docker", "container", "inspect", "web-1"),
         15,
     ),
     "docker.logs": (
@@ -144,6 +144,7 @@ def test_policy_read_only_actions_bind_fixed_argv_without_approval(action):
     assert validated.timeout == expected_timeout
     assert validated.read_only is True
     assert validated.approval is None
+    assert validated.environment == ()
     assert validated.argv[0].startswith("/")
 
 
@@ -225,6 +226,90 @@ def test_policy_shell_defaults_timeout_but_still_requires_approval():
     validated = validate_action("shell.execute", parameters, approval=VALID_APPROVAL)
 
     assert validated.timeout == 30
+    assert validated.environment == ()
+
+
+def test_policy_shell_accepts_only_bounded_non_sensitive_environment():
+    environment = {
+        "TZ": "UTC",
+        "TERM": "xterm-256color",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "NO_COLOR": "1",
+        "LC_CTYPE": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "LANG": "en_US.UTF-8",
+        "DEBIAN_FRONTEND": "noninteractive",
+        "COLORTERM": "truecolor",
+    }
+
+    validated = validate_action(
+        "shell.execute",
+        {"command": "id", "cwd": "/", "env": environment},
+        approval=VALID_APPROVAL,
+    )
+
+    assert validated.environment == tuple(sorted(environment.items()))
+    assert dict(validated.environment) == environment
+
+
+def test_policy_shell_accepts_empty_environment():
+    validated = validate_action(
+        "shell.execute",
+        {"command": "id", "cwd": "/", "env": {}},
+        approval=VALID_APPROVAL,
+    )
+
+    assert validated.environment == ()
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        True,
+        [],
+        {"UNKNOWN": "value"},
+        {"PATH": "/tmp/bin"},
+        {"LD_PRELOAD": "/tmp/library.so"},
+        {"PYTHONPATH": "/tmp/python"},
+        {"PYTHONHOME": "/tmp/python"},
+        {"DGX_OPS_AGENT_SECRET": "secret"},
+        {1: "value"},
+        {"LANG": 1},
+        {"LANG": True},
+        {"LANG": "line\nvalue"},
+        {"LANG": "value\x00suffix"},
+        {"LANG": "x" * 257},
+        {f"EXTRA_{index}": "value" for index in range(17)},
+    ],
+)
+def test_policy_shell_rejects_unsafe_environment_without_echoing_it(environment):
+    secret = "secret"
+
+    with pytest.raises(PolicyError, match="^invalid parameters$") as exc_info:
+        validate_action(
+            "shell.execute",
+            {"command": "id", "cwd": "/", "env": environment},
+            approval=VALID_APPROVAL,
+        )
+
+    assert secret not in str(exc_info.value)
+
+
+def test_policy_shell_environment_is_deterministic_and_immutable():
+    first = validate_action(
+        "shell.execute",
+        {"command": "id", "cwd": "/", "env": {"TZ": "UTC", "LANG": "C"}},
+        approval=VALID_APPROVAL,
+    )
+    second = validate_action(
+        "shell.execute",
+        {"command": "id", "cwd": "/", "env": {"LANG": "C", "TZ": "UTC"}},
+        approval=VALID_APPROVAL,
+    )
+
+    assert first.environment == second.environment == (("LANG", "C"), ("TZ", "UTC"))
+    with pytest.raises(TypeError):
+        first.environment[0] = ("PATH", "/tmp/bin")
 
 
 @pytest.mark.parametrize(
@@ -240,7 +325,6 @@ def test_policy_shell_defaults_timeout_but_still_requires_approval():
         {"command": "id", "cwd": "/", "timeout": True},
         {"command": "id", "cwd": "/", "timeout": 0},
         {"command": "id", "cwd": "/", "timeout": 3601},
-        {"command": "id", "cwd": "/", "timeout": 30, "env": {}},
         {"command": "id", "cwd": "/", "timeout": 30, "unexpected": True},
     ],
 )

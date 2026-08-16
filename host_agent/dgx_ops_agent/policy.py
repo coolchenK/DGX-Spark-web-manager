@@ -12,6 +12,8 @@ from typing import Any
 
 MAX_COMMAND_LENGTH = 16_384
 MAX_CWD_LENGTH = 4_096
+MAX_ENVIRONMENT_VARIABLES = 16
+MAX_ENVIRONMENT_VALUE_LENGTH = 256
 MAX_IDENTIFIER_LENGTH = 128
 MAX_SERVICE_LENGTH = 256
 DEFAULT_TIMEOUT = 30
@@ -24,6 +26,19 @@ _CONTAINER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SERVICE_PATTERN = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 _UTC_TIMESTAMP_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z"
+)
+_ALLOWED_ENVIRONMENT_KEYS = frozenset(
+    {
+        "COLORTERM",
+        "DEBIAN_FRONTEND",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PIP_DISABLE_PIP_VERSION_CHECK",
+        "TERM",
+        "TZ",
+    }
 )
 
 
@@ -51,6 +66,7 @@ class ValidatedAction:
     timeout: int
     read_only: bool
     approval: ApprovalMetadata | None
+    environment: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +108,7 @@ class ToolSpec:
             timeout=self.timeout,
             read_only=True,
             approval=None,
+            environment=(),
         )
 
 
@@ -132,7 +149,9 @@ READ_ONLY_TOOLS: Mapping[str, ToolSpec] = MappingProxyType(
             "none",
             15,
         ),
-        "docker.inspect": ToolSpec(("/usr/bin/docker", "inspect"), "container", 15),
+        "docker.inspect": ToolSpec(
+            ("/usr/bin/docker", "container", "inspect"), "container", 15
+        ),
         "docker.logs": ToolSpec(
             ("/usr/bin/docker", "logs", "--tail"), "container_tail", 15
         ),
@@ -175,7 +194,7 @@ def validate_action(
     if action != "shell.execute":
         raise PolicyError("unknown action")
 
-    command, cwd, timeout = _validate_shell_parameters(parameters)
+    command, cwd, timeout, environment = _validate_shell_parameters(parameters)
     approval_metadata = _validate_approval(approval)
     return ValidatedAction(
         action=action,
@@ -184,6 +203,7 @@ def validate_action(
         timeout=timeout,
         read_only=False,
         approval=approval_metadata,
+        environment=environment,
     )
 
 
@@ -215,15 +235,18 @@ def _validate_tail(value: Any) -> int:
     return value
 
 
-def _validate_shell_parameters(parameters: dict[str, Any]) -> tuple[str, str, int]:
+def _validate_shell_parameters(
+    parameters: dict[str, Any],
+) -> tuple[str, str, int, tuple[tuple[str, str], ...]]:
     keys = frozenset(parameters)
     if not frozenset({"command", "cwd"}) <= keys <= frozenset(
-        {"command", "cwd", "timeout"}
+        {"command", "cwd", "env", "timeout"}
     ):
         raise PolicyError("invalid parameters")
     command = parameters["command"]
     cwd = parameters["cwd"]
     timeout = parameters.get("timeout", DEFAULT_TIMEOUT)
+    environment = _validate_environment(parameters.get("env", {}))
 
     if (
         not isinstance(command, str)
@@ -244,7 +267,25 @@ def _validate_shell_parameters(parameters: dict[str, Any]) -> tuple[str, str, in
         raise PolicyError("invalid parameters")
     if type(timeout) is not int or not MIN_TIMEOUT <= timeout <= MAX_TIMEOUT:
         raise PolicyError("invalid parameters")
-    return command, cwd, timeout
+    return command, cwd, timeout, environment
+
+
+def _validate_environment(value: Any) -> tuple[tuple[str, str], ...]:
+    if type(value) is not dict or len(value) > MAX_ENVIRONMENT_VARIABLES:
+        raise PolicyError("invalid parameters")
+
+    environment: list[tuple[str, str]] = []
+    for key, item in value.items():
+        if (
+            type(key) is not str
+            or key not in _ALLOWED_ENVIRONMENT_KEYS
+            or type(item) is not str
+            or len(item) > MAX_ENVIRONMENT_VALUE_LENGTH
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in item)
+        ):
+            raise PolicyError("invalid parameters")
+        environment.append((key, item))
+    return tuple(sorted(environment))
 
 
 def _validate_approval(approval: dict[str, Any] | None) -> ApprovalMetadata:
