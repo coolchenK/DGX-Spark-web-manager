@@ -319,6 +319,17 @@ def add_action_deployment(db, *, managed, name="service", **values):
     return deployment
 
 
+def action_handler_payload(
+    deployment_id, action, *, container_id, container_name
+):
+    return {
+        "deployment_id": deployment_id,
+        "action": action,
+        "expected_container_id": container_id,
+        "expected_container_name": container_name,
+    }
+
+
 @pytest.mark.parametrize(
     "payload",
     [None, {}, {"confirm_container_name": "wrong-container"}],
@@ -3036,6 +3047,38 @@ def test_queued_delete_rejects_deployment_rebound_to_same_named_container(tmp_pa
         assert current.container_id == container_b.id
 
 
+def test_legacy_delete_without_snapshot_fails_closed_after_rebind(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'legacy-delete-rebound.db'}")
+    database.create_schema()
+    container_b = ActionContainer("3c" * 32, "shared-name")
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=False,
+            name="discovered",
+            container_id=container_b.id,
+            container_name=container_b.name,
+        )
+        deployment_id = deployment.id
+    service, _, get_calls = build_action_service(database, tmp_path, container_b)
+
+    with pytest.raises(ValueError, match="missing its container snapshot; retry"):
+        service.action_handler(
+            HandlerContext(),
+            {"deployment_id": deployment_id, "action": "delete"},
+        )
+
+    assert get_calls == []
+    assert container_b.removed is False
+    with database.session_factory() as db:
+        current = db.get(Deployment, deployment_id)
+        assert current is not None
+        assert current.container_id == container_b.id
+        assert current.container_name == container_b.name
+        assert current.status == "running"
+        assert current.health == "healthy"
+
+
 def test_not_found_cleanup_cas_preserves_concurrently_rebound_deployment(tmp_path):
     database = Database(f"sqlite:///{tmp_path / 'not-found-rebound.db'}")
     database.create_schema()
@@ -3214,7 +3257,13 @@ def test_destructive_action_commits_transition_before_adapter_call(
     monkeypatch.setattr(adapter, adapter_method, operation)
 
     result = service.action_handler(
-        HandlerContext(), {"deployment_id": deployment_id, "action": action}
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            action,
+            container_id=container.id,
+            container_name=container.name,
+        ),
     )
 
     assert observed == {"status": transition_status, "health": "unknown"}
@@ -3242,7 +3291,13 @@ def test_discovered_uninstall_removes_container_record_but_keeps_model(
     service, _, _ = build_action_service(database, tmp_path, container)
 
     result = service.action_handler(
-        HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "delete",
+            container_id=container.id,
+            container_name=container.name,
+        ),
     )
 
     assert result == {
@@ -3282,7 +3337,13 @@ def test_action_rejects_changed_container_identity(tmp_path, actual_id, actual_n
 
     with pytest.raises(ValueError, match="identity does not match"):
         service.action_handler(
-            HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+            HandlerContext(),
+            action_handler_payload(
+                deployment_id,
+                "delete",
+                container_id="a" * 64,
+                container_name="dgx-managed",
+            ),
         )
 
     assert container.removed is False
@@ -3312,7 +3373,13 @@ def test_action_rejects_reserved_manager_containers(tmp_path, container_name):
 
     with pytest.raises(ValueError, match="protected manager container"):
         service.action_handler(
-            HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+            HandlerContext(),
+            action_handler_payload(
+                deployment_id,
+                "delete",
+                container_id=container.id,
+                container_name=container_name,
+            ),
         )
 
     assert container.removed is False
@@ -3336,7 +3403,13 @@ def test_action_rejects_current_manager_container_id(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="protected manager container"):
         service.action_handler(
-            HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+            HandlerContext(),
+            action_handler_payload(
+                deployment_id,
+                "delete",
+                container_id=container.id,
+                container_name=container.name,
+            ),
         )
 
     assert container.removed is False
@@ -3360,7 +3433,13 @@ def test_delete_clears_stale_deployment_record(tmp_path, missing_kind):
     service, _, get_calls = build_action_service(database, tmp_path, target)
 
     result = service.action_handler(
-        HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "delete",
+            container_id=container_id,
+            container_name=f"stale-{missing_kind}",
+        ),
     )
 
     assert result["status"] == "deleted"
@@ -3392,7 +3471,13 @@ def test_stale_delete_does_not_require_a_supported_runtime(tmp_path, container_i
     )
 
     result = service.action_handler(
-        HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "delete",
+            container_id=container_id,
+            container_name="stale-runtime",
+        ),
     )
 
     assert result["container_missing"] is True
@@ -3420,7 +3505,13 @@ def test_non_delete_action_with_no_container_id_reports_missing(tmp_path):
 
     with pytest.raises(ValueError, match="Deployment or container was not found"):
         service.action_handler(
-            HandlerContext(), {"deployment_id": deployment_id, "action": "stop"}
+            HandlerContext(),
+            action_handler_payload(
+                deployment_id,
+                "stop",
+                container_id=None,
+                container_name="missing-stop",
+            ),
         )
 
     assert get_calls == []
@@ -3468,7 +3559,13 @@ def test_failed_destructive_action_restores_non_transitional_state(
 
     with pytest.raises(RuntimeError, match="docker operation failed"):
         service.action_handler(
-            HandlerContext(), {"deployment_id": deployment_id, "action": action}
+            HandlerContext(),
+            action_handler_payload(
+                deployment_id,
+                action,
+                container_id=container.id,
+                container_name=container.name,
+            ),
         )
 
     with database.session_factory() as db:
@@ -3504,7 +3601,13 @@ def test_recovery_failure_does_not_replace_docker_error(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="original docker error"):
         service.action_handler(
-            HandlerContext(), {"deployment_id": deployment_id, "action": "stop"}
+            HandlerContext(),
+            action_handler_payload(
+                deployment_id,
+                "stop",
+                container_id=container.id,
+                container_name=container.name,
+            ),
         )
 
 
@@ -3526,7 +3629,13 @@ def test_action_accepts_docker_short_id_and_normalized_name(tmp_path):
     service, _, _ = build_action_service(database, tmp_path, container)
 
     result = service.action_handler(
-        HandlerContext(), {"deployment_id": deployment_id, "action": "delete"}
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "delete",
+            container_id=full_id[:12],
+            container_name="dgx-managed",
+        ),
     )
 
     assert result["status"] == "deleted"
@@ -3550,7 +3659,13 @@ def test_restart_action_preserves_identity_and_reports_container_present(tmp_pat
     service.wait_for_health = lambda *_args, **_kwargs: True
 
     result = service.action_handler(
-        HandlerContext(), {"deployment_id": deployment_id, "action": "restart"}
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "restart",
+            container_id=container.id,
+            container_name=container.name,
+        ),
     )
 
     assert container.restarts == 1
@@ -3619,7 +3734,12 @@ def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
 
     result = service.action_handler(
         Context(),
-        {"deployment_id": deployment_id, "action": "start"},
+        action_handler_payload(
+            deployment_id,
+            "start",
+            container_id="container-id",
+            container_name="dgx-managed",
+        ),
     )
 
     assert container.starts == 1

@@ -4,7 +4,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import OperationPlan
+from app.models import Deployment, OperationPlan
 from app.tasks.engine import TaskContext
 
 
@@ -48,9 +48,20 @@ class OperationExecutor:
                 if not action:
                     results.append({"index": index, "status": "skipped", "reason": "Not allowed"})
                     continue
+                deployment_id = str(step["deployment_id"])
+                with self.session_factory() as db:
+                    deployment = db.get(Deployment, deployment_id)
+                    if deployment is None:
+                        raise ValueError("Deployment was not found; retry the operation")
+                    action_payload = {
+                        "deployment_id": deployment_id,
+                        "action": action,
+                        "expected_container_id": deployment.container_id,
+                        "expected_container_name": deployment.container_name,
+                    }
                 result = self.deployment_service.action_handler(
                     context,
-                    {"deployment_id": step["deployment_id"], "action": action},
+                    action_payload,
                 )
             results.append({"index": index, "status": "succeeded", "result": result})
             context.update(progress=(index + 1) / max(len(steps), 1) * 100)

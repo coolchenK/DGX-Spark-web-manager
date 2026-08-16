@@ -38,6 +38,9 @@ PROTECTED_CONTAINER_NAMES = {
     "dgx-spark-ops-agent",
 }
 CONCURRENT_DEPLOYMENT_CHANGE_ERROR = "Deployment container identity changed concurrently"
+MISSING_DEPLOYMENT_SNAPSHOT_ERROR = (
+    "Deployment action is missing its container snapshot; retry the action"
+)
 
 
 def resolve_host_model_mount(
@@ -1286,22 +1289,14 @@ class DeploymentService:
             raise ValueError("Unsupported deployment action")
         has_expected_id = "expected_container_id" in payload
         has_expected_name = "expected_container_name" in payload
-        if has_expected_id != has_expected_name:
-            raise ValueError("Deployment action container snapshot is incomplete")
+        if not has_expected_id or not has_expected_name:
+            raise ValueError(MISSING_DEPLOYMENT_SNAPSHOT_ERROR)
         with self.session_factory() as db:
             deployment = db.get(Deployment, deployment_id)
             if not deployment:
                 raise ValueError("Deployment was not found")
-            expected_container_id = (
-                payload["expected_container_id"]
-                if has_expected_id
-                else deployment.container_id
-            )
-            expected_container_name = (
-                payload["expected_container_name"]
-                if has_expected_name
-                else deployment.container_name
-            )
+            expected_container_id = payload["expected_container_id"]
+            expected_container_name = payload["expected_container_name"]
             if (
                 deployment.container_id != expected_container_id
                 or deployment.container_name != expected_container_name
