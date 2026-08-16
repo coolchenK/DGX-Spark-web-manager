@@ -78,7 +78,10 @@ FENCE_PATTERN = re.compile(
     r"(?P<body>.*?)^[ \t]*```[ \t]*$",
     re.MULTILINE | re.DOTALL,
 )
-QUANTIZATION_VALUE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+QUANTIZATION_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+REPOSITORY_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
 
 
 def _reject_json_constant(_value: str) -> None:
@@ -230,6 +233,8 @@ def _extract_generation_values(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_deployment_value(key: str, value: str) -> int | float | str | None:
+    if value.startswith("-"):
+        return None
     if key in {"context_length", "max_concurrency", "max_batched_tokens"}:
         return _normalize_int(value)
     if key == "memory_fraction":
@@ -255,7 +260,7 @@ def _extract_shell_values(body: str) -> dict[str, int | float | bool | str]:
             continue
         if separator:
             raw_value = inline_value
-        elif index + 1 < len(tokens):
+        elif index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
             index += 1
             raw_value = tokens[index]
         else:
@@ -317,10 +322,13 @@ def _target_model_ids(card_data: dict[str, Any]) -> list[str]:
         value = card_data.get(key)
         candidates = value if isinstance(value, list) else [value]
         for candidate in candidates:
-            if not isinstance(candidate, str) or not candidate or len(candidate) > 256:
+            if not isinstance(candidate, str):
                 continue
-            if candidate not in targets:
-                targets.append(candidate)
+            normalized = candidate.strip()
+            if not REPOSITORY_ID.fullmatch(normalized):
+                continue
+            if normalized not in targets:
+                targets.append(normalized)
     return targets
 
 

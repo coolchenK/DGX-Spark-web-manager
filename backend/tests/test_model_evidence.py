@@ -55,6 +55,41 @@ def test_model_card_commands_never_return_unknown_flags_or_values(tmp_path):
     assert "rm-all" not in dumped
 
 
+def test_missing_shell_value_does_not_consume_following_option_or_leak_it(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "README.md").write_text(
+        "```bash\nvllm serve x --quantization --evil-command "
+        "--max-model-len --max-num-seqs 4\n```",
+        encoding="utf-8",
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+    dumped = json.dumps(evidence.model_dump())
+
+    assert evidence.card_deployment_values == {"max_concurrency": 4}
+    assert "evil" not in dumped
+
+
+def test_inline_quantization_is_accepted_but_option_like_values_are_rejected(tmp_path):
+    valid = tmp_path / "valid"
+    invalid = tmp_path / "invalid"
+    valid.mkdir()
+    invalid.mkdir()
+    (valid / "README.md").write_text(
+        "```sh\nvllm serve x --quantization=awq\n```", encoding="utf-8"
+    )
+    (invalid / "README.md").write_text(
+        "```sh\nvllm serve x --quantization=-awq\n```", encoding="utf-8"
+    )
+
+    valid_evidence = ModelEvidenceLoader(card_max_chars=100_000).load(valid)
+    invalid_evidence = ModelEvidenceLoader(card_max_chars=100_000).load(invalid)
+
+    assert valid_evidence.card_deployment_values == {"quantization": "awq"}
+    assert invalid_evidence.card_deployment_values == {}
+
+
 def test_tokenizer_fingerprint_changes_when_special_tokens_change(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -156,6 +191,31 @@ def test_front_matter_uses_model_card_metadata_allowlist(tmp_path):
     assert evidence.speculative_method == "eagle3"
     assert evidence.card_data["base_model"] == ["org/Target-8B"]
     assert "unknown_nested" not in evidence.card_data
+
+
+def test_target_model_ids_are_trimmed_deduplicated_and_strictly_validated(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "README.md").write_text(
+        "---\n"
+        "base_model:\n"
+        "  - org/model\n"
+        '  - " org/model "\n'
+        "  - ../etc\n"
+        "  - /absolute\n"
+        "  - 'org\\model'\n"
+        "  - https://host/org/model\n"
+        "  - org/model/extra\n"
+        "  - org/..\n"
+        '  - "org/mo del"\n'
+        "target_model: second/valid-model\n"
+        "---\n# Draft\n",
+        encoding="utf-8",
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+    assert evidence.target_model_ids == ["org/model", "second/valid-model"]
 
 
 def test_malformed_model_card_metadata_is_a_bounded_warning(tmp_path):
