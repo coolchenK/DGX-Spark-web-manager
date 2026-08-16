@@ -1,5 +1,6 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from threading import Lock
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -43,15 +44,43 @@ from app.tasks.huggingface import HuggingFaceService
 
 
 class _LazyDockerClient:
-    def __init__(self) -> None:
+    def __init__(self, factory: Callable[[], Any] | None = None) -> None:
         self._client: Any | None = None
+        self._factory = factory or self._default_factory
+        self._lock = Lock()
+        self._closed = False
+
+    @staticmethod
+    def _default_factory() -> Any:
+        import docker
+
+        return docker.from_env()
+
+    def _get_client(self) -> Any:
+        client = self._client
+        if client is None:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("Docker client is closed")
+                if self._client is None:
+                    self._client = self._factory()
+                client = self._client
+        return client
 
     def __getattr__(self, name: str) -> Any:
-        if self._client is None:
-            import docker
+        return getattr(self._get_client(), name)
 
-            self._client = docker.from_env()
-        return getattr(self._client, name)
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            client = self._client
+            self._client = None
+        if client is not None:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -80,6 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         startup_timeout_seconds=app_settings.deployment_startup_timeout_seconds,
     )
     provider_service = ProviderService(SecretBox(app_settings.secret_key))
+    lazy_docker_client = _LazyDockerClient()
     evidence_loader = ModelEvidenceLoader(card_max_chars=app_settings.recommendation_card_max_chars)
     resource_estimator = ResourceEstimator(
         reserve_fraction=app_settings.memory_reserve_fraction,
@@ -88,7 +118,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     deployment_recommendation_service = DeploymentRecommendationService(
         evidence_loader=evidence_loader,
         runtime_capability_service=RuntimeCapabilityService(
-            settings=app_settings, docker_client=_LazyDockerClient()
+            settings=app_settings, docker_client=lazy_docker_client
         ),
         resource_estimator=resource_estimator,
         draft_service=DraftCompatibilityService(
@@ -126,21 +156,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        database.create_schema()
-        app.state.settings = app_settings
-        app.state.database = database
-        with database.session_factory() as db:
-            stored_token = db.get(SecretSetting, "huggingface_token")
-            if stored_token:
-                huggingface_service.set_token(
-                    app.state.secret_box.decrypt(stored_token.encrypted_value)
-                )
-            if app_settings.auto_discovery:
-                app.state.discovery_service.scan_all(db)
-        task_engine.start()
-        yield
-        task_engine.stop()
-        database.dispose()
+        task_engine_started = False
+        try:
+            database.create_schema()
+            app.state.settings = app_settings
+            app.state.database = database
+            with database.session_factory() as db:
+                stored_token = db.get(SecretSetting, "huggingface_token")
+                if stored_token:
+                    huggingface_service.set_token(
+                        app.state.secret_box.decrypt(stored_token.encrypted_value)
+                    )
+                if app_settings.auto_discovery:
+                    app.state.discovery_service.scan_all(db)
+            task_engine.start()
+            task_engine_started = True
+            yield
+        finally:
+            try:
+                if task_engine_started:
+                    task_engine.stop()
+            finally:
+                try:
+                    lazy_docker_client.close()
+                finally:
+                    database.dispose()
 
     app = FastAPI(title="DGX Spark Web Manager", version="0.1.0", lifespan=lifespan)
     app.state.settings = app_settings

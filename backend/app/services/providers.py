@@ -4,6 +4,7 @@ import ipaddress
 import re
 import socket
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -24,6 +25,13 @@ FORBIDDEN_CUSTOM_HEADERS = {
     "proxy-authorization",
     "transfer-encoding",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedProviderEndpoint:
+    url: str
+    host_header: str
+    sni_hostname: str | None
 
 
 def _is_forbidden_ip(value: str) -> bool:
@@ -62,6 +70,56 @@ def validate_provider_url(value: str, resolver: Resolver = socket.getaddrinfo) -
         if _is_forbidden_ip(str(literal)):
             raise ValueError("Provider URL targets a restricted network")
     return value
+
+
+def resolve_provider_endpoint(
+    value: str, resolver: Resolver = socket.getaddrinfo
+) -> PinnedProviderEndpoint:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Provider URL must use HTTP or HTTPS")
+    if parsed.username or parsed.password:
+        raise ValueError("Provider URL cannot include credentials")
+    hostname = parsed.hostname.lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise ValueError("Provider URL targets a restricted network")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    literal: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            records = resolver(hostname, port, 0, socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError("Provider hostname could not be resolved") from exc
+        addresses = {str(record[4][0]) for record in records if len(record) > 4 and record[4]}
+        if not addresses:
+            raise ValueError("Provider hostname could not be resolved") from None
+        parsed_addresses = [ipaddress.ip_address(address) for address in addresses]
+    else:
+        parsed_addresses = [literal]
+
+    if any(_is_forbidden_ip(str(address)) or not address.is_global for address in parsed_addresses):
+        raise ValueError("Provider hostname resolves to a restricted network")
+    selected = sorted(parsed_addresses, key=lambda address: (address.version, int(address)))[0]
+    pinned_host = f"[{selected}]" if selected.version == 6 else str(selected)
+    pinned_netloc = f"{pinned_host}:{parsed.port}" if parsed.port is not None else pinned_host
+    original_host = f"[{hostname}]" if literal is not None and literal.version == 6 else hostname
+    host_header = f"{original_host}:{parsed.port}" if parsed.port is not None else original_host
+    return PinnedProviderEndpoint(
+        url=urlunparse(
+            (
+                parsed.scheme,
+                pinned_netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                "",
+            )
+        ),
+        host_header=host_header,
+        sni_hostname=hostname if parsed.scheme == "https" else None,
+    )
 
 
 def normalize_openai_base_url(value: str) -> str:

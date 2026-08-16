@@ -22,8 +22,29 @@ def recommend_deployment(
     refresh_ai: bool = Query(default=False),
 ) -> dict[str, Any]:
     provider = db.get(Provider, payload.provider_id) if payload.provider_id else None
-    if provider is not None and (not provider.enabled or provider.last_test_status == "failed"):
-        provider = None
+    provider_error: tuple[int, str, str] | None = None
+    if payload.provider_id and provider is None:
+        provider_error = (404, "AI provider was not found", "provider_not_found")
+    elif provider is not None and (not provider.enabled or provider.last_test_status == "failed"):
+        provider_error = (409, "AI provider is unavailable", "provider_unavailable")
+    if provider_error is not None:
+        status_code, detail, audit_status = provider_error
+        record_audit(
+            db,
+            actor=str(admin["username"]),
+            action="deployment.recommendation.generate",
+            resource_type="model",
+            resource_id=payload.model_id,
+            outcome="failed",
+            details={
+                "runtime": payload.runtime,
+                "status": audit_status,
+                "provider_used": False,
+                "refresh": refresh_ai,
+            },
+        )
+        db.commit()
+        raise HTTPException(status_code=status_code, detail=detail)
     result = request.app.state.deployment_recommendation_service.recommend(
         db=db,
         model_id=payload.model_id,

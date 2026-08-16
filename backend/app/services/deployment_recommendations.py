@@ -26,6 +26,7 @@ from app.models import Deployment, ModelAsset, Provider
 from app.runtime.base import GenerationDefaults, RecommendationSource
 from app.services.draft_models import DraftCandidate
 from app.services.model_evidence import ModelEvidence, ModelEvidenceLoader
+from app.services.providers import PinnedProviderEndpoint, resolve_provider_endpoint
 from app.services.resource_estimator import (
     MAX_CONTEXT_LENGTH,
     ContextClampResult,
@@ -41,6 +42,9 @@ BoundedText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
 MAX_WARNINGS = 32
 MAX_AI_RESPONSE_BYTES = 256 * 1024
 MAX_AI_CONTENT_CHARS = 64 * 1024
+MAX_AI_REQUEST_BYTES = 256 * 1024
+MAX_STRUCTURED_STRING_CHARS = 4096
+MAX_STRUCTURED_TOTAL_CHARS = 96 * 1024
 RECOMMENDATION_SCHEMA_VERSION = "1"
 
 AI_DEPLOYMENT_FIELDS = frozenset(
@@ -130,8 +134,9 @@ SENSITIVE_CARD_PATTERNS = (
     (re.compile(r"(?i)\bhf_[A-Za-z0-9]{10,}"), "[REDACTED_HF_TOKEN]"),
     (
         re.compile(
-            r"(?im)\b([A-Za-z_][A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD)"
-            r"[A-Za-z0-9_]*)\s*=\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+            r"(?im)\b((?:[A-Za-z_][A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD)"
+            r"[A-Za-z0-9_]*)|SECRET|TOKEN|PASSWORD)\s*=\s*"
+            r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
         ),
         r"\1=[REDACTED]",
     ),
@@ -243,6 +248,8 @@ class _ProviderService(Protocol):
 
 RemoteEvidenceLoader = Callable[[Path | str, str], ModelEvidence]
 SystemSnapshot = Callable[[], Mapping[str, Any] | BaseModel]
+EndpointResolver = Callable[[str], PinnedProviderEndpoint]
+HttpClientFactory = Callable[..., Any]
 
 
 def _warning(value: str) -> str:
@@ -536,25 +543,45 @@ def _host_memory(snapshot: Mapping[str, Any]) -> dict[str, int]:
     return {"total_bytes": total, "available_bytes": min(available, total)}
 
 
-def _safe_json_value(value: Any, *, depth: int = 0) -> Any:
-    if depth > 4:
+def _safe_json_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> Any:
+    remaining = budget if budget is not None else [MAX_STRUCTURED_TOTAL_CHARS]
+    if depth > 4 or remaining[0] <= 0:
         return None
-    if value is None or isinstance(value, str | bool | int):
+    if value is None or isinstance(value, bool | int):
         return value
+    if isinstance(value, str):
+        sanitized = _sanitize_untrusted_string(value, MAX_STRUCTURED_STRING_CHARS)
+        sanitized = sanitized[: remaining[0]]
+        remaining[0] -= len(sanitized)
+        return sanitized
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, list | tuple):
-        return [_safe_json_value(item, depth=depth + 1) for item in value[:64]]
+        result: list[Any] = []
+        for item in value[:64]:
+            if remaining[0] <= 0:
+                break
+            result.append(_safe_json_value(item, depth=depth + 1, budget=remaining))
+        return result
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for raw_key, item in list(value.items())[:64]:
-            key = str(raw_key)[:100]
-            result[key] = _safe_json_value(item, depth=depth + 1)
+            if remaining[0] <= 0:
+                break
+            key = _sanitize_untrusted_string(str(raw_key), 100)
+            remaining[0] -= len(key)
+            if key:
+                result[key] = _safe_json_value(item, depth=depth + 1, budget=remaining)
         return result
     return None
 
 
-def _clean_card_text(value: str, max_chars: int) -> str:
+def _sanitize_untrusted_string(value: str, max_chars: int) -> str:
     bounded = value[:max_chars]
     cleaned = "".join(
         character for character in bounded if character in "\n\r\t" or ord(character) >= 32
@@ -563,17 +590,21 @@ def _clean_card_text(value: str, max_chars: int) -> str:
         cleaned = pattern.sub(replacement, cleaned)
     cleaned = re.sub(r"(?i)\b[A-Z]:[\\/][^\s\"'`]+", "[LOCAL_PATH]", cleaned)
     cleaned = re.sub(
-        r"(?<![:A-Za-z0-9])/(?:[^/\s]+/)*[^\s\"'`]*",
-        "[LOCAL_PATH]",
+        r"(?m)(^|[\s(\"'=])/(?!/)(?:[^/\s]+/)*[^\s\"'`]*",
+        lambda match: f"{match.group(1)}[LOCAL_PATH]",
         cleaned,
     )
     return cleaned[:max_chars]
 
 
+def _clean_card_text(value: str, max_chars: int) -> str:
+    return _sanitize_untrusted_string(value, max_chars)
+
+
 def _bounded_context_string(value: Any, max_chars: int) -> str | None:
     if not isinstance(value, str):
         return None
-    cleaned = "".join(character for character in value if ord(character) >= 32)
+    cleaned = _sanitize_untrusted_string(value, max_chars)
     return cleaned[:max_chars] or None
 
 
@@ -681,14 +712,15 @@ def build_ai_recommendation_request(
         for field in unresolved_fields
         if field in AI_DEPLOYMENT_FIELDS or field in AI_GENERATION_FIELDS
     ][:32]
+    structured_budget = [MAX_STRUCTURED_TOTAL_CHARS]
     user_data = {
         "model_card_data": _clean_card_text(card_text, card_max_chars),
-        "structured_evidence": _safe_json_value(safe_structured_evidence),
-        "device_context": _safe_json_value(safe_device_context),
-        "runtime_capabilities": _safe_json_value(safe_capabilities),
+        "structured_evidence": _safe_json_value(safe_structured_evidence, budget=structured_budget),
+        "device_context": _safe_json_value(safe_device_context, budget=structured_budget),
+        "runtime_capabilities": _safe_json_value(safe_capabilities, budget=structured_budget),
         "unresolved_fields": safe_unresolved,
     }
-    return {
+    payload = {
         "model": model,
         "temperature": 0.1,
         "max_tokens": 800,
@@ -710,6 +742,10 @@ def build_ai_recommendation_request(
             },
         ],
     }
+    serialized = json.dumps(payload, ensure_ascii=True, allow_nan=False).encode("utf-8")
+    if len(serialized) > MAX_AI_REQUEST_BYTES:
+        raise ValueError("AI recommendation request is too large")
+    return payload
 
 
 def _parse_ai_content(content: str) -> dict[str, Any]:
@@ -823,6 +859,8 @@ class DeploymentRecommendationService:
         cache_ttl_seconds: int = 900,
         card_max_chars: int = 100_000,
         clock: Callable[[], float] = time.monotonic,
+        endpoint_resolver: EndpointResolver = resolve_provider_endpoint,
+        http_client_factory: HttpClientFactory | None = None,
     ) -> None:
         self.evidence_loader = evidence_loader
         self.runtime_capability_service = runtime_capability_service
@@ -835,6 +873,8 @@ class DeploymentRecommendationService:
         self.cache_ttl_seconds = cache_ttl_seconds
         self.card_max_chars = card_max_chars
         self.clock = clock
+        self.endpoint_resolver = endpoint_resolver
+        self.http_client_factory = http_client_factory or httpx.Client
         self._ai_cache: dict[
             tuple[str, str, RuntimeName, str, str, str],
             tuple[float, dict[str, dict[str, Any]]],
@@ -1057,21 +1097,51 @@ class DeploymentRecommendationService:
             runtime_capabilities=capabilities.model_dump(mode="json"),
             card_max_chars=self.card_max_chars,
         )
+        endpoint = self.endpoint_resolver(f"{provider.base_url}/chat/completions")
+        provider_headers = self.provider_service.authorization_headers(provider)
+        headers = {
+            name: value
+            for name, value in provider_headers.items()
+            if name.casefold() not in {"accept-encoding", "host"}
+        }
+        headers.update(
+            {
+                "Accept-Encoding": "identity",
+                "Host": endpoint.host_header,
+            }
+        )
         body = bytearray()
-        with httpx.stream(
-            "POST",
-            f"{provider.base_url}/chat/completions",
-            headers=self.provider_service.authorization_headers(provider),
-            json=payload,
+        with self.http_client_factory(
             timeout=provider.timeout_seconds,
             follow_redirects=False,
             trust_env=False,
-        ) as response:
-            response.raise_for_status()
-            for chunk in response.iter_bytes():
-                if len(body) + len(chunk) > MAX_AI_RESPONSE_BYTES:
-                    raise ValueError("AI response is too large")
-                body.extend(chunk)
+        ) as client:
+            extensions = (
+                {"sni_hostname": endpoint.sni_hostname} if endpoint.sni_hostname is not None else {}
+            )
+            with client.stream(
+                "POST",
+                endpoint.url,
+                headers=headers,
+                json=payload,
+                extensions=extensions,
+            ) as response:
+                response.raise_for_status()
+                content_encoding = (
+                    (
+                        response.headers.get("Content-Encoding")
+                        or response.headers.get("content-encoding")
+                        or ""
+                    )
+                    .strip()
+                    .casefold()
+                )
+                if content_encoding not in {"", "identity"}:
+                    raise ValueError("Compressed AI responses are not accepted")
+                for chunk in response.iter_bytes():
+                    if len(body) + len(chunk) > MAX_AI_RESPONSE_BYTES:
+                        raise ValueError("AI response is too large")
+                    body.extend(chunk)
         envelope = json.loads(bytes(body))
         if not isinstance(envelope, dict):
             raise ValueError("AI response shape is invalid")
