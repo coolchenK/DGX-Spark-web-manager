@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 from app.db import Database
 from app.models import Deployment, ModelAsset
-from app.services.model_lifecycle import ModelLifecycleService, ModelReference
+from app.services.model_lifecycle import ModelLifecycleService, ModelReference, _resolved
 
 
 @pytest.fixture
@@ -217,6 +217,101 @@ def test_references_do_not_treat_path_prefix_as_a_match(database, service, tmp_p
                 deployment_id="prefix",
                 name="prefix",
                 config={"model_path": f"{target_path}-copy"},
+            )
+        )
+        db.commit()
+
+        assert service.references(db, "target") == []
+
+
+def test_references_match_persisted_draft_mount_when_draft_id_is_stale(
+    database, service, tmp_path
+):
+    target_path = tmp_path / "models" / "draft"
+    with database.session_factory() as db:
+        db.add(_asset(local_path=str(target_path)))
+        db.add(
+            _deployment(
+                deployment_id="persisted-draft",
+                name="persisted-draft",
+                config={
+                    "speculative": {"draft_model_id": "stale-id"},
+                    "mounts": {"draft": {"model_path": str(target_path)}},
+                },
+            )
+        )
+        db.commit()
+
+        references = service.references(db, "target")
+
+    assert references == [
+        ModelReference("persisted-draft", "persisted-draft", "legacy_path")
+    ]
+
+
+@pytest.mark.parametrize("path_location", ["spec", "base_mount"])
+def test_references_match_persisted_base_paths(
+    database, service, tmp_path, path_location
+):
+    target_path = tmp_path / "models" / "base"
+    config = (
+        {"spec": {"model_path": str(target_path)}}
+        if path_location == "spec"
+        else {"mounts": {"base": {"model_path": str(target_path)}}}
+    )
+
+    with database.session_factory() as db:
+        db.add(_asset(local_path=str(target_path)))
+        db.add(
+            _deployment(
+                deployment_id=f"persisted-{path_location}",
+                name=f"persisted-{path_location}",
+                config=config,
+            )
+        )
+        db.commit()
+
+        references = service.references(db, "target")
+
+    assert references == [
+        ModelReference(
+            f"persisted-{path_location}",
+            f"persisted-{path_location}",
+            "legacy_path",
+        )
+    ]
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t", None, 42])
+def test_resolved_rejects_empty_blank_and_non_string_values(value):
+    assert _resolved(value) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"spec": []},
+        {"mounts": "not-a-dict"},
+        {"mounts": {"base": [], "draft": "not-a-dict"}},
+        {
+            "spec": {"model_path": []},
+            "mounts": {
+                "base": {"model_path": 42},
+                "draft": {"model_path": {}},
+            },
+        },
+    ],
+)
+def test_references_ignore_malformed_persisted_path_structures(
+    database, service, tmp_path, config
+):
+    with database.session_factory() as db:
+        db.add(_asset(local_path=str(tmp_path / "target")))
+        db.add(
+            _deployment(
+                deployment_id="malformed",
+                name="malformed",
+                config=config,
             )
         )
         db.commit()

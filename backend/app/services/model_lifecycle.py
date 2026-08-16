@@ -18,7 +18,7 @@ class ModelReference:
 
 
 def _resolved(value: str | None) -> Path | None:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not value.strip():
         return None
     try:
         return Path(value).resolve(strict=False)
@@ -42,6 +42,14 @@ class ModelLifecycleService:
 
         for deployment in deployments:
             config = deployment.config if isinstance(deployment.config, dict) else {}
+            spec = config.get("spec")
+            spec = spec if isinstance(spec, dict) else {}
+            mounts = config.get("mounts")
+            mounts = mounts if isinstance(mounts, dict) else {}
+            base_mount = mounts.get("base")
+            base_mount = base_mount if isinstance(base_mount, dict) else {}
+            draft_mount = mounts.get("draft")
+            draft_mount = draft_mount if isinstance(draft_mount, dict) else {}
             speculative = config.get("speculative")
             speculative = speculative if isinstance(speculative, dict) else {}
 
@@ -50,9 +58,15 @@ class ModelLifecycleService:
                 usage = "base"
             elif speculative.get("draft_model_id") == model_id:
                 usage = "draft"
-            elif target_path is not None and (
-                _resolved(config.get("model_path")) == target_path
-                or _resolved(speculative.get("draft_model_path")) == target_path
+            elif target_path is not None and any(
+                _resolved(path) == target_path
+                for path in (
+                    config.get("model_path"),
+                    spec.get("model_path"),
+                    base_mount.get("model_path"),
+                    draft_mount.get("model_path"),
+                    speculative.get("draft_model_path"),
+                )
             ):
                 usage = "legacy_path"
 
