@@ -85,7 +85,7 @@ _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])(?P<quote>[\"']?)"
     r"(?P<label>[A-Za-z0-9][A-Za-z0-9_-]{0,127})(?P=quote)\s*[:=]\s*"
     r"(?:(?:bearer|basic)\s+)?"
-    r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)''',
+    r'''(?:\[REDACTED\]|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)''',
     re.IGNORECASE,
 )
 
@@ -392,11 +392,12 @@ def _redact_credential_assignment(match: re.Match[str]) -> str:
 
 
 def _sanitize_string(value: str, secrets: tuple[str, ...], limit: int) -> str:
-    sanitized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
-        _redact_credential_assignment, value
-    )
-    for secret in secrets:
+    sanitized = value
+    for secret in sorted(set(secrets), key=len, reverse=True):
         sanitized = sanitized.replace(secret, _REDACTED)
+    sanitized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
+        _redact_credential_assignment, sanitized
+    )
     if len(sanitized) <= limit:
         return sanitized
     marker = f"\n{_TRUNCATED}\n"

@@ -358,6 +358,60 @@ def test_bounded_credential_label_and_url_redaction_preserve_non_secret_text(
     assert "password rotation pending" in sanitized
 
 
+@pytest.mark.parametrize(
+    ("assignment", "secret", "sensitive_tail"),
+    [
+        ("api_key=abc;def", "abc;def", "def"),
+        ("Authorization: Bearer abc def", "abc def", "def"),
+        ("token=abc&def", "abc&def", "def"),
+    ],
+)
+def test_known_secrets_are_removed_before_assignment_parsing(
+    database: Database,
+    secret_box: SecretBox,
+    assignment: str,
+    secret: str,
+    sensitive_tail: str,
+) -> None:
+    with database.session_factory() as db:
+        db.add_all(
+            [
+                Provider(
+                    name="contained-secret",
+                    base_url="https://contained.example/v1",
+                    default_model="model",
+                    encrypted_api_key=secret_box.encrypt("abc"),
+                ),
+                Provider(
+                    name="full-secret",
+                    base_url="https://full.example/v1",
+                    default_model="model",
+                    encrypted_api_key=secret_box.encrypt(secret),
+                ),
+            ]
+        )
+        db.commit()
+    agent = FakeAgent(
+        {
+            "status": "failed",
+            "output": assignment,
+            "nested": {"again": assignment},
+            "large": ("x" * 50_000) + assignment,
+            "error": assignment,
+        }
+    )
+    registry = OpsToolRegistry(agent, database.session_factory, secret_box)
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = result.model_dump_json()
+
+    assert secret not in dumped
+    assert sensitive_tail not in dumped
+    assert "[REDACTED]" in dumped
+    assert "[REDACTED]]" not in dumped
+    assert result.error == "[REDACTED]"
+
+
 def test_sensitive_key_matching_preserves_public_token_metrics(
     database: Database, secret_box: SecretBox
 ) -> None:
