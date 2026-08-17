@@ -31,8 +31,9 @@ The manager receives the Agent key through the read-only
 `/run/secrets/ops-agent.key` mount and connects to
 `/run/dgx-spark-manager/ops-agent.sock`. The socket is local to the host and is never exposed as a
 TCP listener. The container runs with its normal non-root UID plus the numeric `OPS_AGENT_GID`,
-which must match the host `dgx-spark-ops` group. The root Agent alone owns process creation and host
-state changes.
+which must match the host `dgx-spark-ops` group. The root Agent is the sole executor for the Host
+shell and privileged diagnostic or repair command path. The manager still uses its existing Docker
+socket mount directly for validated inference-container discovery and lifecycle actions.
 
 Protocol version 1 uses bounded length-prefixed JSON and HMAC-SHA256 authentication. Every request
 has a UUID `request_id`, timestamp, and random nonce. The Agent verifies the signature and timestamp
@@ -189,9 +190,10 @@ Diagnostic AI providers receive a bounded snapshot of real system values and tai
 redaction. Returned JSON is reduced to known fields. Unknown operations remain visible with
 `executable=false`; the executor never evaluates text or invokes a shell.
 
-The administrator-only `GET /api/ops-agent/health` endpoint reports only `ok`, `unavailable`, or
-`error`, plus protocol version when healthy. It does not return socket paths, key material, remote
-error details, commands, or job output.
+The administrator-only `GET /api/ops-agent/health` endpoint reports `ok`, `unavailable`, or `error`.
+A healthy response includes the protocol version; unavailable and error responses include only a
+fixed redacted `detail`. It does not return socket paths, key material, raw remote errors, commands,
+or job output.
 
 ## DGX Spark Acceptance
 

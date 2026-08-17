@@ -63,18 +63,19 @@ running container:
 
 ```bash
 getent group dgx-spark-ops
+stat -c '%g %a %n' /run/dgx-spark-manager/ops-agent.sock
 grep '^OPS_AGENT_GID=' .env
 docker compose exec manager id
-docker compose exec manager stat -c '%G %a %n' /run/dgx-spark-manager/ops-agent.sock
+docker compose exec manager stat -c '%g %a %n' /run/dgx-spark-manager/ops-agent.sock
 ```
 
-If the values differ, update only `OPS_AGENT_GID` to the numeric GID from `getent`, then recreate the
-manager so supplementary groups are recalculated:
+If the values differ, use the main installer. Its preview is read-only; apply resolves the numeric
+host GID and atomically upserts `OPS_AGENT_GID` without printing or replacing existing secret
+values, then recreates the manager with the correct supplementary group:
 
 ```bash
-ops_gid="$(getent group dgx-spark-ops | cut -d: -f3)"
-sed -i "s/^OPS_AGENT_GID=.*/OPS_AGENT_GID=$ops_gid/" .env
-docker compose up -d --force-recreate manager
+./scripts/install.sh
+./scripts/install.sh --apply
 ```
 
 If the group and GID match but the socket mode or owner does not, do not loosen its permissions.
@@ -96,8 +97,18 @@ docker compose exec manager stat -c '%G %a %s %n' /run/secrets/ops-agent.key
 ```
 
 The host key must be a regular, non-symlink file owned by `root:dgx-spark-ops` with mode `0640`.
-Reapplying the installer is idempotent and preserves a valid key and existing jobs. Recreate the
-manager afterward so a file bind mount and the client's cached key both use the current inode:
+
+If only its owner or mode is wrong, repair that metadata exactly before reapplying the installer:
+
+```bash
+sudo chown root:dgx-spark-ops /etc/dgx-spark-manager/ops-agent.key
+sudo chmod 0640 /etc/dgx-spark-manager/ops-agent.key
+sudo ./scripts/install-ops-agent.sh --apply
+```
+
+If the host key is valid but the container has a stale file mount or the manager cached an earlier
+key, reapplying the installer is idempotent and preserves the key and existing jobs. Recreate the
+manager so its bind mount and client both read the current key inode:
 
 ```bash
 sudo ./scripts/install-ops-agent.sh --apply
@@ -107,6 +118,23 @@ curl -fsS -b ./admin.cookies http://127.0.0.1:3000/api/ops-agent/health
 
 The installer performs its own signed `agent.health` probe before it succeeds, independently of the
 manager container.
+
+If the installer reports invalid key content, it fails closed and does not overwrite that file.
+Before rotating it, confirm there are no active Agent jobs, accept a brief Agent outage, and create a
+current manager database and `.env` backup:
+
+```bash
+./scripts/backup.sh
+# Type PURGE OPS AGENT KEY when prompted.
+sudo ./scripts/uninstall-ops-agent.sh --apply --purge-key
+sudo ./scripts/install-ops-agent.sh --apply
+docker compose up -d --force-recreate manager
+curl -fsS -b ./admin.cookies http://127.0.0.1:3000/api/ops-agent/health
+```
+
+This uninstaller contract removes the Agent package and units as well as the invalid key, but
+preserves the job directory because `--purge-jobs` was not supplied. Reinstallation generates a new
+key, and manager recreation is required before authenticated Agent requests can resume.
 
 ### Agent jobs, timeouts, and restart recovery
 
