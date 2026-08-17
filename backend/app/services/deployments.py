@@ -87,7 +87,7 @@ class DeploymentService:
         session_factory: sessionmaker[Session],
         model_roots: tuple[Path, ...],
         host_model_roots: tuple[Path, ...] | None = None,
-        startup_timeout_seconds: int = 300,
+        startup_timeout_seconds: int = 1200,
         runtime_capability_service: RuntimeCapabilityService | None = None,
         evidence_loader: ModelEvidenceLoader | None = None,
         draft_service: DraftCompatibilityService | None = None,

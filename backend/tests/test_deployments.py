@@ -2829,7 +2829,7 @@ def test_settings_preserve_container_to_host_model_root_order(tmp_path):
     )
 
     assert getattr(settings, "host_model_root_paths", ()) == (host_models, host_hf)
-    assert getattr(settings, "deployment_startup_timeout_seconds", None) == 300
+    assert getattr(settings, "deployment_startup_timeout_seconds", None) == 1200
 
 
 def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):

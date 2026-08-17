@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     session_ttl_seconds: int = 43_200
     cookie_secure: bool = False
-    deployment_startup_timeout_seconds: int = Field(default=300, ge=30, le=1800)
+    deployment_startup_timeout_seconds: int = Field(default=1200, ge=30, le=1800)
     runtime_probe_timeout_seconds: int = Field(default=45, ge=5, le=180)
     ops_agent_socket: Path = Path("/run/dgx-spark-manager/ops-agent.sock")
     ops_agent_key_file: Path = Path("/run/secrets/ops-agent.key")
