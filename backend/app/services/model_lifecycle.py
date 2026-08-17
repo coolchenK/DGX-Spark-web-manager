@@ -402,6 +402,31 @@ class ModelLifecycleService:
         except (OSError, RuntimeError):
             return False
 
+    @classmethod
+    def _is_negative_only_hf_cache(cls, target: Path) -> bool:
+        """Return true only for an empty repo or zero-byte `.no_exist` markers."""
+        try:
+            if cls._is_link_or_reparse(target) or not target.is_dir():
+                return False
+            entries = list(target.iterdir())
+            if not entries:
+                return True
+            if len(entries) != 1 or entries[0].name != ".no_exist":
+                return False
+            marker_root = entries[0]
+            if cls._is_link_or_reparse(marker_root) or not marker_root.is_dir():
+                return False
+            for path in marker_root.rglob("*"):
+                if cls._is_link_or_reparse(path):
+                    return False
+                if path.is_dir():
+                    continue
+                if not path.is_file() or path.stat().st_size != 0:
+                    return False
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+
     def _mark_delete_failed(self, model_id: str) -> None:
         if self.session_factory is None:
             return
@@ -570,6 +595,23 @@ class ModelLifecycleService:
                 if missing_can_reconcile and self._path_is_absent(target):
                     if not reentry:
                         context.check_control()
+                    return complete_deletion()
+                elif missing_can_reconcile and self._is_negative_only_hf_cache(target):
+                    estimated_bytes = directory_size(target)
+                    usage_path = self.hf_cache_dir
+                    usage_path.mkdir(parents=True, exist_ok=True)
+                    free_before = self._disk_free(usage_path)
+                    context.check_control()
+                    if not self._is_negative_only_hf_cache(target):
+                        raise RuntimeError(
+                            "Hugging Face negative cache changed before deletion"
+                        )
+                    destructive_started = True
+                    self.local_remover(self.hf_cache_dir, target)
+                    if not self._path_is_absent(target):
+                        raise RuntimeError(
+                            "Hugging Face negative cache deletion did not remove the target"
+                        )
                     return complete_deletion()
                 else:
                     estimated_bytes = directory_size(target)
