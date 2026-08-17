@@ -1,4 +1,6 @@
+import json
 import socket
+from datetime import UTC, datetime
 
 import pytest
 from app.models import Provider
@@ -229,3 +231,98 @@ def test_provider_test_api_reports_chat_failure_without_losing_connection_status
         "model": "missing-model",
         "error": "configured model was rejected",
     }
+
+
+def test_provider_serialization_redacts_bounded_historical_result_without_mutating_database(
+    authenticated_client, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    opaque_key = "credential.with.opaque.history.123456789"
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": "Historical provider",
+            "base_url": "https://api.example.com/v1",
+            "api_key": opaque_key,
+            "default_model": "ops-model",
+        },
+    )
+    provider_id = created.json()["id"]
+    historical_result = {
+        f"secret-key-{opaque_key}": {
+            "error": f"upstream returned {opaque_key}\x00" + "x" * 2_000,
+            "nested": [{"message": f"still {opaque_key}"}],
+        },
+        "items": [f"item-{index}-{opaque_key}" for index in range(80)],
+    }
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        provider.last_test_result = historical_result
+        provider.last_test_status = "failed"
+        provider.last_tested_at = datetime.now(UTC)
+        db.commit()
+
+    listed = authenticated_client.get("/api/providers").json()[0]
+    serialized_result = listed["last_test_result"]
+    serialized_dump = json.dumps(serialized_result)
+
+    assert opaque_key not in serialized_dump
+    assert len(serialized_result["items"]) <= 50
+    assert all(len(value) <= 500 for value in serialized_result["items"])
+    assert all(len(key) <= 500 for key in serialized_result)
+    with authenticated_client.app.state.database.session_factory() as db:
+        persisted = db.get(Provider, provider_id)
+        assert persisted.last_test_result == historical_result
+        assert opaque_key in json.dumps(persisted.last_test_result)
+
+
+def test_rotating_provider_key_clears_probe_state_and_never_echoes_secrets(
+    authenticated_client, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    old_key = "old.opaque.provider.credential.123456"
+    new_key = "new.opaque.provider.credential.987654"
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": "Rotating provider",
+            "base_url": "https://api.example.com/v1",
+            "api_key": old_key,
+            "default_model": "ops-model",
+        },
+    )
+    provider_id = created.json()["id"]
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        provider.last_test_result = {
+            "status": "failed",
+            "connection": {"status": "failed", "error": f"rejected {old_key}"},
+        }
+        provider.last_test_status = "failed"
+        provider.last_tested_at = datetime.now(UTC)
+        db.commit()
+
+    response = authenticated_client.patch(
+        f"/api/providers/{provider_id}", json={"api_key": new_key}
+    )
+
+    assert response.status_code == 200
+    response_dump = json.dumps(response.json())
+    assert old_key not in response_dump
+    assert new_key not in response_dump
+    assert response.json()["last_test_result"] == {}
+    assert response.json()["last_test_status"] is None
+    assert response.json()["last_tested_at"] is None
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        assert provider.last_test_result == {}
+        assert provider.last_test_status is None
+        assert provider.last_tested_at is None
+        assert authenticated_client.app.state.secret_box.decrypt(provider.encrypted_api_key) == (
+            new_key
+        )
+
+    listed_dump = json.dumps(authenticated_client.get("/api/providers").json())
+    audit_dump = json.dumps(authenticated_client.get("/api/audit").json())
+    assert old_key not in listed_dump and new_key not in listed_dump
+    assert old_key not in audit_dump and new_key not in audit_dump

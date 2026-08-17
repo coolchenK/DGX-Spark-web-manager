@@ -27,6 +27,9 @@ FORBIDDEN_CUSTOM_HEADERS = {
     "proxy-authorization",
     "transfer-encoding",
 }
+MAX_SERIALIZED_TEST_STRING_CHARS = 500
+MAX_SERIALIZED_TEST_COLLECTION_ITEMS = 50
+MAX_SERIALIZED_TEST_DEPTH = 6
 
 
 class OpsProviderProbe(Protocol):
@@ -35,6 +38,40 @@ class OpsProviderProbe(Protocol):
     def complete(
         self, provider: Provider, messages: list[dict[str, Any]]
     ) -> AssistantTurn: ...
+
+
+def _sanitize_test_result_string(value: str, known_secret: str) -> str:
+    redacted = value.replace(known_secret, "[REDACTED]") if known_secret else value
+    return " ".join(redacted.replace("\x00", " ").split())[
+        :MAX_SERIALIZED_TEST_STRING_CHARS
+    ]
+
+
+def _sanitize_test_result(value: Any, known_secret: str, *, depth: int = 0) -> Any:
+    if depth >= MAX_SERIALIZED_TEST_DEPTH:
+        return "[TRUNCATED]"
+    if isinstance(value, str):
+        return _sanitize_test_result_string(value, known_secret)
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (raw_key, raw_value) in enumerate(value.items()):
+            if index >= MAX_SERIALIZED_TEST_COLLECTION_ITEMS:
+                break
+            key = _sanitize_test_result_string(str(raw_key), known_secret)
+            if key in result:
+                continue
+            result[key] = _sanitize_test_result(
+                raw_value, known_secret, depth=depth + 1
+            )
+        return result
+    if isinstance(value, list | tuple):
+        return [
+            _sanitize_test_result(item, known_secret, depth=depth + 1)
+            for item in value[:MAX_SERIALIZED_TEST_COLLECTION_ITEMS]
+        ]
+    return "[UNSUPPORTED]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,20 +222,25 @@ class ProviderService:
         return provider
 
     def update_secret(self, provider: Provider, api_key: str) -> None:
-        provider.encrypted_api_key = self.secret_box.encrypt(api_key)
+        encrypted_api_key = self.secret_box.encrypt(api_key)
+        provider.encrypted_api_key = encrypted_api_key
+        provider.last_test_result = {}
+        provider.last_test_status = None
+        provider.last_tested_at = None
 
     def serialize(self, provider: Provider) -> dict[str, Any]:
+        api_key = self.secret_box.decrypt(provider.encrypted_api_key)
         return {
             "id": provider.id,
             "name": provider.name,
             "base_url": provider.base_url,
             "default_model": provider.default_model,
-            "api_key_masked": mask_secret(self.secret_box.decrypt(provider.encrypted_api_key)),
+            "api_key_masked": mask_secret(api_key),
             "timeout_seconds": provider.timeout_seconds,
             "headers": provider.headers,
             "enabled": provider.enabled,
             "last_test_status": provider.last_test_status,
-            "last_test_result": provider.last_test_result,
+            "last_test_result": _sanitize_test_result(provider.last_test_result, api_key),
             "last_tested_at": provider.last_tested_at,
             "created_at": provider.created_at,
             "updated_at": provider.updated_at,
