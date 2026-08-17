@@ -14,21 +14,13 @@ from app.models import (
     OpsToolRun,
     Provider,
 )
-from sqlalchemy import delete, event, inspect, select, text
+from sqlalchemy import delete, inspect, select, text
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _database(path) -> Database:
-    database = Database(f"sqlite:///{path}")
-
-    @event.listens_for(database.engine, "connect")
-    def enable_foreign_keys(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    return database
+    return Database(f"sqlite:///{path}")
 
 
 def _provider(name: str) -> Provider:
@@ -103,6 +95,12 @@ def test_ops_session_persists_ordered_messages_and_tool_runs(tmp_path):
             "host.health",
             "host.memory",
         ]
+
+    with database.session_factory() as db:
+        persisted = db.get(OpsSession, session_id)
+        assert persisted is not None
+        assert "messages" in inspect(persisted).unloaded
+        assert "tool_runs" in inspect(persisted).unloaded
         db.delete(persisted)
         db.commit()
 
