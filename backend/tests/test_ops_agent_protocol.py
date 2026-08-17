@@ -1101,6 +1101,128 @@ def test_streaming_redactor_handles_split_and_invalid_utf8_without_leaking():
     assert "\ufffd" in decoded
 
 
+def _redact_chunks(chunks):
+    redactor = StreamingRedactor()
+    return b"".join(
+        [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "secret", "expected"),
+    [
+        (
+            b'{"DGX_OPS_RECOVERY_TOKEN": "recovery-secret"}',
+            b"recovery-secret",
+            b'{"DGX_OPS_RECOVERY_TOKEN": "[REDACTED]"}',
+        ),
+        (
+            b'{"DGX_API_KEY": "api-secret"}',
+            b"api-secret",
+            b'{"DGX_API_KEY": "[REDACTED]"}',
+        ),
+        (
+            b'{"HF_ENDPOINT": "endpoint-secret"}',
+            b"endpoint-secret",
+            b'{"HF_ENDPOINT": "[REDACTED]"}',
+        ),
+    ],
+)
+def test_streaming_redactor_namespaced_direct_json_keys_are_chunk_equivalent(
+    payload,
+    secret,
+    expected,
+):
+    whole = _redact_chunks([payload])
+    assert whole == expected
+
+    for split in range(len(payload) + 1):
+        split_output = _redact_chunks([payload[:split], payload[split:]])
+        assert split_output == whole, f"split={split}"
+        assert secret not in split_output
+
+    bytewise = _redact_chunks([bytes((byte,)) for byte in payload])
+    assert bytewise == whole
+    assert secret not in bytewise
+
+
+@pytest.mark.parametrize("backslash_count", [0, 2, 4, 6])
+def test_streaming_redactor_assignment_opening_quote_is_chunk_equivalent(
+    backslash_count,
+):
+    payload = b'API_KEY="secret' + b"\\" * backslash_count + b'" tail'
+    expected = b'API_KEY="[REDACTED]" tail'
+    whole = _redact_chunks([payload])
+    assert whole == expected
+
+    for split in range(len(payload) + 1):
+        split_output = _redact_chunks([payload[:split], payload[split:]])
+        assert split_output == whole, f"split={split}"
+        assert b"secret" not in split_output
+
+    bytewise = _redact_chunks([bytes((byte,)) for byte in payload])
+    assert bytewise == whole
+    assert b"secret" not in bytewise
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b"prefix dgx_token-value suffix", b"prefix [REDACTED] suffix"),
+        (b'"dgx_token-value" tail', b'"[REDACTED]" tail'),
+        (b'{"value":"dgx_token-value"}', b'{"value":"[REDACTED]"}'),
+        (
+            b'{"PUBLIC_KEY":"visible","value":"ordinary"}',
+            b'{"PUBLIC_KEY":"visible","value":"ordinary"}',
+        ),
+    ],
+)
+def test_streaming_redactor_direct_and_plain_json_are_chunk_equivalent(
+    payload,
+    expected,
+):
+    whole = _redact_chunks([payload])
+    assert whole == expected
+
+    for split in range(len(payload) + 1):
+        assert _redact_chunks([payload[:split], payload[split:]]) == whole
+    assert _redact_chunks([bytes((byte,)) for byte in payload]) == whole
+
+
+def test_streaming_redactor_bounds_direct_key_and_whitespace_decisions():
+    long_key_payload = b'{"DGX_' + b"A" * 1024 + b'": "long-key-secret"}'
+    long_key_output = _redact_chunks(
+        [bytes((byte,)) for byte in long_key_payload]
+    )
+    assert b"long-key-secret" not in long_key_output
+    assert long_key_output == b'{"[REDACTED]": "[REDACTED]"}'
+
+    redactor = StreamingRedactor()
+    prefix = redactor.feed(b'"dgx_token"')
+    released = redactor.feed(b" " * 1024)
+    suffix = redactor.feed(b"plain") + redactor.finish()
+    assert prefix + released + suffix == b'"[REDACTED]"' + b" " * 1024 + b"plain"
+    assert len(released) > 900
+
+
+def test_streaming_redactor_never_restores_configured_secret_used_as_json_key():
+    payload = b'{"configured-secret": "value-secret"}'
+    expected = b'{"[REDACTED]": "[REDACTED]"}'
+
+    for chunks in (
+        [payload],
+        [payload[:10], payload[10:]],
+        [bytes((byte,)) for byte in payload],
+    ):
+        redactor = StreamingRedactor(secret_values=("configured-secret",))
+        output = b"".join(
+            [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
+        )
+        assert output == expected
+        assert b"configured-secret" not in output
+        assert b"value-secret" not in output
+
+
 def test_streaming_redactor_covers_namespaced_sensitive_assignments():
     redactor = StreamingRedactor()
     chunks = [
