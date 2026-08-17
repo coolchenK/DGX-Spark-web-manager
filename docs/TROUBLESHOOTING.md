@@ -19,6 +19,36 @@ sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" .env
 docker compose up -d --force-recreate
 ```
 
+## Online AI Provider Is Not Ready
+
+Run **Online AI Service -> Test** after changing a base URL, key, or default model. The result
+separates endpoint connectivity and model-list discovery from an actual structured chat probe of
+the selected default model. A reachable `/v1/models` endpoint is not enough for AI operations.
+
+If connectivity succeeds but the default model fails, expand the technical details in the panel.
+Common causes are an unknown model name, an empty final assistant message, or truncated structured
+JSON such as `finish_reason=length`. Confirm the configured model is served by that endpoint,
+increase the provider-side output-token limit when applicable, and retest. The manager retries once
+without `response_format` when a compatible endpoint rejects that field; it does not hide a second
+protocol or model failure. Provider API keys are write-only and must not be placed in logs or issue
+reports.
+
+## AI Operations Session Is Stuck
+
+Inspect **Task Center**, the session timeline, and the linked plan before restarting anything.
+`ops.respond` covers Provider reasoning and read-only tools; `operation.execute` covers an approved
+Shell plan. Only one response or plan execution can be active in a session.
+
+A rejected plan remains rejected and the session returns to `active`; send a revised request in the
+same session. For a failed execution, inspect its bounded redacted output and audit entry, then check
+the Host Agent health and journal below. On manager restart, interrupted task state is recovered by
+the durable queue, while Agent jobs use their own process-identity recovery.
+
+The **Clear alerts and diagnostics history** action requires the exact phrase shown in its modal. A
+`409` means an AI response task, operation task, or approved/executing plan is still active. Wait for
+it to finish or cancel it through its normal control, then retry. The action physically deletes the
+listed history and cannot be restored except from a manager backup.
+
 ## Host Operations Agent
 
 Start with the public manager health check, then use an existing administrator cookie jar for the
@@ -260,3 +290,9 @@ Create a gateway key under **API 网关**. Administrator passwords and browser c
 ## Backup And Recovery
 
 Run `./scripts/backup.sh` before upgrades. Model files are not copied because they remain in the host model/HF directories. `restore.sh` validates archive paths, stops the manager, restores SQLite and `.env`, then restarts the service.
+
+For a release rollback, also record the current manager image ID and retain the previous source and
+raw Compose file. Restore the database and `.env` backup first, restore the previous source/Compose
+configuration, recreate the manager from the recorded image or rebuild that source, and verify
+`/api/health`. Uninstall the Host Agent only after the restored manager no longer mounts its socket
+and key. A normal Agent uninstall preserves its key and jobs for a subsequent reinstall.

@@ -22,7 +22,8 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
 - Hashed gateway API keys, encrypted provider/Hugging Face secrets, administrator sessions, CSRF protection, and audit history.
 - Third-party OpenAI-compatible providers for bounded deployment recommendations and diagnosis. AI
-  plans require human approval and can only invoke enumerated operations.
+  operations persist sessions and read-only tool results; exact Shell plans require administrator
+  approval before Host Agent execution.
 - Responsive Ant Design interface with desktop/mobile layouts and light/dark/system themes.
 
 ## DGX Spark Installation
@@ -119,8 +120,10 @@ On startup the manager scans Docker without restarting or recreating existing co
 
 Third-party AI providers are configured with an OpenAI-compatible base URL, API key, default model,
 timeout, and optional headers. Test a provider before using it for recommendations or diagnostics.
-Diagnostic plans and executable operations remain separate: AI plans require administrator approval,
-and the executor accepts only its fixed operation enum.
+The test reports connection/model-list readiness separately from a structured default-model probe.
+Diagnostic read tools use the local Host Agent automatically. A proposed Shell command remains a
+separate immutable plan: the panel shows its exact command, working directory, timeout, impact, and
+rollback, and execution requires explicit administrator approval.
 
 ## OpenAI API
 
@@ -199,7 +202,8 @@ The Vite dev server proxies `/api` and `/v1` to `127.0.0.1:3000`.
 - Browser mutations require a signed administrator session and matching CSRF token.
 - Provider URLs reject credentials, loopback, private, link-local, reserved, and metadata-network addresses.
 - Model paths must remain inside configured roots. Deployment images and runtime arguments are allowlisted.
-- AI responses never become shell commands. The executor accepts only start, stop, restart, and inventory rescan operations.
+- Provider text is never executed directly. Shell repairs are persisted as exact plans, require
+  administrator approval, and are digest-checked before the local Host Agent executes them.
 - Authorization headers, API keys, and Hugging Face tokens are redacted from diagnostic context and logs.
 - Model cards are untrusted data. Recommendation requests redact credentials and paths, bound all
   context, accept only requested typed fields, and still require administrator review plus server

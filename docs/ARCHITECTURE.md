@@ -83,9 +83,9 @@ uninstaller.
 | `deployment_recommendations` | Model evidence, deterministic settings, bounded AI fallback, resource estimates, and Draft candidates |
 | `deployments` | Idempotent container creation, health wait, preview/edit/clone workflows, lifecycle, logs, and rollback |
 | `gateway` | OpenAI model routing, JSON/SSE proxying, usage metrics |
-| `providers` | Encrypted external OpenAI-compatible API configuration and testing |
-| `diagnostics` | Real-context prompt construction and structured plan validation |
-| `operations` | Human-approved, enum-only action execution |
+| `providers` | Encrypted external OpenAI-compatible API configuration, structured connection/default-model readiness probes, and bounded response repair |
+| `diagnostics` | Persistent operations sessions, ordered messages/tool runs, bounded read-only orchestration, and linked plans |
+| `operations` | Digest-bound administrator approval and asynchronous execution of the exact displayed Shell plan through the Host Agent |
 | `audit` | Actor, action, resource, outcome, IP, and redacted details |
 
 ## State And Recovery
@@ -99,6 +99,30 @@ failed | cancelled -> queued
 ```
 
 An interrupted `running` task returns to `queued` during startup and appends a recovery log entry. Download tasks use the Hugging Face cache, so a resumed task reuses completed blobs.
+
+## AI Operations Lifecycle
+
+AI operations is a persistent, task-backed workflow rather than a synchronous chat request:
+
+1. An administrator creates a session and queues a user message as an `ops.respond` task.
+2. The configured Provider runs a bounded tool loop. The manager validates every tool name and
+   argument before dispatch and limits iterations, output, and retained context.
+3. The eleven structured Host Agent read tools can run without per-call approval. Their outputs are
+   bounded, redacted, persisted as ordered tool runs, and fed back to the Provider for diagnosis.
+4. A proposed repair is persisted as a pending `OperationPlan`. Its exact command, working
+   directory, timeout, impact, and rollback are displayed in the panel and covered by a canonical
+   digest.
+5. Administrator approval queues an `operation.execute` task. The worker recomputes the digest
+   before calling `shell.execute`; changed or stale plan data fails closed. Redacted output, task
+   state, plan state, and audit records remain visible while the command runs.
+6. Rejection leaves the plan immutable and returns the session to `active`, allowing a revised
+   message without losing the preceding evidence.
+
+The Settings history-clear action is a separate confirmation-gated maintenance transaction. It
+refuses to run while AI response or operation tasks/plans are active, physically deletes failed task
+history plus operation sessions/messages/tool runs/plans and their related audit rows, then retains
+one aggregate `maintenance.history.clear` audit event. Model, deployment, Provider, API-key,
+Hugging Face secret, gateway metric, and successful task records are preserved.
 
 ## Recommendation Pipeline
 
@@ -181,14 +205,15 @@ original repository, snapshots, and revision directories for reparse points befo
 verifies their identities and the blob path again before reading. Arbitrary links, linked blob
 directories or files, and non-regular blob targets remain unreadable.
 
-AI can suggest only a bounded set of deployment and generation values. It cannot choose images,
+Deployment-recommendation AI can suggest only a bounded set of deployment and generation values. It cannot choose images,
 quantization, paths, compatibility status, runtime operations, or shell commands. Suggestions remain
 visible for human review and are never deployment authorization. The server revalidates the final
 administrator-approved spec against current evidence, capabilities, and resources.
 
-Diagnostic AI providers receive a bounded snapshot of real system values and tail logs after secret
-redaction. Returned JSON is reduced to known fields. Unknown operations remain visible with
-`executable=false`; the executor never evaluates text or invokes a shell.
+Diagnostic AI providers receive bounded, redacted system and tool results. Read-only Host Agent
+tools use validated structured arguments. Shell text is never executed from a Provider response:
+it first becomes a persisted plan, is shown verbatim to an administrator, and may run only after
+approval metadata and the canonical plan digest are revalidated by both manager and Agent.
 
 The administrator-only `GET /api/ops-agent/health` endpoint reports `ok`, `unavailable`, or `error`.
 A healthy response includes the protocol version; unavailable and error responses include only a

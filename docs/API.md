@@ -62,6 +62,7 @@ Authorization: Bearer dgx_...
 | GET | `/api/audit` | Audit history |
 | GET | `/api/settings` | Non-secret manager configuration |
 | PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
+| DELETE | `/api/settings/alerts-diagnostics-history` | Physically clear failed-task and AI operations history |
 
 ### Deployment lifecycle actions
 
@@ -151,6 +152,30 @@ returns `409`.
 `tool_runs`, and plans linked from assistant messages. `GET /api/diagnostics` remains the legacy
 plan-history endpoint. The old `POST /api/diagnostics` request body remains accepted, but now
 creates a session and returns its asynchronous task with `202`.
+
+An assistant response can invoke only the bounded structured read tools exposed by the Host Agent.
+A Shell proposal is stored as a pending plan with exact `command`, `cwd`, `timeout_seconds`,
+`impact`, and `rollback` values. `POST /api/diagnostics/{id}/approve` records administrator approval
+and returns an asynchronous `operation.execute` task. The worker verifies the plan digest before
+execution. `POST /api/diagnostics/{id}/reject` leaves the plan rejected and returns its session to
+`active`.
+
+### Physical operations-history deletion
+
+`DELETE /api/settings/alerts-diagnostics-history` requires an administrator session, CSRF token,
+and this exact request body:
+
+```json
+{"confirmation":"清除历史记录"}
+```
+
+The endpoint returns `409` while an `ops.respond` or `operation.execute` task is queued, running,
+paused, or cancellation-requested, or while a plan is approved/executing. Otherwise one database
+transaction physically deletes failed tasks, all operation plans, all operations sessions/messages/
+tool runs, and their related operations/failed-task audit rows. It then creates one
+`maintenance.history.clear` audit record and returns aggregate deletion counts. Models,
+deployments, Providers, API keys, Hugging Face secrets, gateway metrics, and successful tasks are
+not deleted. A transaction failure rolls back every deletion.
 
 ### Hugging Face Spark compatibility
 
