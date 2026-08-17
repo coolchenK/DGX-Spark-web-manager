@@ -38,8 +38,37 @@ _SIGNATURE_LENGTH = hashlib.sha256().digest_size * 2
 _MAX_RESPONSE_AGE_SECONDS = 30
 _MAX_ERROR_CODE_LENGTH = 128
 _MAX_ERROR_MESSAGE_LENGTH = 1_024
+_SAFE_REMOTE_ERROR_MESSAGE = "Host operations agent returned an error"
+_REMOTE_ERROR_CODES = frozenset(
+    {
+        "approval_required",
+        "authentication_failed",
+        "expired_request",
+        "frame_too_large",
+        "invalid_frame",
+        "invalid_parameters",
+        "invalid_request",
+        "job_not_found",
+        "operation_failed",
+        "operation_timeout",
+        "policy_rejected",
+        "read_timeout",
+        "replay_detected",
+        "unknown_action",
+    }
+)
 _HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
 _MAX_KEY_FILE_SIZE = 65
+
+
+def _is_remote_error_code(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _MAX_ERROR_CODE_LENGTH
+        and value.isascii()
+        and value in _REMOTE_ERROR_CODES
+    )
 
 
 class OpsAgentError(RuntimeError):
@@ -63,10 +92,12 @@ class OpsAgentProtocolError(OpsAgentError):
 class OpsAgentRemoteError(OpsAgentError):
     """The Agent authenticated a stable application error."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str) -> None:
+        if not _is_remote_error_code(code):
+            raise OpsAgentProtocolError()
         self.code = code
-        self.message = message
-        super().__init__("Host operations agent returned an error")
+        self.message = _SAFE_REMOTE_ERROR_MESSAGE
+        super().__init__(_SAFE_REMOTE_ERROR_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,15 +313,15 @@ class OpsAgentClient:
         code = error.get("code")
         message = error.get("message")
         if (
-            not isinstance(code, str)
-            or not code
-            or len(code) > _MAX_ERROR_CODE_LENGTH
+            not _is_remote_error_code(code)
             or not isinstance(message, str)
             or not message
             or len(message) > _MAX_ERROR_MESSAGE_LENGTH
         ):
             raise OpsAgentProtocolError()
-        raise OpsAgentRemoteError(code, message)
+        error["message"] = None
+        message = None
+        raise OpsAgentRemoteError(code) from None
 
     def _validate_output_limit(self, result: dict[str, Any] | None) -> None:
         if result is None:
@@ -304,7 +335,11 @@ class OpsAgentClient:
                     if key == "output":
                         if not isinstance(value, str):
                             raise OpsAgentProtocolError()
-                        total += len(value.encode("utf-8"))
+                        try:
+                            encoded_length = len(value.encode("utf-8"))
+                        except UnicodeEncodeError:
+                            raise OpsAgentProtocolError() from None
+                        total += encoded_length
                         if total > self._output_limit:
                             raise OpsAgentProtocolError()
                     else:

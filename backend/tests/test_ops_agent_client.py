@@ -314,7 +314,7 @@ def test_client_maps_remote_error_without_losing_code(tmp_path):
             _client(server.socket_path, key_path).call("shell.execute", {})
 
     assert raised.value.code == "approval_required"
-    assert raised.value.message == "approval required"
+    assert raised.value.message == "Host operations agent returned an error"
 
 
 def test_remote_error_string_does_not_echo_remote_detail(tmp_path):
@@ -335,9 +335,39 @@ def test_remote_error_string_does_not_echo_remote_detail(tmp_path):
         with pytest.raises(OpsAgentRemoteError) as raised:
             _client(server.socket_path, key_path).call("host.memory", {})
 
-    assert raised.value.message == remote_detail
-    assert "private" not in str(raised.value)
-    assert "signature" not in str(raised.value)
+    error = raised.value
+    assert error.message == "Host operations agent returned an error"
+    for rendered in (str(error), repr(error), repr(error.args), repr(error.__dict__)):
+        assert "private" not in rendered
+        assert "signature" not in rendered
+        assert "key=" not in rendered
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["unknown-code", "operation failed", "operation_failed\nkey", "操作失败"],
+)
+def test_client_rejects_unrecognized_or_non_ascii_remote_error_codes(tmp_path, code):
+    secret = b"w" * 32
+    key_path = tmp_path / "agent.key"
+    key_path.write_bytes(secret)
+    with _server(
+        tmp_path,
+        lambda request: encode_frame(
+            _response(
+                request,
+                secret,
+                error={"code": code, "message": "rejected"},
+            )
+        ),
+    ) as server:
+        with pytest.raises(OpsAgentProtocolError):
+            _client(server.socket_path, key_path).call("host.memory", {})
+
+
+def test_remote_error_constructor_rejects_unrecognized_code():
+    with pytest.raises(OpsAgentProtocolError):
+        OpsAgentRemoteError("private/path")
 
 
 @pytest.mark.parametrize(
@@ -402,6 +432,28 @@ def test_client_rejects_recursive_output_over_configured_limit(tmp_path):
                 key_path,
                 output_limit_bytes=10_000,
             ).call("job.get", {"job_id": "example"})
+
+
+def test_client_maps_lone_surrogate_output_to_protocol_error(tmp_path):
+    secret = b"j" * 32
+    key_path = tmp_path / "agent.key"
+    key_path.write_bytes(secret)
+    surrogate = "\ud800"
+    with _server(
+        tmp_path,
+        lambda request: encode_frame(
+            _response(
+                request,
+                secret,
+                result={"nested": {surrogate: "safe", "output": surrogate}},
+            )
+        ),
+    ) as server:
+        with pytest.raises(OpsAgentProtocolError) as raised:
+            _client(server.socket_path, key_path).call("job.get", {"job_id": "example"})
+
+    assert str(raised.value) == "Host operations agent returned an invalid response"
+    assert raised.value.__cause__ is None
 
 
 def test_client_classifies_missing_key_and_socket_as_unavailable(tmp_path):
@@ -479,12 +531,15 @@ def test_ops_agent_settings_defaults_and_ranges(tmp_path):
 
 
 def test_manager_image_packages_shared_ops_protocol():
-    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    repository_root = Path(__file__).resolve().parents[2]
+    project = tomllib.loads(
+        (repository_root / "pyproject.toml").read_text(encoding="utf-8")
+    )
     packages = project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
     assert packages == ["backend/app", "host_agent"]
-    assert Path("host_agent/__init__.py").is_file()
+    assert (repository_root / "host_agent/__init__.py").is_file()
 
-    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (repository_root / "Dockerfile").read_text(encoding="utf-8")
     copy_agent = dockerfile.index("COPY host_agent/ ./host_agent/")
     install_project = dockerfile.index("RUN python -m pip install .")
     assert copy_agent < install_project
@@ -520,7 +575,7 @@ def test_health_api_reports_ok(authenticated_client, monkeypatch):
             "Host operations agent returned an invalid response",
         ),
         (
-            OpsAgentRemoteError("operation_failed", "private command failed"),
+            OpsAgentRemoteError("operation_failed"),
             "error",
             "Host operations agent rejected the health check",
         ),
