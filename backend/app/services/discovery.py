@@ -99,7 +99,7 @@ def infer_runtime(image: str, command: list[str]) -> str | None:
     if "vllm" in haystack:
         return "vllm"
     if "llama-server" in haystack or "llama.cpp" in haystack:
-        return "llama.cpp"
+        return "llama_cpp"
     if "tritonserver" in haystack:
         return "triton"
     return None

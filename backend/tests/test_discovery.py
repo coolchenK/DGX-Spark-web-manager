@@ -312,6 +312,13 @@ def test_infer_runtime_from_image_and_command():
         == "sglang"
     )
     assert infer_runtime("vllm/vllm-openai:v0.27.1", ["--model", "nvidia/model"]) == "vllm"
+    assert (
+        infer_runtime(
+            "nvidia/cuda:12.9.0-devel-ubuntu24.04",
+            ["/opt/llamacpp/llama-server", "--model", "/models/model.gguf"],
+        )
+        == "llama_cpp"
+    )
     assert infer_runtime("redis:7", ["redis-server"]) is None
 
 
