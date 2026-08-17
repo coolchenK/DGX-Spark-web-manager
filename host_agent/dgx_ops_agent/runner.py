@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .launcher import GO, write_request
 from .policy import ValidatedAction
 from .redaction import StreamingRedactor, redact_text
 
@@ -112,6 +113,8 @@ class _JobState:
     process: subprocess.Popen[bytes] | None = None
     process_group: int | None = None
     process_identity: _ProcessIdentity | None = None
+    launch_phase: str | None = None
+    recovery_token: str | None = None
     cancel_requested: threading.Event = field(default_factory=threading.Event)
 
 
@@ -277,6 +280,84 @@ class JobRunner:
             raise ValueError("invalid argv")
         return argv
 
+    def _spawn_process(
+        self,
+        argv: tuple[str, ...],
+        cwd: str | None,
+        environment: dict[str, str],
+        recovery_token: str,
+    ) -> tuple[subprocess.Popen[bytes], int | None]:
+        common_options: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": False,
+            "shell": False,
+        }
+        if not _HAS_PROCESS_GROUPS:
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=environment,
+                **common_options,
+            )
+            return process, None
+
+        request_read, request_write = os.pipe()
+        gate_read, gate_write = os.pipe()
+        launcher_path = Path(__file__).with_name("launcher.py").resolve(strict=True)
+        launcher_argv = (
+            sys.executable,
+            str(launcher_path),
+            str(request_read),
+            str(gate_read),
+        )
+        try:
+            process = subprocess.Popen(
+                launcher_argv,
+                cwd=None,
+                env={
+                    "PATH": SAFE_PATH,
+                    _RECOVERY_ENVIRONMENT_KEY: recovery_token,
+                },
+                pass_fds=(request_read, gate_read),
+                start_new_session=True,
+                **common_options,
+            )
+        except Exception:
+            for descriptor in (request_read, request_write, gate_read, gate_write):
+                self._close_descriptor(descriptor)
+            raise
+
+        self._close_descriptor(request_read)
+        self._close_descriptor(gate_read)
+        try:
+            write_request(
+                request_write,
+                argv=argv,
+                cwd=cwd,
+                environment=environment,
+            )
+        except Exception:
+            self._close_descriptor(gate_write)
+            self._terminate(process, process.pid)
+            try:
+                process.wait(timeout=max(self.termination_grace, 0.1))
+            except subprocess.TimeoutExpired:
+                self._kill(process, process.pid)
+                process.wait()
+            raise
+        return process, gate_write
+
+    @staticmethod
+    def _close_descriptor(descriptor: int | None) -> None:
+        if descriptor is None:
+            return
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
     def _run(
         self,
         state: _JobState,
@@ -291,32 +372,47 @@ class JobRunner:
                 return
             state.started = time.time()
 
-        popen_options: dict[str, Any] = {
-            "cwd": cwd,
-            "env": {
-                **environment,
-                _RECOVERY_ENVIRONMENT_KEY: secrets.token_urlsafe(32),
-            },
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.STDOUT,
-            "text": False,
-            "shell": False,
+        recovery_token = secrets.token_urlsafe(32)
+        execution_environment = {
+            **environment,
+            _RECOVERY_ENVIRONMENT_KEY: recovery_token,
         }
         if _HAS_PROCESS_GROUPS:
-            popen_options["start_new_session"] = True
+            preparation_error: OSError | None = None
+            with self._lock:
+                state.launch_phase = "prepared"
+                state.recovery_token = recovery_token
+                try:
+                    self._persist(state)
+                except OSError as exc:
+                    preparation_error = exc
+            if preparation_error is not None:
+                with self._lock:
+                    state.status = "failed"
+                    state.finished = time.time()
+                    state.error = self._bounded_error(preparation_error)
+                    try:
+                        self._persist(state)
+                    except OSError:
+                        pass
+                return
         try:
-            process = subprocess.Popen(argv, **popen_options)
+            process, gate_descriptor = self._spawn_process(
+                argv,
+                cwd,
+                execution_environment,
+                recovery_token,
+            )
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             with self._lock:
                 self._finish(state, "failed", None, error=self._bounded_error(exc))
             return
 
-        recovery_token = popen_options["env"][_RECOVERY_ENVIRONMENT_KEY]
         process_group = process.pid if _HAS_PROCESS_GROUPS else None
         try:
             identity = self._capture_process_identity(process.pid, recovery_token)
         except (OSError, ValueError) as exc:
+            self._close_descriptor(gate_descriptor)
             self._terminate(process, process_group)
             try:
                 exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
@@ -340,11 +436,14 @@ class JobRunner:
             state.process_group = process_group
             state.process_identity = identity
             state.status = "running"
+            if _HAS_PROCESS_GROUPS:
+                state.launch_phase = "ready"
             try:
                 self._persist(state)
             except OSError as exc:
                 persistence_error = exc
         if persistence_error is not None:
+            self._close_descriptor(gate_descriptor)
             self._terminate(process, process_group)
             try:
                 exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
@@ -362,6 +461,28 @@ class JobRunner:
                 except OSError:
                     pass
             return
+
+        if gate_descriptor is not None:
+            try:
+                if os.write(gate_descriptor, GO) != len(GO):
+                    raise OSError("launcher gate write failed")
+            except OSError as exc:
+                self._close_descriptor(gate_descriptor)
+                self._terminate(process, process_group)
+                try:
+                    exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
+                except subprocess.TimeoutExpired:
+                    self._kill(process, process_group)
+                    exit_code = process.wait()
+                with self._lock:
+                    self._finish(
+                        state,
+                        "failed",
+                        exit_code,
+                        error=self._bounded_error(exc),
+                    )
+                return
+            self._close_descriptor(gate_descriptor)
 
         redactor = StreamingRedactor(secret_values=(recovery_token,))
         reader_error: list[Exception] = []
@@ -554,6 +675,14 @@ class JobRunner:
             if state.process_identity is None
             else state.process_identity.as_dict()
         )
+        metadata["launch"] = (
+            None
+            if state.launch_phase is None or state.recovery_token is None
+            else {
+                "phase": state.launch_phase,
+                "recovery_token": state.recovery_token,
+            }
+        )
         target = self.job_dir / f"{state.id}.json"
         temporary = self.job_dir / f".{state.id}.{uuid.uuid4().hex}.tmp"
         descriptor = os.open(
@@ -574,6 +703,7 @@ class JobRunner:
             self._replace_metadata(temporary, target)
             target.chmod(0o600)
             self._verify_metadata_file(target)
+            self._sync_job_directory()
         finally:
             try:
                 temporary.unlink()
@@ -611,6 +741,16 @@ class JobRunner:
                 or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
                 raise PermissionError("job_dir permissions are not private")
+        finally:
+            os.close(descriptor)
+
+    def _sync_job_directory(self) -> None:
+        if not _IS_POSIX_FILESYSTEM:
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.job_dir, flags)
+        try:
+            os.fsync(descriptor)
         finally:
             os.close(descriptor)
 
@@ -654,11 +794,7 @@ class JobRunner:
             self._jobs[job_id] = state
             if state.status not in TERMINAL_STATUSES:
                 if _IS_LINUX and state.process_identity is not None:
-                    process_group = self._recoverable_process_group(
-                        state.process_identity
-                    )
-                    if process_group is not None:
-                        self._terminate_recovered_group(process_group)
+                    self._recover_with_pidfds(state.process_identity)
                 state.status = "failed"
                 state.exit_code = None
                 state.finished = time.time()
@@ -692,6 +828,7 @@ class JobRunner:
         finished = data.get("finished")
         error = data.get("error")
         process_identity = self._parse_process_identity(data.get("process_identity"))
+        launch_phase, recovery_token = self._parse_launch(data.get("launch"))
         if exit_code is not None and type(exit_code) is not int:
             raise ValueError("invalid job metadata")
         if started is not None and not isinstance(started, (int, float)):
@@ -718,7 +855,24 @@ class JobRunner:
                 else process_identity.process_group
             ),
             process_identity=process_identity,
+            launch_phase=launch_phase,
+            recovery_token=recovery_token,
         )
+
+    @staticmethod
+    def _parse_launch(value: Any) -> tuple[str | None, str | None]:
+        if value is None:
+            return None, None
+        if (
+            type(value) is not dict
+            or set(value) != {"phase", "recovery_token"}
+            or value["phase"] not in {"prepared", "ready"}
+            or not isinstance(value["recovery_token"], str)
+            or not 32 <= len(value["recovery_token"]) <= 128
+            or not value["recovery_token"].isascii()
+        ):
+            raise ValueError("invalid job metadata")
+        return value["phase"], value["recovery_token"]
 
     @staticmethod
     def _parse_process_identity(value: Any) -> _ProcessIdentity | None:
@@ -792,17 +946,59 @@ class JobRunner:
             recovery_token=recovery_token,
         )
 
+    def _recover_with_pidfds(self, identity: _ProcessIdentity) -> None:
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        if not callable(pidfd_open) or not callable(pidfd_send_signal):
+            return
+        if not self._recovery_identity_is_current(identity):
+            return
+
+        deadline = time.monotonic() + self.termination_grace
+        terminated: set[int] = set()
+        while True:
+            matching = self._matching_recovery_pids(identity)
+            if not matching:
+                return
+            new_members = [pid for pid in matching if pid not in terminated]
+            self._signal_recovery_pids(
+                identity,
+                new_members,
+                signal.SIGTERM,
+                pidfd_open,
+                pidfd_send_signal,
+            )
+            terminated.update(new_members)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+
+        self._signal_recovery_pids(
+            identity,
+            self._matching_recovery_pids(identity),
+            signal.SIGKILL,
+            pidfd_open,
+            pidfd_send_signal,
+        )
+
     @staticmethod
-    def _recoverable_process_group(identity: _ProcessIdentity) -> int | None:
+    def _recovery_identity_is_current(identity: _ProcessIdentity) -> bool:
         if (
             identity.process_group is None
             or identity.session_id is None
             or identity.start_time_ticks is None
             or identity.boot_id is None
-            or _read_boot_id() != identity.boot_id
+            or identity.pid != identity.process_group
+            or identity.process_group != identity.session_id
         ):
-            return None
+            return False
+        try:
+            return _read_boot_id() == identity.boot_id
+        except (OSError, ValueError):
+            return False
 
+    @staticmethod
+    def _matching_recovery_pids(identity: _ProcessIdentity) -> list[int]:
         candidates = [PROC_ROOT / str(identity.pid)]
         try:
             candidates.extend(
@@ -811,41 +1007,58 @@ class JobRunner:
                 if path.name.isdecimal() and path.name != str(identity.pid)
             )
         except OSError:
-            return None
+            return []
+        matching: list[int] = []
         for process_dir in candidates:
-            try:
-                process_group, session_id, start_time_ticks = _read_linux_stat(
-                    process_dir / "stat"
-                )
-                if process_group != identity.process_group or session_id != identity.session_id:
-                    continue
-                if process_dir.name == str(identity.pid) and (
-                    start_time_ticks != identity.start_time_ticks
-                ):
-                    continue
-                if _proc_environment_has_token(
-                    process_dir / "environ", identity.recovery_token
-                ):
-                    return identity.process_group
-            except (OSError, ValueError):
-                continue
-        return None
+            if JobRunner._recovery_process_matches(identity, process_dir):
+                matching.append(int(process_dir.name))
+        return matching
 
-    def _terminate_recovered_group(self, process_group: int) -> None:
-        deadline = time.monotonic() + self.termination_grace
-        if not self._process_group_exists(process_group):
-            return
+    @staticmethod
+    def _recovery_process_matches(
+        identity: _ProcessIdentity,
+        process_dir: Path,
+    ) -> bool:
         try:
-            os.killpg(process_group, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        while self._process_group_exists(process_group) and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if self._process_group_exists(process_group):
+            process_group, session_id, start_time_ticks = _read_linux_stat(
+                process_dir / "stat"
+            )
+            if process_group != identity.process_group or session_id != identity.session_id:
+                return False
+            if process_dir.name == str(identity.pid) and (
+                start_time_ticks != identity.start_time_ticks
+            ):
+                return False
+            return _proc_environment_has_token(
+                process_dir / "environ", identity.recovery_token
+            )
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _signal_recovery_pids(
+        identity: _ProcessIdentity,
+        process_ids: list[int],
+        sent_signal: int,
+        pidfd_open: Any,
+        pidfd_send_signal: Any,
+    ) -> None:
+        for pid in process_ids:
             try:
-                os.killpg(process_group, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+                descriptor = pidfd_open(pid, 0)
+            except OSError:
+                continue
+            try:
+                if not JobRunner._recovery_process_matches(
+                    identity, PROC_ROOT / str(pid)
+                ):
+                    continue
+                try:
+                    pidfd_send_signal(descriptor, sent_signal, None, 0)
+                except OSError:
+                    continue
+            finally:
+                os.close(descriptor)
 
     @staticmethod
     def _bounded_error(exc: Exception) -> str:

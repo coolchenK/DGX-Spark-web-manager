@@ -8,6 +8,7 @@ import signal
 import stat
 import struct
 import sys
+import threading
 import time
 import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
@@ -1334,7 +1335,11 @@ def test_timeout_tracks_injected_process_group_after_leader_exit(
         "_process_group_exists",
         staticmethod(lambda _process_group: group_alive),
     )
-    monkeypatch.setattr(runner_module.subprocess, "Popen", lambda *_args, **_kwargs: ExitedLeader())
+    monkeypatch.setattr(
+        runner,
+        "_spawn_process",
+        lambda *_args, **_kwargs: (ExitedLeader(), None),
+    )
 
     job = runner.start(
         [sys.executable, "-c", "unused"], cwd=tmp_path, timeout=0.05
@@ -1343,6 +1348,134 @@ def test_timeout_tracks_injected_process_group_after_leader_exit(
 
     assert result.status == "timed_out"
     assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+
+
+def test_launcher_waits_for_go_and_eof_never_executes(tmp_path):
+    from host_agent.dgx_ops_agent import launcher
+
+    request_read, request_write = os.pipe()
+    gate_read, gate_write = os.pipe()
+    calls = []
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            launcher.run_launcher(
+                request_read,
+                gate_read,
+                exec_function=lambda *args: calls.append(args),
+            )
+        )
+    )
+    worker.start()
+    launcher.write_request(
+        request_write,
+        argv=(sys.executable, "-c", "literal;not-a-shell"),
+        cwd=str(tmp_path),
+        environment={"PATH": SAFE_PATH, "LANG": "C"},
+    )
+    time.sleep(0.02)
+
+    assert calls == []
+    os.close(gate_write)
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert calls == []
+    assert result == [launcher.EXIT_GATE_CLOSED]
+
+    request_read, request_write = os.pipe()
+    gate_read, gate_write = os.pipe()
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            launcher.run_launcher(
+                request_read,
+                gate_read,
+                exec_function=lambda *args: calls.append(args),
+            )
+        )
+    )
+    worker.start()
+    expected_argv = (sys.executable, "-c", "literal;not-a-shell")
+    expected_environment = {"PATH": SAFE_PATH, "LANG": "C"}
+    launcher.write_request(
+        request_write,
+        argv=expected_argv,
+        cwd=str(tmp_path),
+        environment=expected_environment,
+    )
+    assert calls == []
+    os.write(gate_write, launcher.GO)
+    os.close(gate_write)
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert calls == [(expected_argv[0], list(expected_argv), expected_environment)]
+    assert result == [0]
+
+
+def test_runner_persists_pre_spawn_recovery_token(tmp_path, monkeypatch):
+    observed_launch = {}
+
+    def refuse_spawn(*_args, **_kwargs):
+        metadata_path = next(tmp_path.glob("*.json"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        observed_launch.update(metadata.get("launch") or {})
+        raise OSError("injected spawn refusal")
+
+    runner = JobRunner(tmp_path)
+    monkeypatch.setattr(runner_module, "_HAS_PROCESS_GROUPS", True)
+    monkeypatch.setattr(runner_module.subprocess, "Popen", refuse_spawn)
+
+    job = runner.start(
+        [sys.executable, "-c", "unused"], cwd=tmp_path, timeout=1
+    )
+    result = _wait_for_terminal(runner, job.id)
+
+    assert result.status == "failed"
+    assert observed_launch["phase"] == "prepared"
+    assert len(observed_launch["recovery_token"]) >= 32
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX launcher handshake only")
+def test_launcher_persist_failure_before_go_never_executes_command(
+    tmp_path, monkeypatch
+):
+    marker = tmp_path / "must-not-run"
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+    original_persist = runner._persist
+    injected = False
+
+    def fail_ready_identity(state):
+        nonlocal injected
+        if getattr(state, "launch_phase", None) == "ready" and not injected:
+            injected = True
+            raise OSError("ready identity persistence failed")
+        return original_persist(state)
+
+    monkeypatch.setattr(runner, "_persist", fail_ready_identity)
+    job = runner.start(
+        [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"],
+        cwd=tmp_path,
+        timeout=2,
+    )
+    result = _wait_for_terminal(runner, job.id)
+
+    assert injected is True
+    assert result.status == "failed"
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX launcher handshake only")
+def test_launcher_releases_extremely_short_command_after_identity_fsync(tmp_path):
+    runner = JobRunner(tmp_path)
+
+    result = _wait_for_terminal(
+        runner,
+        runner.start(["/bin/true"], cwd="/", timeout=1).id,
+    )
+
+    assert result.status == "succeeded"
+    assert result.exit_code == 0
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
@@ -1542,32 +1675,65 @@ def test_restart_kills_only_exact_fake_proc_identity_match(tmp_path, monkeypatch
     write_job(matching_id, 101, "matching-recovery-token")
     write_job(mismatch_id, 202, "metadata-token-does-not-match")
 
-    group_alive = {101: True, 202: True}
+    opened_pids = []
+    descriptor_pids = {}
     sent_signals = []
 
-    def fake_killpg(process_group, sent_signal):
-        sent_signals.append((process_group, sent_signal))
+    def fake_pidfd_open(pid, flags=0):
+        assert flags == 0
+        opened_pids.append(pid)
+        descriptor = os.open(os.devnull, os.O_RDONLY)
+        descriptor_pids[descriptor] = pid
+        return descriptor
+
+    def fake_pidfd_send_signal(descriptor, sent_signal, siginfo=None, flags=0):
+        assert siginfo is None
+        assert flags == 0
+        pid = descriptor_pids[descriptor]
+        sent_signals.append((pid, sent_signal))
         if sent_signal == 9:
-            group_alive[process_group] = False
+            process_dir = proc_root / str(pid)
+            (process_dir / "environ").unlink()
+            (process_dir / "stat").unlink()
+            process_dir.rmdir()
+
+    def forbid_recovery_killpg(*_args):
+        pytest.fail("restart recovery must not call killpg")
 
     monkeypatch.setattr(runner_module, "PROC_ROOT", proc_root, raising=False)
     monkeypatch.setattr(runner_module, "_IS_LINUX", True, raising=False)
     monkeypatch.setattr(runner_module.signal, "SIGKILL", 9, raising=False)
-    monkeypatch.setattr(runner_module.os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(runner_module.os, "pidfd_open", fake_pidfd_open, raising=False)
     monkeypatch.setattr(
-        JobRunner,
-        "_process_group_exists",
-        staticmethod(lambda process_group: group_alive[process_group]),
+        runner_module.signal,
+        "pidfd_send_signal",
+        fake_pidfd_send_signal,
+        raising=False,
     )
+    monkeypatch.setattr(runner_module.os, "killpg", forbid_recovery_killpg, raising=False)
 
     runner = JobRunner(jobs, termination_grace=0)
 
+    assert opened_pids == [101, 101]
     assert sent_signals == [(101, signal.SIGTERM), (101, 9)]
     assert runner.get(matching_id).status == "failed"
     assert runner.get(mismatch_id).status == "failed"
     assert "interrupted" in runner.get(matching_id).error
     assert "interrupted" in runner.get(mismatch_id).error
     assert json.loads((jobs / f"{matching_id}.json").read_text())["process_identity"]
+
+    unsupported_id = "00000000-0000-4000-8000-000000000303"
+    write_process(303, "unsupported-pidfd-token")
+    write_job(unsupported_id, 303, "unsupported-pidfd-token")
+    monkeypatch.delattr(runner_module.os, "pidfd_open")
+    monkeypatch.delattr(runner_module.signal, "pidfd_send_signal")
+
+    unsupported_runner = JobRunner(jobs, termination_grace=0)
+
+    assert unsupported_runner.get(unsupported_id).status == "failed"
+    assert "interrupted" in unsupported_runner.get(unsupported_id).error
+    assert opened_pids == [101, 101]
+    assert sent_signals == [(101, signal.SIGTERM), (101, 9)]
 
 
 def test_runner_rejects_invalid_limits_offsets_environment_and_job_ids(tmp_path):
