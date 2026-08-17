@@ -93,8 +93,10 @@ validate_systemd_state() {
     is-enabled:service:disabled:1|is-enabled:service:static:0|\
     is-enabled:service:not-found:1|is-enabled:service:not-found:4|\
     is-active:socket:active:0|is-active:socket:inactive:3|\
+    is-active:socket:inactive:4|\
     is-active:socket:not-found:3|is-active:socket:not-found:4|\
     is-active:service:active:0|is-active:service:inactive:3|\
+    is-active:service:inactive:4|\
     is-active:service:not-found:3|is-active:service:not-found:4)
       return 0
       ;;
@@ -122,6 +124,14 @@ query_systemd_state() {
     return 1
   }
   validate_systemd_state "$operation" "$unit_type" "$value" "$status" || return 1
+  if [[ "$status" == 4 ]]; then
+    local unit_path="$UNIT_DIR/$unit"
+    if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+      echo "Systemd reported an existing unit as unknown: $unit" >&2
+      return 1
+    fi
+    value=not-found
+  fi
   printf -v "$result_variable" '%s' "$value"
 }
 

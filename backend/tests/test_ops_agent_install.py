@@ -177,7 +177,16 @@ def _fake_agent_system(
                 "    unit=$1",
                 "    case \"$unit\" in *.socket) kind=socket ;; *) kind=service ;; esac",
                 "    if [ ! -e \"$UNIT_DIR/$unit\" ]; then",
-                "      printf 'not-found\\n'",
+                "      if [ \"$command\" = is-active ]; then",
+                "        printf 'inactive\\n'",
+                "      else",
+                "        printf 'not-found\\n'",
+                "      fi",
+                "      exit 4",
+                "    fi",
+                "    if [ \"$command\" = is-active ] &&",
+                "       [ -e \"$STATE/existing-inactive-rc4\" ]; then",
+                "      printf 'inactive\\n'",
                 "      exit 4",
                 "    fi",
                 "    suffix=${command#is-}",
@@ -601,7 +610,12 @@ def test_new_systemd_activation_failure_rolls_back_without_committing_backup(
 
 @pytest.mark.parametrize(
     "query_failure",
-    ["masked", "query-transport-failure", "query-rc-mismatch"],
+    [
+        "masked",
+        "query-transport-failure",
+        "query-rc-mismatch",
+        "existing-inactive-rc4",
+    ],
 )
 def test_invalid_systemd_query_fails_closed_before_install_writes(
     tmp_path: Path,
@@ -631,6 +645,79 @@ def test_invalid_systemd_query_fails_closed_before_install_writes(
     assert socket_unit.read_text() == "old-socket"
     assert not (install_root / "var/lib/dgx-spark-ops-agent/jobs").exists()
     assert not list(package.parent.glob(".transaction.*"))
+
+
+def _fake_absent_systemd_state(tmp_path: Path) -> Path:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "systemctl",
+        "\n".join(
+            (
+                "#!/bin/sh",
+                'case "$1" in',
+                "  is-enabled) printf 'not-found\\n'; exit 4 ;;",
+                "  is-active) printf 'inactive\\n'; exit 4 ;;",
+                "  *) exit 99 ;;",
+                "esac",
+                "",
+            )
+        ),
+    )
+    return fake_bin
+
+
+def test_absent_unit_inactive_rc4_is_normalized_to_not_found(tmp_path: Path) -> None:
+    bash = _bash()
+    fake_bin = _fake_absent_systemd_state(tmp_path)
+    install_root = tmp_path / "root"
+    command = "; ".join(
+        (
+            f'source "{INSTALLER.as_posix()}"',
+            "capture_systemd_snapshot",
+            'printf "%s\\n" "$SOCKET_ENABLED_STATE:$SOCKET_ACTIVE_STATE"',
+            'printf "%s\\n" "$SERVICE_ENABLED_STATE:$SERVICE_ACTIVE_STATE"',
+        )
+    )
+
+    result = subprocess.run(
+        [bash, "-c", command],
+        cwd=ROOT,
+        env={**os.environ, **_agent_test_env(fake_bin, install_root)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["not-found:not-found", "not-found:not-found"]
+    assert not install_root.exists()
+
+
+def test_existing_unit_inactive_rc4_fails_closed_without_writes(tmp_path: Path) -> None:
+    bash = _bash()
+    fake_bin = _fake_absent_systemd_state(tmp_path)
+    install_root = tmp_path / "root"
+    service = install_root / "etc/systemd/system/dgx-spark-ops-agent.service"
+    socket_unit = install_root / "etc/systemd/system/dgx-spark-ops-agent.socket"
+    service.parent.mkdir(parents=True)
+    service.write_text("existing-service", encoding="utf-8")
+    socket_unit.write_text("existing-socket", encoding="utf-8")
+    command = f'source "{INSTALLER.as_posix()}"; capture_systemd_snapshot'
+
+    result = subprocess.run(
+        [bash, "-c", command],
+        cwd=ROOT,
+        env={**os.environ, **_agent_test_env(fake_bin, install_root)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert service.read_text(encoding="utf-8") == "existing-service"
+    assert socket_unit.read_text(encoding="utf-8") == "existing-socket"
+    assert not (install_root / "var/lib/dgx-spark-ops-agent/jobs").exists()
 
 
 @pytest.mark.parametrize(
