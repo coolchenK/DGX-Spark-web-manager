@@ -1189,6 +1189,49 @@ def test_streaming_redactor_direct_and_plain_json_are_chunk_equivalent(
     assert _redact_chunks([bytes((byte,)) for byte in payload]) == whole
 
 
+@pytest.mark.parametrize("whitespace", [b"\n", b"\t", b"\r\n", b" \t\r\n"])
+def test_streaming_redactor_direct_noncolon_whitespace_is_byte_exact(whitespace):
+    payload = b'"dgx_token-value"' + whitespace + b"ERROR next-line"
+    expected = b'"[REDACTED]"' + whitespace + b"ERROR next-line"
+    whole = _redact_chunks([payload])
+    assert whole == expected
+
+    for split in range(len(payload) + 1):
+        assert _redact_chunks([payload[:split], payload[split:]]) == whole
+    assert _redact_chunks([bytes((byte,)) for byte in payload]) == whole
+
+
+@pytest.mark.parametrize(
+    ("key", "secret_values", "expected_key"),
+    [
+        (b"HF_ENDPOINT", (), b"HF_ENDPOINT"),
+        (b"API_KEY", (), b"API_KEY"),
+        (b"configured-secret", ("configured-secret",), b"[REDACTED]"),
+    ],
+)
+def test_streaming_redactor_json_key_mixed_whitespace_is_byte_exact(
+    key,
+    secret_values,
+    expected_key,
+):
+    whitespace = b" \t\r\n "
+    secret = b"mixed-whitespace-secret"
+    payload = b'{"' + key + b'"' + whitespace + b': "' + secret + b'"}'
+    expected = b'{"' + expected_key + b'"' + whitespace + b': "[REDACTED]"}'
+
+    def redact(chunks):
+        redactor = StreamingRedactor(secret_values=secret_values)
+        return b"".join(
+            [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
+        )
+
+    whole = redact([payload])
+    assert whole == expected
+    for split in range(len(payload) + 1):
+        assert redact([payload[:split], payload[split:]]) == whole
+    assert redact([bytes((byte,)) for byte in payload]) == whole
+
+
 def test_streaming_redactor_bounds_direct_key_and_whitespace_decisions():
     long_key_payload = b'{"DGX_' + b"A" * 1024 + b'": "long-key-secret"}'
     long_key_output = _redact_chunks(
@@ -1199,11 +1242,12 @@ def test_streaming_redactor_bounds_direct_key_and_whitespace_decisions():
 
     redactor = StreamingRedactor()
     prefix = redactor.feed(b'"dgx_token"')
-    released = redactor.feed(b" " * 1024)
-    assert released == b""
-    assert redactor._key_whitespace_count == 1024
+    whitespace = b" \t\r\n" * 256
+    released = redactor.feed(whitespace)
+    assert released == b'[REDACTED]"' + whitespace
+    assert len(redactor._key_whitespace) <= 128
     suffix = redactor.feed(b"plain") + redactor.finish()
-    assert prefix + released + suffix == b'"[REDACTED]"' + b" " * 1024 + b"plain"
+    assert prefix + released + suffix == b'"[REDACTED]"' + whitespace + b"plain"
 
 
 def test_streaming_redactor_never_restores_configured_secret_used_as_json_key():
@@ -1230,7 +1274,7 @@ def test_streaming_redactor_never_restores_configured_secret_used_as_json_key():
         (b"DGX_API_KEY", 33, (), b"DGX_API_KEY"),
         (b"API_KEY", 96, (), b"API_KEY"),
         (b"configured-secret", 33, ("configured-secret",), b"[REDACTED]"),
-        (b"HF_ENDPOINT", 4096, (), b"HF_ENDPOINT"),
+        (b"HF_ENDPOINT", 4096, (), b"[REDACTED]"),
     ],
 )
 def test_streaming_redactor_json_key_whitespace_is_unbounded_and_chunk_equivalent(
@@ -1264,7 +1308,8 @@ def test_streaming_redactor_json_key_whitespace_is_unbounded_and_chunk_equivalen
 
 def test_streaming_redactor_json_key_wait_state_is_strictly_bounded():
     redactor = StreamingRedactor()
-    prefix = b'{"HF_ENDPOINT"' + b" " * (16 * 1024)
+    whitespace = b" \t\r\n" * (4 * 1024)
+    prefix = b'{"HF_ENDPOINT"' + whitespace
 
     released = redactor.feed(prefix)
 
@@ -1273,10 +1318,10 @@ def test_streaming_redactor_json_key_wait_state_is_strictly_bounded():
         for value in vars(redactor).values()
         if isinstance(value, str)
     )
-    assert released == b'{"'
+    assert released == b'{"[REDACTED]"' + whitespace
     assert redactor._buffer == ""
     assert string_state_size <= 512
-    assert redactor._key_whitespace_count == 16 * 1024
+    assert len(redactor._key_whitespace) <= 128
 
     suffix = redactor.feed(b': "bounded-state-secret"}') + redactor.finish()
     output = released + suffix

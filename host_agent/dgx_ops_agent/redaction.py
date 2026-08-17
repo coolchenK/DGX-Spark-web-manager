@@ -9,6 +9,7 @@ from collections.abc import Iterable
 REDACTED = "[REDACTED]"
 _NORMAL_CARRY = 96
 _MAX_DIRECT_KEY_LENGTH = 256
+_MAX_KEY_WHITESPACE = 128
 _JSON_WHITESPACE = frozenset(" \t\r\n")
 _TOKEN_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-"
@@ -49,7 +50,7 @@ class StreamingRedactor:
         self._direct_text: str | None = ""
         self._direct_preservable = False
         self._direct_key_quote = ""
-        self._key_whitespace_count = 0
+        self._key_whitespace = ""
         self._finished = False
         secrets = tuple(value for value in secret_values if value)
         self._secret_pattern = (
@@ -233,7 +234,7 @@ class StreamingRedactor:
         if terminator == self._direct_key_quote:
             self._mode = "direct_key"
             self._quote = terminator
-            self._key_whitespace_count = 0
+            self._key_whitespace = ""
             return True
 
         self._emit_direct_text(output)
@@ -272,25 +273,32 @@ class StreamingRedactor:
             and self._buffer[whitespace_length] in _JSON_WHITESPACE
         ):
             whitespace_length += 1
-        self._key_whitespace_count += whitespace_length
+        whitespace = self._buffer[:whitespace_length]
         self._buffer = self._buffer[whitespace_length:]
+
+        if len(self._key_whitespace) + len(whitespace) > _MAX_KEY_WHITESPACE:
+            self._emit_direct_text(output, preserve=False)
+            output.extend((self._quote, self._key_whitespace, whitespace))
+            self._reset_direct(mode="key_colon")
+            return True
+        self._key_whitespace += whitespace
 
         if not self._buffer:
             if final:
                 self._emit_direct_text(output, preserve=False)
-                output.extend((self._quote, " " * self._key_whitespace_count))
+                output.extend((self._quote, self._key_whitespace))
                 self._reset_direct()
             return False
 
         if self._buffer[0] == ":":
             self._emit_direct_text(output, preserve=True)
-            output.extend((self._quote, " " * self._key_whitespace_count, ":"))
+            output.extend((self._quote, self._key_whitespace, ":"))
             self._buffer = self._buffer[1:]
             self._reset_direct(mode="assignment_value")
             return True
 
         self._emit_direct_text(output, preserve=False)
-        output.extend((self._quote, " " * self._key_whitespace_count))
+        output.extend((self._quote, self._key_whitespace))
         self._reset_direct()
         return True
 
@@ -348,7 +356,7 @@ class StreamingRedactor:
         self._direct_preservable = False
         self._direct_key_quote = ""
         self._quote = ""
-        self._key_whitespace_count = 0
+        self._key_whitespace = ""
 
     @staticmethod
     def _find_unescaped_quote(
