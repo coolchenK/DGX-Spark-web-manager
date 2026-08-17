@@ -16,6 +16,7 @@ from app.api.gateway import GatewayActivity, GatewayAuthError
 from app.api.gateway import router as gateway_router
 from app.api.huggingface import router as huggingface_router
 from app.api.inventory import router as inventory_router
+from app.api.ops_agent import router as ops_agent_router
 from app.api.providers import router as providers_router
 from app.api.settings import router as settings_router
 from app.api.system import router as system_router
@@ -36,6 +37,7 @@ from app.services.discovery import DiscoveryService
 from app.services.draft_models import DraftCompatibilityService
 from app.services.model_evidence import ModelEvidenceLoader
 from app.services.model_lifecycle import ModelLifecycleService
+from app.services.ops_agent import OpsAgentClient
 from app.services.providers import ProviderService
 from app.services.resource_estimator import ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilityService
@@ -156,6 +158,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         deployment_service=deployment_service,
         discovery_service=discovery_service,
     )
+    ops_agent_client = OpsAgentClient(
+        app_settings.ops_agent_socket,
+        app_settings.ops_agent_key_file,
+        connect_timeout_seconds=app_settings.ops_agent_connect_timeout_seconds,
+        read_timeout_seconds=app_settings.ops_agent_read_timeout_seconds,
+        output_limit_bytes=app_settings.ops_agent_output_limit_bytes,
+    )
 
     def download_and_discover(context, payload):
         result = huggingface_service.download_handler(context, payload)
@@ -216,6 +225,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.deployment_recommendation_service = deployment_recommendation_service
     app.state.diagnostic_service = diagnostic_service
     app.state.operation_executor = operation_executor
+    app.state.ops_agent_client = ops_agent_client
     app.state.gateway_activity = GatewayActivity()
     app.add_middleware(
         CORSMiddleware,
@@ -243,6 +253,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(audit_router)
     app.include_router(system_router)
     app.include_router(inventory_router)
+    app.include_router(ops_agent_router)
     app.include_router(tasks_router)
     app.include_router(huggingface_router)
     app.include_router(deployments_router)

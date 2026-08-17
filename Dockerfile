@@ -21,6 +21,7 @@ RUN groupadd --gid 10001 manager && useradd --uid 10001 --gid manager --create-h
 WORKDIR /app
 COPY pyproject.toml README.md alembic.ini ./
 COPY backend/ ./backend/
+COPY host_agent/ ./host_agent/
 COPY scripts/entrypoint.sh ./scripts/entrypoint.sh
 RUN python -m pip install . && chmod +x ./scripts/entrypoint.sh && mkdir -p /app/data && chown -R manager:manager /app
 COPY --from=frontend-builder --chown=manager:manager /build/frontend/dist ./frontend/dist
