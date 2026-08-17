@@ -1,5 +1,7 @@
 import json
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
@@ -326,3 +328,243 @@ def test_rotating_provider_key_clears_probe_state_and_never_echoes_secrets(
     audit_dump = json.dumps(authenticated_client.get("/api/audit").json())
     assert old_key not in listed_dump and new_key not in listed_dump
     assert old_key not in audit_dump and new_key not in audit_dump
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"base_url": "https://changed.example/v1"},
+        {"default_model": "changed-model"},
+        {"headers": {"X-Tenant": "changed"}},
+        {"timeout_seconds": 90},
+        {"enabled": False},
+    ],
+)
+def test_probe_affecting_provider_updates_invalidate_health(
+    authenticated_client, monkeypatch, patch
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": f"Invalidated {next(iter(patch))}",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "opaque.provider.key.123456",
+            "default_model": "ops-model",
+        },
+    )
+    provider_id = created.json()["id"]
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        provider.last_test_result = {"status": "healthy"}
+        provider.last_test_status = "healthy"
+        provider.last_tested_at = datetime.now(UTC)
+        initial_revision = provider.config_revision
+        db.commit()
+
+    response = authenticated_client.patch(f"/api/providers/{provider_id}", json=patch)
+
+    assert response.status_code == 200
+    assert response.json()["last_test_result"] == {}
+    assert response.json()["last_test_status"] is None
+    assert response.json()["last_tested_at"] is None
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        assert provider.config_revision == initial_revision + 1
+        assert provider.last_test_result == {}
+        assert provider.last_test_status is None
+        assert provider.last_tested_at is None
+
+
+def test_same_probe_configuration_patch_keeps_health_and_revision(
+    authenticated_client, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": "Unchanged provider",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "opaque.provider.key.123456",
+            "default_model": "ops-model",
+            "headers": {"X-Tenant": "same"},
+            "timeout_seconds": 60,
+        },
+    )
+    provider_id = created.json()["id"]
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        provider.last_test_result = {"status": "healthy"}
+        provider.last_test_status = "healthy"
+        provider.last_tested_at = datetime.now(UTC)
+        initial_revision = provider.config_revision
+        db.commit()
+
+    response = authenticated_client.patch(
+        f"/api/providers/{provider_id}",
+        json={
+            "base_url": "https://api.example.com/v1/",
+            "default_model": "ops-model",
+            "headers": {"X-Tenant": "same"},
+            "timeout_seconds": 60,
+            "enabled": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["last_test_status"] == "healthy"
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        assert provider.config_revision == initial_revision
+        assert provider.last_test_result == {"status": "healthy"}
+
+
+@pytest.mark.parametrize(
+    ("patch", "expected_field", "expected_value"),
+    [
+        ({"api_key": "new.invalid.opaque.key.654321"}, "encrypted_api_key", None),
+        (
+            {"base_url": "https://concurrent.example/v1"},
+            "base_url",
+            "https://concurrent.example/v1",
+        ),
+        ({"default_model": "concurrent-model"}, "default_model", "concurrent-model"),
+    ],
+)
+def test_stale_probe_cannot_overwrite_concurrent_provider_configuration(
+    authenticated_client, monkeypatch, patch, expected_field, expected_value
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    old_key = "old.concurrent.opaque.key.123456"
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": f"Concurrent {expected_field}",
+            "base_url": "https://api.example.com/v1",
+            "api_key": old_key,
+            "default_model": "ops-model",
+        },
+    )
+    provider_id = created.json()["id"]
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingProbe:
+        def list_models(self, provider: Provider) -> list[str]:
+            assert provider.default_model == "ops-model"
+            started.set()
+            assert release.wait(10)
+            return [provider.default_model]
+
+        def complete(self, _provider: Provider, _messages) -> AssistantTurn:
+            return AssistantTurn(action="answer", summary="stale healthy")
+
+    authenticated_client.app.state.provider_service.ops_provider_client = BlockingProbe()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            authenticated_client.post, f"/api/providers/{provider_id}/test"
+        )
+        assert started.wait(10)
+        updated = authenticated_client.patch(f"/api/providers/{provider_id}", json=patch)
+        assert updated.status_code == 200
+        release.set()
+        stale_response = future.result(timeout=10)
+
+    assert stale_response.status_code == 409
+    assert stale_response.json()["detail"] == "Provider configuration changed during test"
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        assert provider.last_test_result == {}
+        assert provider.last_test_status is None
+        assert provider.last_tested_at is None
+        assert provider.config_revision == 1
+        if expected_field == "encrypted_api_key":
+            decrypted = authenticated_client.app.state.secret_box.decrypt(
+                provider.encrypted_api_key
+            )
+            assert decrypted == patch["api_key"]
+        else:
+            assert getattr(provider, expected_field) == expected_value
+
+
+@pytest.mark.parametrize("stage", ["models", "chat"])
+def test_unexpected_provider_client_errors_bubble_without_persisting_failed_state(
+    authenticated_client, monkeypatch, stage
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": f"Unexpected {stage}",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "opaque.provider.key.123456",
+            "default_model": "ops-model",
+        },
+    )
+    provider_id = created.json()["id"]
+
+    class UnexpectedProbe:
+        def list_models(self, _provider: Provider) -> list[str]:
+            if stage == "models":
+                raise AttributeError("programming failure")
+            return ["ops-model"]
+
+        def complete(self, _provider: Provider, _messages) -> AssistantTurn:
+            raise TypeError("programming failure")
+
+    authenticated_client.app.state.provider_service.ops_provider_client = UnexpectedProbe()
+    transport = authenticated_client._transport
+    raise_server_exceptions = transport.raise_server_exceptions
+    transport.raise_server_exceptions = False
+    try:
+        response = authenticated_client.post(f"/api/providers/{provider_id}/test")
+    finally:
+        transport.raise_server_exceptions = raise_server_exceptions
+    assert response.status_code == 500
+
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        assert provider.last_test_result == {}
+        assert provider.last_test_status is None
+        assert provider.last_tested_at is None
+
+
+@pytest.mark.parametrize("stage", ["models", "chat"])
+def test_expected_provider_errors_return_structured_failure_and_persist(
+    authenticated_client, monkeypatch, stage
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": f"Expected {stage}",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "opaque.provider.key.123456",
+            "default_model": "ops-model",
+        },
+    )
+    provider_id = created.json()["id"]
+
+    class ExpectedFailureProbe:
+        def list_models(self, _provider: Provider) -> list[str]:
+            if stage == "models":
+                raise OpsProviderError("expected connection failure")
+            return ["ops-model"]
+
+        def complete(self, _provider: Provider, _messages) -> AssistantTurn:
+            raise OpsProviderError("expected chat failure")
+
+    authenticated_client.app.state.provider_service.ops_provider_client = (
+        ExpectedFailureProbe()
+    )
+    response = authenticated_client.post(f"/api/providers/{provider_id}/test")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    expected_section = "connection" if stage == "models" else "default_model"
+    assert response.json()[expected_section]["status"] == "failed"
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        assert provider.last_test_status == "failed"
+        assert provider.last_test_result == response.json()
+        assert provider.last_tested_at is not None

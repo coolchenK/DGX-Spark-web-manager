@@ -137,6 +137,15 @@ def upgrade() -> None:
             server_default=sa.text("'{}'"),
         ),
     )
+    op.add_column(
+        "providers",
+        sa.Column(
+            "config_revision",
+            sa.Integer(),
+            nullable=False,
+            server_default=sa.text("0"),
+        ),
+    )
     op.create_table(
         "ops_sessions",
         sa.Column("id", sa.String(36), nullable=False),
@@ -248,4 +257,5 @@ def downgrade() -> None:
     )
 
     with op.batch_alter_table("providers") as batch_op:
+        batch_op.drop_column("config_revision")
         batch_op.drop_column("last_test_result")

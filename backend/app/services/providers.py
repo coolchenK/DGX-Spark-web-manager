@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import re
 import socket
@@ -9,10 +10,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlparse, urlunparse
 
+from sqlalchemy import update as sql_update
 from sqlalchemy.orm import Session
 
 from app.models import Provider
 from app.security import SecretBox, mask_secret
+from app.services.provider_errors import OpsProviderError, ProviderConfigurationChanged
 
 if TYPE_CHECKING:
     from app.services.ops_provider import AssistantTurn
@@ -30,6 +33,9 @@ FORBIDDEN_CUSTOM_HEADERS = {
 MAX_SERIALIZED_TEST_STRING_CHARS = 500
 MAX_SERIALIZED_TEST_COLLECTION_ITEMS = 50
 MAX_SERIALIZED_TEST_DEPTH = 6
+PROBE_CONFIGURATION_FIELDS = frozenset(
+    {"base_url", "default_model", "headers", "timeout_seconds", "enabled"}
+)
 
 
 class OpsProviderProbe(Protocol):
@@ -221,12 +227,54 @@ class ProviderService:
         db.refresh(provider)
         return provider
 
-    def update_secret(self, provider: Provider, api_key: str) -> None:
-        encrypted_api_key = self.secret_box.encrypt(api_key)
-        provider.encrypted_api_key = encrypted_api_key
+    @staticmethod
+    def _invalidate_probe(provider: Provider) -> None:
         provider.last_test_result = {}
         provider.last_test_status = None
         provider.last_tested_at = None
+
+    def update(
+        self,
+        provider: Provider,
+        *,
+        values: dict[str, Any],
+        api_key: str | None = None,
+    ) -> None:
+        normalized = dict(values)
+        if "base_url" in normalized:
+            validate_provider_url(normalized["base_url"])
+            normalized["base_url"] = normalize_openai_base_url(normalized["base_url"])
+        if "headers" in normalized:
+            validate_custom_headers(normalized["headers"])
+        allowed_fields = PROBE_CONFIGURATION_FIELDS | {"name"}
+        if unsupported := set(normalized) - allowed_fields:
+            raise ValueError(f"Unsupported Provider fields: {', '.join(sorted(unsupported))}")
+
+        config_changed = any(
+            key in PROBE_CONFIGURATION_FIELDS and getattr(provider, key) != value
+            for key, value in normalized.items()
+        )
+        encrypted_api_key: str | None = None
+        if api_key is not None:
+            try:
+                current_api_key = self.secret_box.decrypt(provider.encrypted_api_key)
+            except ValueError:
+                current_api_key = None
+            if current_api_key is None or not hmac.compare_digest(current_api_key, api_key):
+                encrypted_api_key = self.secret_box.encrypt(api_key)
+                config_changed = True
+
+        for key, value in normalized.items():
+            if getattr(provider, key) != value:
+                setattr(provider, key, value)
+        if encrypted_api_key is not None:
+            provider.encrypted_api_key = encrypted_api_key
+        if config_changed:
+            self._invalidate_probe(provider)
+            provider.config_revision = Provider.config_revision + 1
+
+    def update_secret(self, provider: Provider, api_key: str) -> None:
+        self.update(provider, values={}, api_key=api_key)
 
     def serialize(self, provider: Provider) -> dict[str, Any]:
         api_key = self.secret_box.decrypt(provider.encrypted_api_key)
@@ -252,26 +300,44 @@ class ProviderService:
             "Authorization": f"Bearer {self.secret_box.decrypt(provider.encrypted_api_key)}",
         }
 
+    @staticmethod
+    def _probe_snapshot(provider: Provider) -> Provider:
+        return Provider(
+            id=provider.id,
+            name=provider.name,
+            base_url=provider.base_url,
+            default_model=provider.default_model,
+            encrypted_api_key=provider.encrypted_api_key,
+            timeout_seconds=provider.timeout_seconds,
+            headers=dict(provider.headers),
+            enabled=provider.enabled,
+            config_revision=provider.config_revision,
+        )
+
     def test(self, db: Session, provider: Provider) -> dict[str, Any]:
+        snapshot = self._probe_snapshot(provider)
+        provider_id = snapshot.id
+        config_revision = snapshot.config_revision
+        db.rollback()
         try:
-            models = self.ops_provider_client.list_models(provider)
-        except Exception as exc:
+            models = self.ops_provider_client.list_models(snapshot)
+        except OpsProviderError as exc:
             result = {
                 "status": "failed",
                 "connection": {
                     "status": "failed",
-                    "error": self._probe_error(provider, exc),
+                    "error": self._probe_error(snapshot, exc),
                 },
                 "default_model": {
                     "status": "not_tested",
-                    "model": provider.default_model,
+                    "model": snapshot.default_model,
                 },
             }
         else:
             connection = {"status": "healthy", "models_seen": len(models)}
             try:
                 self.ops_provider_client.complete(
-                    provider,
+                    snapshot,
                     [
                         {
                             "role": "system",
@@ -283,14 +349,14 @@ class ProviderService:
                         {"role": "user", "content": "Confirm this model can respond."},
                     ],
                 )
-            except Exception as exc:
+            except OpsProviderError as exc:
                 result = {
                     "status": "failed",
                     "connection": connection,
                     "default_model": {
                         "status": "failed",
-                        "model": provider.default_model,
-                        "error": self._probe_error(provider, exc),
+                        "model": snapshot.default_model,
+                        "error": self._probe_error(snapshot, exc),
                     },
                 }
             else:
@@ -299,12 +365,26 @@ class ProviderService:
                     "connection": connection,
                     "default_model": {
                         "status": "healthy",
-                        "model": provider.default_model,
+                        "model": snapshot.default_model,
                     },
                 }
-        provider.last_test_status = result["status"]
-        provider.last_test_result = result
-        provider.last_tested_at = datetime.now(UTC)
+        tested_at = datetime.now(UTC)
+        persisted = db.execute(
+            sql_update(Provider)
+            .where(
+                Provider.id == provider_id,
+                Provider.config_revision == config_revision,
+            )
+            .values(
+                last_test_status=result["status"],
+                last_test_result=result,
+                last_tested_at=tested_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if persisted.rowcount != 1:
+            db.rollback()
+            raise ProviderConfigurationChanged()
         db.commit()
         return result
 

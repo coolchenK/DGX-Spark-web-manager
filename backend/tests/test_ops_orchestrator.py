@@ -358,9 +358,10 @@ def test_fresh_database_upgrades_directly_to_head(tmp_path, monkeypatch):
         assert {"ops_sessions", "ops_messages", "ops_tool_runs"} <= set(
             inspector.get_table_names()
         )
-        assert "last_test_result" in {
+        provider_columns = {
             column["name"] for column in inspector.get_columns("providers")
         }
+        assert {"last_test_result", "config_revision"} <= provider_columns
         assert _foreign_key_ondelete(inspector, "deployments", "model_id") == "SET NULL"
         assert _foreign_key_ondelete(inspector, "operation_plans", "provider_id") == "SET NULL"
         assert (
@@ -483,9 +484,10 @@ def test_ops_session_migration_preserves_existing_provider_data(tmp_path, monkey
         assert not {"ops_sessions", "ops_messages", "ops_tool_runs"} & set(
             inspector.get_table_names()
         )
-        assert "last_test_result" not in {
+        provider_columns = {
             column["name"] for column in inspector.get_columns("providers")
         }
+        assert not {"last_test_result", "config_revision"} & provider_columns
     with database.engine.begin() as connection:
         connection.execute(
             text(
@@ -510,14 +512,19 @@ def test_ops_session_migration_preserves_existing_provider_data(tmp_path, monkey
         assert {"ops_sessions", "ops_messages", "ops_tool_runs"} <= set(
             inspector.get_table_names()
         )
-        assert "last_test_result" in {
+        provider_columns = {
             column["name"] for column in inspector.get_columns("providers")
         }
+        assert {"last_test_result", "config_revision"} <= provider_columns
         row = connection.execute(
-            text("SELECT name, last_test_result FROM providers WHERE id='existing-provider'")
+            text(
+                "SELECT name, last_test_result, config_revision FROM providers "
+                "WHERE id='existing-provider'"
+            )
         ).one()
         assert row.name == "Existing"
         assert row.last_test_result == "{}"
+        assert row.config_revision == 0
 
     command.downgrade(config, "20260816_0001")
     with database.engine.connect() as connection:
@@ -525,9 +532,10 @@ def test_ops_session_migration_preserves_existing_provider_data(tmp_path, monkey
         assert not {"ops_sessions", "ops_messages", "ops_tool_runs"} & set(
             inspector.get_table_names()
         )
-        assert "last_test_result" not in {
+        provider_columns = {
             column["name"] for column in inspector.get_columns("providers")
         }
+        assert not {"last_test_result", "config_revision"} & provider_columns
         assert _foreign_key_ondelete(inspector, "deployments", "model_id") is None
         assert _foreign_key_ondelete(inspector, "operation_plans", "provider_id") is None
         assert _foreign_key_ondelete(inspector, "operation_plans", "deployment_id") is None
@@ -542,8 +550,11 @@ def test_ops_session_migration_preserves_existing_provider_data(tmp_path, monkey
             inspector.get_table_names()
         )
         assert connection.execute(
-            text("SELECT last_test_result FROM providers WHERE id='existing-provider'")
-        ).scalar_one() == "{}"
+            text(
+                "SELECT last_test_result, config_revision FROM providers "
+                "WHERE id='existing-provider'"
+            )
+        ).one() == ("{}", 0)
         assert _foreign_key_ondelete(inspector, "deployments", "model_id") == "SET NULL"
         assert _foreign_key_ondelete(inspector, "operation_plans", "provider_id") == "SET NULL"
         assert (

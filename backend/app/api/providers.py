@@ -7,6 +7,7 @@ from sqlalchemy import select
 from app.audit import record_audit
 from app.dependencies import Admin, CsrfAdmin, DbSession
 from app.models import Provider
+from app.services.provider_errors import ProviderConfigurationChanged
 from app.services.providers import validate_custom_headers
 
 router = APIRouter(prefix="/api/providers", tags=["providers"])
@@ -27,7 +28,7 @@ class ProviderCreate(BaseModel):
 class ProviderUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     base_url: str | None = None
-    api_key: str | None = None
+    api_key: str | None = Field(default=None, min_length=1)
     default_model: str | None = None
     timeout_seconds: int | None = Field(default=None, ge=5, le=600)
     headers: dict[str, str] | None = None
@@ -78,15 +79,12 @@ def update_provider(
         raise HTTPException(status_code=404, detail="Provider not found")
     values = payload.model_dump(exclude_unset=True)
     api_key = values.pop("api_key", None)
-    if "base_url" in values:
-        from app.services.providers import normalize_openai_base_url, validate_provider_url
-
-        validate_provider_url(values["base_url"])
-        values["base_url"] = normalize_openai_base_url(values["base_url"])
-    for key, value in values.items():
-        setattr(provider, key, value)
-    if api_key:
-        request.app.state.provider_service.update_secret(provider, api_key)
+    try:
+        request.app.state.provider_service.update(
+            provider, values=values, api_key=api_key
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     record_audit(
         db,
         actor=str(admin["username"]),
@@ -108,7 +106,10 @@ def test_provider(
     provider = db.get(Provider, provider_id)
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
-    result = request.app.state.provider_service.test(db, provider)
+    try:
+        result = request.app.state.provider_service.test(db, provider)
+    except ProviderConfigurationChanged as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     record_audit(
         db,
         actor=str(admin["username"]),

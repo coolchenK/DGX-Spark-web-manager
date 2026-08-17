@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, Protocol
 
@@ -17,10 +16,15 @@ from pydantic import (
 
 from app.models import Provider
 from app.security import SecretBox
+from app.services.provider_errors import (
+    OpsProviderError,
+)
+from app.services.provider_errors import (
+    sanitize_provider_error as _sanitize_error,
+)
 from app.services.providers import PinnedProviderEndpoint, resolve_provider_endpoint
 
 MAX_PROVIDER_RESPONSE_BYTES = 256 * 1024
-MAX_PROVIDER_ERROR_CHARS = 500
 MAX_REPAIR_MESSAGES = 8
 MAX_REPAIR_MESSAGE_CHARS = 2400
 MAX_REPAIR_TOTAL_CHARS = 16_000
@@ -113,12 +117,6 @@ class AssistantTurn(BaseModel):
         return self
 
 
-class OpsProviderError(RuntimeError):
-    def __init__(self, detail: str):
-        self.detail = _sanitize_error(detail)
-        super().__init__(self.detail)
-
-
 class _IncompleteProviderResponse(ValueError):
     pass
 
@@ -128,24 +126,6 @@ class HttpClientFactory(Protocol):
 
 
 EndpointResolver = Callable[[str], PinnedProviderEndpoint]
-
-_SECRET_PATTERNS = (
-    re.compile(r"(?i)authorization\s*:\s*bearer\s+[^\s,;]+"),
-    re.compile(r"(?i)(?:api[_-]?key|token)\s*[=:]\s*[^\s,;]+"),
-    re.compile(r"\b(?:sk|hf)_[A-Za-z0-9_-]{8,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
-)
-
-
-def _sanitize_error(value: object, *, known_secret: str | None = None) -> str:
-    text = str(value)
-    if known_secret:
-        text = text.replace(known_secret, "[REDACTED]")
-    for pattern in _SECRET_PATTERNS:
-        text = pattern.sub("[REDACTED]", text)
-    text = " ".join(text.replace("\x00", " ").split())
-    return text[:MAX_PROVIDER_ERROR_CHARS] or "Provider request failed"
-
 
 def _bounded_repair_content(value: str, limit: int) -> str:
     if len(value) <= limit:
@@ -334,8 +314,7 @@ class OpsProviderClient:
             raise OpsProviderError(
                 _sanitize_error(exc.detail, known_secret=api_key)
             ) from None
-        except Exception as exc:
-            # This is the Provider transport boundary; every surfaced error must be redacted.
+        except (httpx.HTTPError, OSError, ValueError) as exc:
             detail = _sanitize_error(exc, known_secret=api_key)
             raise OpsProviderError(f"Provider request failed: {detail}") from None
 

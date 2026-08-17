@@ -109,6 +109,7 @@ class Provider(TimestampMixin, Base):
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=60)
     headers: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    config_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_test_status: Mapped[str | None] = mapped_column(String(32))
     last_test_result: Mapped[dict[str, Any]] = mapped_column(
         MutableDict.as_mutable(JSON), default=dict, server_default="{}"
