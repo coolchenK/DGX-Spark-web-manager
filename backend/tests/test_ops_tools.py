@@ -529,8 +529,9 @@ def test_camel_case_credentials_are_redacted_but_public_metrics_are_preserved(
     assert result.output["passwordRotation"] == "pending"
 
 
+@pytest.mark.parametrize("short_secret", ["a", "ab"])
 def test_short_provider_secret_fails_closed_without_calling_agent(
-    database: Database, secret_box: SecretBox
+    database: Database, secret_box: SecretBox, short_secret: str
 ) -> None:
     with database.session_factory() as db:
         db.add(
@@ -538,7 +539,7 @@ def test_short_provider_secret_fails_closed_without_calling_agent(
                 name="short",
                 base_url="https://short.example/v1",
                 default_model="model",
-                encrypted_api_key=secret_box.encrypt("a"),
+                encrypted_api_key=secret_box.encrypt(short_secret),
             )
         )
         db.commit()
@@ -550,6 +551,130 @@ def test_short_provider_secret_fails_closed_without_calling_agent(
     ):
         registry.execute(ReadOnlyToolRequest(name="manager.summary", arguments={}))
     assert agent.calls == []
+
+
+@pytest.mark.parametrize(
+    "credential_key",
+    [
+        "X-Auth",
+        "X-Authorization",
+        "xAuth",
+        "xAuthorization",
+        "MY_CUSTOM_AUTH",
+        "MY_CUSTOM_AUTHORIZATION",
+    ],
+)
+def test_auth_suffix_credentials_are_redacted_in_keys_and_assignments(
+    database: Database,
+    secret_box: SecretBox,
+    credential_key: str,
+) -> None:
+    registry = OpsToolRegistry(
+        FakeAgent(
+            {
+                "status": "succeeded",
+                credential_key: "structured-auth-secret",
+                "log": f"{credential_key}=logged-auth-secret",
+                "author": "kept",
+                "authors": "kept",
+            }
+        ),
+        database.session_factory,
+        secret_box,
+    )
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = result.model_dump_json()
+
+    assert "structured-auth-secret" not in dumped
+    assert "logged-auth-secret" not in dumped
+    assert result.output["author"] == "kept"
+    assert result.output["authors"] == "kept"
+
+
+def test_short_known_secret_boundaries_preserve_words_and_redact_tokens_and_keys(
+    database: Database, secret_box: SecretBox
+) -> None:
+    for index, secret in enumerate(("ata", "model", "active", "healthy")):
+        with database.session_factory() as db:
+            db.add(
+                Provider(
+                    name=f"boundary-{index}",
+                    base_url=f"https://boundary-{index}.example/v1",
+                    default_model="online-model",
+                    encrypted_api_key=secret_box.encrypt(secret),
+                )
+            )
+            db.commit()
+    registry = OpsToolRegistry(FakeAgent(), database.session_factory, secret_box)
+
+    summary = registry.execute(ReadOnlyToolRequest(name="manager.summary", arguments={}))
+    assert "models" in summary.output
+    assert "database" in summary.output["system"]
+    assert "active_tasks" in summary.output["system"]
+    assert "healthy" in summary.output["providers"]
+
+    registry.agent = FakeAgent(
+        {
+            "status": "succeeded",
+            "scalar": "model",
+            "log": "ata model active healthy",
+            "ata": "secret-key-name",
+            "database": "preserved",
+            "models": "preserved",
+            "active_tasks": "preserved",
+            "healthy_count": "preserved",
+        }
+    )
+    agent_result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = agent_result.model_dump_json()
+    assert agent_result.output["scalar"] == "[REDACTED]"
+    assert agent_result.output["log"] == "[REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+    assert "ata" not in agent_result.output
+    for key in ("database", "models", "active_tasks", "healthy_count"):
+        assert key in agent_result.output
+    assert "secret-key-name" in dumped
+
+
+def test_single_pass_known_secret_replacement_does_not_mutate_redaction_marker(
+    database: Database, secret_box: SecretBox
+) -> None:
+    with database.session_factory() as db:
+        db.add_all(
+            [
+                Provider(
+                    name="red",
+                    base_url="https://red.example/v1",
+                    default_model="model",
+                    encrypted_api_key=secret_box.encrypt("RED"),
+                ),
+                Provider(
+                    name="act",
+                    base_url="https://act.example/v1",
+                    default_model="model",
+                    encrypted_api_key=secret_box.encrypt("ACT"),
+                ),
+            ]
+        )
+        db.commit()
+    registry = OpsToolRegistry(
+        FakeAgent(
+            {
+                "status": "failed",
+                "output": "api_key=RED",
+                "error": "token=ACT",
+            }
+        ),
+        database.session_factory,
+        secret_box,
+    )
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+
+    assert result.output["output"] == "[REDACTED]"
+    assert result.output["error"] == "[REDACTED]"
+    assert result.error == "[REDACTED]"
+    assert result.model_dump_json().count("[REDACTED]") == 3
 
 
 def test_non_credential_custom_header_is_not_collected_as_a_secret(
@@ -566,9 +691,7 @@ def test_non_credential_custom_header_is_not_collected_as_a_secret(
             )
         )
         db.commit()
-    agent = FakeAgent(
-        {"status": "succeeded", "output": "database status available for tenant a"}
-    )
+    agent = FakeAgent({"status": "succeeded", "output": "database status available for tenant a"})
     registry = OpsToolRegistry(agent, database.session_factory, secret_box)
 
     result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
@@ -644,9 +767,7 @@ def test_manager_database_failures_use_a_generic_tool_execution_error(
 def test_credential_redaction_preserves_following_non_secret_query_parameters(
     database: Database, secret_box: SecretBox
 ) -> None:
-    agent = FakeAgent(
-        {"status": "succeeded", "output": "token=opaque-query&mode=read"}
-    )
+    agent = FakeAgent({"status": "succeeded", "output": "token=opaque-query&mode=read"})
     registry = OpsToolRegistry(agent, database.session_factory, secret_box)
 
     result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
@@ -684,9 +805,7 @@ def test_gateway_aggregates_use_the_requested_time_window(
     registry = OpsToolRegistry(FakeAgent(), database.session_factory, secret_box)
 
     result = registry.execute(
-        ReadOnlyToolRequest(
-            name="manager.gateway", arguments={"minutes": 60, "limit": 10}
-        )
+        ReadOnlyToolRequest(name="manager.gateway", arguments={"minutes": 60, "limit": 10})
     )
 
     assert result.output["total_requests"] == 1
@@ -721,9 +840,7 @@ def test_gateway_uses_one_aggregate_and_one_recent_metric_query(
     try:
         registry = OpsToolRegistry(FakeAgent(), database.session_factory, secret_box)
         result = registry.execute(
-            ReadOnlyToolRequest(
-                name="manager.gateway", arguments={"minutes": 60, "limit": 5}
-            )
+            ReadOnlyToolRequest(name="manager.gateway", arguments={"minutes": 60, "limit": 5})
         )
     finally:
         event.remove(database.engine, "before_cursor_execute", capture_statement)
@@ -758,9 +875,7 @@ def test_manager_tasks_truncates_large_lobs_in_sql_and_keeps_recent_log_tail(
     event.listen(database.engine, "before_cursor_execute", capture_statement)
     try:
         registry = OpsToolRegistry(FakeAgent(), database.session_factory, secret_box)
-        result = registry.execute(
-            ReadOnlyToolRequest(name="manager.tasks", arguments={"limit": 5})
-        )
+        result = registry.execute(ReadOnlyToolRequest(name="manager.tasks", arguments={"limit": 5}))
     finally:
         event.remove(database.engine, "before_cursor_execute", capture_statement)
 
@@ -786,8 +901,7 @@ def test_final_tool_result_including_wrapper_stays_within_30000_characters(
     agent = FakeAgent(
         {
             "status": agent_status,
-            "output": ('quote=" slash=\\ 中文' * 5000)
-            + " api_key=opaque-boundary-secret",
+            "output": ('quote=" slash=\\ 中文' * 5000) + " api_key=opaque-boundary-secret",
             "error": (
                 "password=opaque-error-secret " + ("错误" * 1000)
                 if agent_status == "failed"

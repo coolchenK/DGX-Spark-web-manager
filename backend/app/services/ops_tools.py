@@ -5,6 +5,7 @@ import math
 import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -58,6 +59,7 @@ _TRUNCATED = "[truncated]"
 _REDACTED = "[REDACTED]"
 _SENSITIVE_KEY_NAMES = frozenset(
     {
+        "auth",
         "authorization",
         "api_key",
         "apikey",
@@ -76,6 +78,8 @@ _SENSITIVE_KEY_NAMES = frozenset(
     }
 )
 _SENSITIVE_KEY_SUFFIXES = (
+    "_auth",
+    "_authorization",
     "_api_key",
     "_apikey",
     "_token",
@@ -84,11 +88,55 @@ _SENSITIVE_KEY_SUFFIXES = (
     "_secret",
     "_secret_key",
 )
+_MANAGER_PUBLIC_KEYS = frozenset(
+    {
+        "active_tasks",
+        "available",
+        "average_latency_ms",
+        "cancel_requested",
+        "completed_bytes",
+        "completion_tokens",
+        "created_at",
+        "database",
+        "deployments",
+        "enabled",
+        "endpoint",
+        "error",
+        "error_rate",
+        "error_truncated",
+        "failed_requests",
+        "finished_at",
+        "healthy",
+        "id",
+        "latency_ms",
+        "log",
+        "log_truncated",
+        "model",
+        "models",
+        "progress",
+        "prompt_tokens",
+        "providers",
+        "recent",
+        "running",
+        "started_at",
+        "status",
+        "status_code",
+        "system",
+        "tasks",
+        "title",
+        "total",
+        "total_bytes",
+        "total_requests",
+        "type",
+        "updated_at",
+        "window_minutes",
+    }
+)
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])(?P<quote>[\"']?)"
     r"(?P<label>[A-Za-z0-9][A-Za-z0-9_-]{0,127})(?P=quote)\s*[:=]\s*"
     r"(?:(?:bearer|basic)\s+)?"
-    r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:\[REDACTED\]|[^\s,;&}\[\]]+)+)''',
+    r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:\[REDACTED\]|[^\s,;&}\[\]]+)+)""",
     re.IGNORECASE,
 )
 _ACRONYM_BOUNDARY_PATTERN = re.compile(r"([A-Z]+)([A-Z][a-z])")
@@ -152,7 +200,11 @@ class OpsToolRegistry:
         else:
             try:
                 output = self._execute_manager_tool(request)
-                sanitized_output = sanitize_and_bound(output, secrets=secrets)
+                sanitized_output = sanitize_and_bound(
+                    output,
+                    secrets=secrets,
+                    trusted_keys=_MANAGER_PUBLIC_KEYS,
+                )
                 return _fit_tool_result(
                     ToolResult(
                         name=name,
@@ -243,9 +295,7 @@ class OpsToolRegistry:
         if not plaintext:
             raise ToolExecutionError("configured secrets could not be loaded safely")
         if len(plaintext) < MIN_EMBEDDED_SECRET_CHARS:
-            raise ToolExecutionError(
-                "configured secrets are too short to sanitize safely"
-            )
+            raise ToolExecutionError("configured secrets are too short to sanitize safely")
         values.add(plaintext)
 
     def _execute_manager_tool(self, request: ReadOnlyToolRequest) -> dict[str, Any]:
@@ -324,9 +374,9 @@ class OpsToolRegistry:
             ),
             MAX_TASK_LOG_CHARS,
         ).label("log_excerpt")
-        error_excerpt = func.substr(
-            TaskRecord.error, 1, MAX_TASK_ERROR_CHARS
-        ).label("error_excerpt")
+        error_excerpt = func.substr(TaskRecord.error, 1, MAX_TASK_ERROR_CHARS).label(
+            "error_excerpt"
+        )
         rows = db.execute(
             select(
                 TaskRecord.id,
@@ -367,9 +417,7 @@ class OpsToolRegistry:
                     ),
                     "error_truncated": bool(row.error_truncated),
                     "log": (
-                        f"{_TRUNCATED}\n{row.log_excerpt}"
-                        if row.log_truncated
-                        else row.log_excerpt
+                        f"{_TRUNCATED}\n{row.log_excerpt}" if row.log_truncated else row.log_excerpt
                     ),
                     "log_truncated": bool(row.log_truncated),
                     "created_at": row.created_at,
@@ -387,9 +435,7 @@ class OpsToolRegistry:
         aggregate = db.execute(
             select(
                 func.count(RequestMetric.id).label("total"),
-                func.sum(
-                    case((RequestMetric.status_code >= 400, 1), else_=0)
-                ).label("failed"),
+                func.sum(case((RequestMetric.status_code >= 400, 1), else_=0)).label("failed"),
                 func.avg(RequestMetric.latency_ms).label("average_latency"),
             ).where(RequestMetric.created_at >= cutoff)
         ).one()
@@ -435,9 +481,7 @@ def _is_sensitive_key(value: str) -> bool:
     normalized = re.sub(r"[-\s]+", "_", value).strip("_")
     normalized = _ACRONYM_BOUNDARY_PATTERN.sub(r"\1_\2", normalized)
     normalized = _CAMEL_BOUNDARY_PATTERN.sub(r"\1_\2", normalized).casefold()
-    return normalized in _SENSITIVE_KEY_NAMES or normalized.endswith(
-        _SENSITIVE_KEY_SUFFIXES
-    )
+    return normalized in _SENSITIVE_KEY_NAMES or normalized.endswith(_SENSITIVE_KEY_SUFFIXES)
 
 
 def _redact_credential_assignment(match: re.Match[str]) -> str:
@@ -446,18 +490,30 @@ def _redact_credential_assignment(match: re.Match[str]) -> str:
     return match.group(0)
 
 
+@lru_cache(maxsize=128)
+def _known_secret_pattern(secrets: tuple[str, ...]) -> re.Pattern[str] | None:
+    embedded = [re.escape(secret) for secret in secrets if len(secret) >= 8]
+    bounded = [
+        re.escape(secret) for secret in secrets if MIN_EMBEDDED_SECRET_CHARS <= len(secret) < 8
+    ]
+    alternatives = embedded
+    if bounded:
+        alternatives.append(rf"(?<![A-Za-z0-9_])(?:{'|'.join(bounded)})(?![A-Za-z0-9_])")
+    return re.compile("|".join(alternatives)) if alternatives else None
+
+
+def _replace_known_secrets(value: str, secrets: tuple[str, ...]) -> str:
+    if value in secrets:
+        return _REDACTED
+    pattern = _known_secret_pattern(secrets)
+    if pattern is None:
+        return value
+    return _REDACTED.join(pattern.sub(_REDACTED, segment) for segment in value.split(_REDACTED))
+
+
 def _sanitize_string(value: str, secrets: tuple[str, ...], limit: int) -> str:
-    sanitized = value
-    unique_secrets = sorted({secret for secret in secrets if secret}, key=len, reverse=True)
-    if sanitized in unique_secrets:
-        sanitized = _REDACTED
-    for secret in unique_secrets:
-        if len(secret) < MIN_EMBEDDED_SECRET_CHARS:
-            continue
-        sanitized = sanitized.replace(secret, _REDACTED)
-    sanitized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
-        _redact_credential_assignment, sanitized
-    )
+    sanitized = _replace_known_secrets(value, secrets)
+    sanitized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(_redact_credential_assignment, sanitized)
     if len(sanitized) <= limit:
         return sanitized
     marker = f"\n{_TRUNCATED}\n"
@@ -467,7 +523,12 @@ def _sanitize_string(value: str, secrets: tuple[str, ...], limit: int) -> str:
     return f"{sanitized[:head]}{marker}{sanitized[-tail:] if tail else ''}"
 
 
-def _sanitize_value(value: Any, secrets: tuple[str, ...], depth: int = 0) -> Any:
+def _sanitize_value(
+    value: Any,
+    secrets: tuple[str, ...],
+    trusted_keys: frozenset[str],
+    depth: int = 0,
+) -> Any:
     if depth >= MAX_STRUCTURE_DEPTH:
         return _TRUNCATED
     if value is None or isinstance(value, (bool, int)):
@@ -484,15 +545,22 @@ def _sanitize_value(value: Any, secrets: tuple[str, ...], depth: int = 0) -> Any
             if index >= MAX_COLLECTION_ITEMS:
                 result["truncated"] = True
                 break
-            key_text = _sanitize_string(str(key), secrets, 256)
-            if _is_sensitive_key(key_text):
+            raw_key = str(key)
+            if raw_key in trusted_keys:
+                key_text = raw_key
+            elif _is_sensitive_key(raw_key):
                 result[f"redacted_field_{index}"] = _REDACTED
+                continue
             else:
-                result[key_text] = _sanitize_value(item, secrets, depth + 1)
+                key_text = _sanitize_string(raw_key, secrets, 256)
+                if key_text != raw_key:
+                    key_text = f"redacted_key_{index}"
+            result[key_text] = _sanitize_value(item, secrets, trusted_keys, depth + 1)
         return result
     if isinstance(value, (list, tuple)):
         result = [
-            _sanitize_value(item, secrets, depth + 1) for item in value[:MAX_COLLECTION_ITEMS]
+            _sanitize_value(item, secrets, trusted_keys, depth + 1)
+            for item in value[:MAX_COLLECTION_ITEMS]
         ]
         if len(value) > MAX_COLLECTION_ITEMS:
             result.append(_TRUNCATED)
@@ -525,9 +593,7 @@ def _fit_tool_result(result: ToolResult) -> ToolResult:
         2,
         MAX_TOOL_RESULT_CHARS - len(empty.model_dump_json()) + 2,
     )
-    fitted = result.model_copy(
-        update={"output": _bound_serialized(result.output, output_budget)}
-    )
+    fitted = result.model_copy(update={"output": _bound_serialized(result.output, output_budget)})
     if len(fitted.model_dump_json()) <= MAX_TOOL_RESULT_CHARS:
         return fitted
 
@@ -541,11 +607,15 @@ def sanitize_and_bound(
     output: Mapping[str, Any],
     *,
     secrets: tuple[str, ...] = (),
+    trusted_keys: frozenset[str] = frozenset(),
     limit: int = MAX_TOOL_OUTPUT_CHARS,
 ) -> dict[str, Any]:
     if not isinstance(output, Mapping):
         raise ToolExecutionError("tool output must be an object")
-    sanitized = _sanitize_value(output, secrets)
+    normalized_secrets = tuple(
+        sorted({secret for secret in secrets if secret}, key=lambda item: (-len(item), item))
+    )
+    sanitized = _sanitize_value(output, normalized_secrets, trusted_keys)
     if not isinstance(sanitized, dict):  # pragma: no cover - Mapping always maps to dict
         raise ToolExecutionError("tool output could not be sanitized")
     return _bound_serialized(sanitized, limit)
