@@ -18,6 +18,58 @@ before the Docker API creates a runtime container. This prevents container-local
 
 The manager container does not replace or wrap inference containers. Runtime adapters create normal NVIDIA containers using the same host GPU and model caches.
 
+## Host Operations Agent
+
+The non-root manager container does not implement the privileged host command execution path.
+Privileged diagnostics and approved repairs cross a separate Host Operations Agent trust boundary:
+
+```text
+browser -> authenticated manager API -> signed Unix socket request -> root Host Agent
+```
+
+The manager receives the Agent key through the read-only
+`/run/secrets/ops-agent.key` mount and connects to
+`/run/dgx-spark-manager/ops-agent.sock`. The socket is local to the host and is never exposed as a
+TCP listener. The container runs with its normal non-root UID plus the numeric `OPS_AGENT_GID`,
+which must match the host `dgx-spark-ops` group. The root Agent alone owns process creation and host
+state changes.
+
+Protocol version 1 uses bounded length-prefixed JSON and HMAC-SHA256 authentication. Every request
+has a UUID `request_id`, timestamp, and random nonce. The Agent verifies the signature and timestamp
+before atomically consuming the nonce, so expired, future, replayed, malformed, or oversized
+requests fail before dispatch. Every response is signed and bound to the original `request_id`; the
+manager rejects stale, mismatched, malformed, or unsigned responses.
+
+The Agent policy exposes exactly eleven structured read tools: `host.memory`, `host.disk`,
+`host.gpu`, `host.ports`, `host.processes`, `docker.list`, `docker.inspect`, `docker.logs`,
+`docker.stats`, `systemd.status`, and `systemd.journal`. They use fixed absolute executables and
+validated selectors and can run automatically during diagnosis. `shell.execute` is a separate
+action and is rejected unless the request carries approval metadata from an administrator-approved
+`OperationPlan`. Shell execution uses `/bin/bash --noprofile --norc -c` with a fixed safe `PATH`, a
+small environment allowlist, bounded command/cwd/timeout values, and no inherited manager or Agent
+secrets.
+
+Commands execute as durable asynchronous Agent jobs. Output is UTF-8 normalized, streamed through
+secret redaction, retained within a byte limit, and addressed by absolute `output_offset` and
+`truncated_before` values so polling does not duplicate output. Timeout and cancellation terminate
+the command process group with a bounded TERM/KILL sequence. Atomic root-only metadata records
+process identity and a private recovery token; on restart the Agent revalidates `/proc` identity and
+uses pidfds before terminating an interrupted job. The systemd service uses
+`KillMode=control-group` as the final service-restart containment boundary.
+
+The Agent is installed as a root systemd socket-activated service. The socket is
+`root:dgx-spark-ops 0660`, the shared key is `root:dgx-spark-ops 0640`, and the initialized job
+directory is `root:root 0700`. The service runs as root with `NoNewPrivileges=true`, a private
+temporary directory, and `UMask=0027`.
+
+`scripts/install-ops-agent.sh` is read-only unless passed `--apply`. Apply accepts only ARM64,
+preserves a valid existing key and job history, stages package and unit replacements, activates the
+socket, and completes a signed `agent.health` probe. A failed transaction restores the previous
+package, units, and systemd state. `scripts/uninstall-ops-agent.sh` also previews by default; apply
+removes the package and units but preserves the key and jobs. Physical deletion requires the
+explicit `--purge-key` or `--purge-jobs` flag and the exact interactive confirmation shown by the
+uninstaller.
+
 ## Backend Domains
 
 | Domain | Responsibility |
@@ -136,6 +188,19 @@ administrator-approved spec against current evidence, capabilities, and resource
 Diagnostic AI providers receive a bounded snapshot of real system values and tail logs after secret
 redaction. Returned JSON is reduced to known fields. Unknown operations remain visible with
 `executable=false`; the executor never evaluates text or invokes a shell.
+
+The administrator-only `GET /api/ops-agent/health` endpoint reports only `ok`, `unavailable`, or
+`error`, plus protocol version when healthy. It does not return socket paths, key material, remote
+error details, commands, or job output.
+
+## DGX Spark Acceptance
+
+Acceptance on 2026-08-17 used an `aarch64` DGX Spark host. The Linux installer suite passed all 53
+tests; preview made no writes, and apply completed a signed protocol-v1 health check. Runtime modes
+were verified as socket `0660`, key `0640`, and jobs `0700`. Structured reads, approved Shell,
+streaming redaction, cancellation, and restart recovery passed. The ARM64 manager image built
+natively, and its non-root Compose container reached the Agent health endpoint through the local
+socket.
 
 ## Frontend
 

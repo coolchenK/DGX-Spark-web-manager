@@ -19,6 +19,154 @@ sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)/" .env
 docker compose up -d --force-recreate
 ```
 
+## Host Operations Agent
+
+Start with the public manager health check, then use an existing administrator cookie jar for the
+admin-only Agent health endpoint:
+
+```bash
+curl -fsS http://127.0.0.1:3000/api/health
+curl -fsS -b ./admin.cookies http://127.0.0.1:3000/api/ops-agent/health
+```
+
+The second response is intentionally limited to a safe status and protocol version. A normal shell
+request without an approved Operation Plan returns `approval_required`; this is policy enforcement,
+not an Agent outage.
+
+Check socket activation and bounded service logs on the host:
+
+```bash
+sudo systemctl status dgx-spark-ops-agent.socket dgx-spark-ops-agent.service --no-pager
+sudo journalctl -u dgx-spark-ops-agent.socket -u dgx-spark-ops-agent.service -n 200 --no-pager
+sudo stat -c '%U:%G %a %n' \
+  /run/dgx-spark-manager/ops-agent.sock \
+  /etc/dgx-spark-manager/ops-agent.key \
+  /var/lib/dgx-spark-ops-agent/jobs
+```
+
+After the Agent has initialized, the expected values are:
+
+```text
+root:dgx-spark-ops 660 /run/dgx-spark-manager/ops-agent.sock
+root:dgx-spark-ops 640 /etc/dgx-spark-manager/ops-agent.key
+root:root          700 /var/lib/dgx-spark-ops-agent/jobs
+```
+
+Never make the socket world-writable with `chmod 666`, expose it through TCP, print the key, or paste
+raw job metadata into a ticket. Those actions bypass the intended local group boundary or disclose
+sensitive diagnostic output.
+
+### Group GID or socket permission mismatch
+
+The Compose group must use the host group's numeric GID. Compare the host value, `.env`, and the
+running container:
+
+```bash
+getent group dgx-spark-ops
+grep '^OPS_AGENT_GID=' .env
+docker compose exec manager id
+docker compose exec manager stat -c '%G %a %n' /run/dgx-spark-manager/ops-agent.sock
+```
+
+If the values differ, update only `OPS_AGENT_GID` to the numeric GID from `getent`, then recreate the
+manager so supplementary groups are recalculated:
+
+```bash
+ops_gid="$(getent group dgx-spark-ops | cut -d: -f3)"
+sed -i "s/^OPS_AGENT_GID=.*/OPS_AGENT_GID=$ops_gid/" .env
+docker compose up -d --force-recreate manager
+```
+
+If the group and GID match but the socket mode or owner does not, do not loosen its permissions.
+Restore the installed unit and let socket activation recreate it:
+
+```bash
+sudo ./scripts/install-ops-agent.sh --apply
+sudo systemctl restart dgx-spark-ops-agent.socket
+sudo systemctl restart dgx-spark-ops-agent.service
+```
+
+### Key mismatch or invalid signed response
+
+Do not inspect the key with `cat`, shell tracing, or an environment variable. Verify metadata only:
+
+```bash
+sudo stat -c '%U:%G %a %s %n' /etc/dgx-spark-manager/ops-agent.key
+docker compose exec manager stat -c '%G %a %s %n' /run/secrets/ops-agent.key
+```
+
+The host key must be a regular, non-symlink file owned by `root:dgx-spark-ops` with mode `0640`.
+Reapplying the installer is idempotent and preserves a valid key and existing jobs. Recreate the
+manager afterward so a file bind mount and the client's cached key both use the current inode:
+
+```bash
+sudo ./scripts/install-ops-agent.sh --apply
+docker compose up -d --force-recreate manager
+curl -fsS -b ./admin.cookies http://127.0.0.1:3000/api/ops-agent/health
+```
+
+The installer performs its own signed `agent.health` probe before it succeeds, independently of the
+manager container.
+
+### Agent jobs, timeouts, and restart recovery
+
+Agent job metadata and bounded redacted output are stored together at:
+
+```text
+/var/lib/dgx-spark-ops-agent/jobs/<job-id>.json
+```
+
+The directory is root-only and files are mode `0600`. Inspect status through the panel or manager
+API first. If a job remains running after its configured timeout, restart the Agent once and check
+recovery plus service logs:
+
+```bash
+sudo systemctl restart dgx-spark-ops-agent.service
+sudo journalctl -u dgx-spark-ops-agent.service -n 200 --no-pager
+sudo find /var/lib/dgx-spark-ops-agent/jobs -maxdepth 1 -type f \
+  -name '*.json' -printf '%u:%g %m %f\n'
+```
+
+Restart recovery validates process identity before signalling interrupted work; systemd
+`KillMode=control-group` contains remaining service processes. Do not manually kill a PID copied
+from a metadata file because PID reuse can target an unrelated process.
+
+Structured read tools may use up to 15 seconds, followed by bounded termination and completion
+grace. Keep `DGX_OPS_AGENT_READ_TIMEOUT_SECONDS` at the default 30 seconds or above the complete
+server-side budget. A lower client timeout can report `unavailable` while the Agent is still safely
+finishing or cancelling the read job. After changing it, recreate the manager container.
+
+### Reinstall, rollback, and physical purge
+
+Preview both lifecycle operations before changing the host:
+
+```bash
+./scripts/install-ops-agent.sh
+./scripts/uninstall-ops-agent.sh
+```
+
+Install apply is transactional and preserves the key and job history. A failed apply attempts to
+restore the previous package, units, and systemd state. Normal uninstall also preserves the key and
+jobs so rollback or reinstall retains authentication and diagnostics:
+
+```bash
+sudo ./scripts/uninstall-ops-agent.sh --apply
+sudo ./scripts/install-ops-agent.sh --apply
+```
+
+Only use the purge flags when physical deletion is intended. Each flag requires a separate exact
+interactive confirmation:
+
+```bash
+# Type PURGE OPS AGENT JOBS when prompted.
+sudo ./scripts/uninstall-ops-agent.sh --apply --purge-jobs
+# Type PURGE OPS AGENT KEY when prompted.
+sudo ./scripts/uninstall-ops-agent.sh --apply --purge-key
+```
+
+Purging the key requires recreating the manager after reinstall so it mounts the newly generated
+key. Purging jobs permanently deletes their metadata and retained redacted output.
+
 ## GPU Or `nvidia-smi` Missing
 
 Confirm the host and a minimal container both see the GPU:

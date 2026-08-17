@@ -30,6 +30,7 @@ Authorization: Bearer dgx_...
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/health` | Service and database liveness |
+| GET | `/api/ops-agent/health` | Admin-only safe Host Operations Agent status |
 | GET | `/api/system` | Current host and GPU snapshot |
 | GET | `/api/models` | Registered model assets |
 | DELETE | `/api/models/{id}` | Create a permanent model deletion task |
