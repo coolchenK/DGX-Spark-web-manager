@@ -16,16 +16,23 @@ upsert_env() {
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || fail "Invalid environment value for $name"
   local temporary
   temporary="$(mktemp "${file}.tmp.XXXXXX")"
-  awk -v key="$name" -v replacement="$name=$value" '
-    BEGIN { found = 0 }
-    index($0, key "=") == 1 {
-      if (!found) print replacement
-      found = 1
-      next
-    }
-    { print }
-    END { if (!found) print replacement }
-  ' "$file" > "$temporary"
+  local found=false
+  local line
+  {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "$name="* ]]; then
+        if [[ "$found" == false ]]; then
+          printf '%s=%s\n' "$name" "$value"
+          found=true
+        fi
+      else
+        printf '%s\n' "$line"
+      fi
+    done
+    if [[ "$found" == false ]]; then
+      printf '%s=%s\n' "$name" "$value"
+    fi
+  } < "$file" > "$temporary"
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$file"
 }

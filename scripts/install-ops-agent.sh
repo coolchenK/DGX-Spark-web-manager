@@ -33,12 +33,15 @@ PACKAGE_WAS_PRESENT=false
 TRANSACTION_DIR=""
 SOCKET_UNIT_EXISTED=false
 SERVICE_UNIT_EXISTED=false
-SOCKET_WAS_ENABLED=false
-SOCKET_WAS_ACTIVE=false
-SERVICE_WAS_ENABLED=false
-SERVICE_WAS_ACTIVE=false
+SOCKET_ENABLED_STATE=""
+SOCKET_ACTIVE_STATE=""
+SERVICE_ENABLED_STATE=""
+SERVICE_ACTIVE_STATE=""
 ROLLBACK_IN_PROGRESS=false
-TRANSACTION_READY=false
+TRANSACTION_ACTIVE=false
+SNAPSHOTS_READY=false
+KEY_TEMP=""
+KEY_CREATED_THIS_RUN=false
 
 usage() {
   cat <<'EOF'
@@ -77,6 +80,71 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
 }
 
+validate_systemd_state() {
+  local operation="$1"
+  local unit_type="$2"
+  local value="$3"
+  local status="$4"
+  case "$operation:$unit_type:$value:$status" in
+    is-enabled:socket:enabled:0|is-enabled:socket:enabled-runtime:0|\
+    is-enabled:socket:disabled:1|is-enabled:socket:not-found:1|\
+    is-enabled:socket:not-found:4|\
+    is-enabled:service:enabled:0|is-enabled:service:enabled-runtime:0|\
+    is-enabled:service:disabled:1|is-enabled:service:static:0|\
+    is-enabled:service:not-found:1|is-enabled:service:not-found:4|\
+    is-active:socket:active:0|is-active:socket:inactive:3|\
+    is-active:socket:not-found:3|is-active:socket:not-found:4|\
+    is-active:service:active:0|is-active:service:inactive:3|\
+    is-active:service:not-found:3|is-active:service:not-found:4)
+      return 0
+      ;;
+    *)
+      echo "Unsafe systemd state response for $operation $unit_type: value='$value' status=$status" >&2
+      return 1
+      ;;
+  esac
+}
+
+query_systemd_state() {
+  local operation="$1"
+  local unit="$2"
+  local unit_type="$3"
+  local result_variable="$4"
+  local value
+  local status
+  if value="$(systemctl "$operation" "$unit" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || {
+    echo "Invalid systemd state output for $unit" >&2
+    return 1
+  }
+  validate_systemd_state "$operation" "$unit_type" "$value" "$status" || return 1
+  printf -v "$result_variable" '%s' "$value"
+}
+
+verify_systemd_state() {
+  local operation="$1"
+  local unit="$2"
+  local unit_type="$3"
+  local expected="$4"
+  local actual=""
+  query_systemd_state "$operation" "$unit" "$unit_type" actual || return 1
+  [[ "$actual" == "$expected" ]] || {
+    echo "Systemd state verification failed for $unit: expected $expected, found $actual" >&2
+    return 1
+  }
+}
+
+capture_systemd_snapshot() {
+  query_systemd_state is-enabled dgx-spark-ops-agent.socket socket SOCKET_ENABLED_STATE
+  query_systemd_state is-active dgx-spark-ops-agent.socket socket SOCKET_ACTIVE_STATE
+  query_systemd_state is-enabled dgx-spark-ops-agent.service service SERVICE_ENABLED_STATE
+  query_systemd_state is-active dgx-spark-ops-agent.service service SERVICE_ACTIVE_STATE
+}
+
 effective_uid() {
   if [[ "${DGX_OPS_AGENT_TESTING:-}" == "1" && -n "${DGX_OPS_AGENT_TEST_EUID:-}" ]]; then
     printf '%s\n' "$DGX_OPS_AGENT_TEST_EUID"
@@ -93,14 +161,9 @@ machine_architecture() {
   fi
 }
 
-validate_existing_key() {
-  [[ ! -L "$KEY_FILE" ]] || fail "Existing Agent key must not be a symlink"
-  local metadata
-  metadata="$(stat -c '%U:%G:%a' -- "$KEY_FILE")"
-  [[ "$metadata" == "root:dgx-spark-ops:640" ]] || {
-    fail "Existing Agent key must be root:dgx-spark-ops:640 (found $metadata)"
-  }
-  python3 - "$KEY_FILE" <<'PY'
+validate_key_content() {
+  local path="$1"
+  python3 - "$path" <<'PY'
 import os
 import stat
 import sys
@@ -108,7 +171,7 @@ import sys
 path = sys.argv[1]
 metadata = os.lstat(path)
 if not stat.S_ISREG(metadata.st_mode):
-    raise SystemExit("Existing Agent key is not a regular file")
+    raise SystemExit("Agent key is not a regular file")
 with open(path, "rb", buffering=0) as handle:
     value = handle.read(66)
 if len(value) == 32:
@@ -116,8 +179,23 @@ if len(value) == 32:
 if value.endswith(b"\n"):
     value = value[:-1]
 if len(value) != 64 or any(byte not in b"0123456789abcdefABCDEF" for byte in value):
-    raise SystemExit("Existing Agent key must contain 32 raw bytes or 64 hexadecimal characters")
+    raise SystemExit("Agent key must contain 32 raw bytes or 64 hexadecimal characters")
 PY
+}
+
+validate_key_metadata() {
+  local path="$1"
+  [[ ! -L "$path" ]] || fail "Agent key must not be a symlink"
+  local metadata
+  metadata="$(stat -c '%U:%G:%a' -- "$path")"
+  [[ "$metadata" == "root:dgx-spark-ops:640" ]] || {
+    fail "Existing Agent key must be root:dgx-spark-ops:640 (found $metadata)"
+  }
+}
+
+validate_existing_key() {
+  validate_key_metadata "$KEY_FILE"
+  validate_key_content "$KEY_FILE"
 }
 
 create_key_if_missing() {
@@ -130,15 +208,18 @@ create_key_if_missing() {
     return
   fi
 
-  local temporary_key
-  temporary_key="$(mktemp "$KEY_DIR/.ops-agent.key.XXXXXX")"
-  trap 'rm -f -- "$temporary_key"' RETURN
-  openssl rand -hex 32 > "$temporary_key"
-  chown root:"$GROUP_NAME" -- "$temporary_key"
-  chmod 0640 -- "$temporary_key"
-  ln -- "$temporary_key" "$KEY_FILE" || fail "Agent key appeared during installation; rerun after validating it"
-  rm -f -- "$temporary_key"
-  trap - RETURN
+  KEY_TEMP="$(mktemp "$KEY_DIR/.ops-agent.key.XXXXXX")"
+  openssl rand -hex 32 > "$KEY_TEMP"
+  validate_key_content "$KEY_TEMP"
+  chown root:"$GROUP_NAME" -- "$KEY_TEMP"
+  chmod 0640 -- "$KEY_TEMP"
+  validate_key_metadata "$KEY_TEMP"
+  [[ ! -e "$KEY_FILE" && ! -L "$KEY_FILE" ]] || {
+    fail "Agent key appeared during installation; rerun after validating it"
+  }
+  mv -- "$KEY_TEMP" "$KEY_FILE"
+  KEY_TEMP=""
+  KEY_CREATED_THIS_RUN=true
   validate_existing_key
   echo "Created Agent key at /etc/dgx-spark-manager/ops-agent.key"
 }
@@ -204,28 +285,7 @@ snapshot_install_transaction() {
   fi
   snapshot_unit "$UNIT_DIR/dgx-spark-ops-agent.socket" socket.unit SOCKET_UNIT_EXISTED
   snapshot_unit "$UNIT_DIR/dgx-spark-ops-agent.service" service.unit SERVICE_UNIT_EXISTED
-
-  if systemctl is-enabled --quiet dgx-spark-ops-agent.socket; then
-    SOCKET_WAS_ENABLED=true
-  else
-    SOCKET_WAS_ENABLED=false
-  fi
-  if systemctl is-active --quiet dgx-spark-ops-agent.socket; then
-    SOCKET_WAS_ACTIVE=true
-  else
-    SOCKET_WAS_ACTIVE=false
-  fi
-  if systemctl is-enabled --quiet dgx-spark-ops-agent.service; then
-    SERVICE_WAS_ENABLED=true
-  else
-    SERVICE_WAS_ENABLED=false
-  fi
-  if systemctl is-active --quiet dgx-spark-ops-agent.service; then
-    SERVICE_WAS_ACTIVE=true
-  else
-    SERVICE_WAS_ACTIVE=false
-  fi
-  TRANSACTION_READY=true
+  SNAPSHOTS_READY=true
 }
 
 install_unit() {
@@ -343,57 +403,74 @@ restore_unit_snapshot() {
 
 restore_systemd_state() {
   local restored=true
-  if $SOCKET_WAS_ENABLED; then
-    systemctl enable dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false
-  else
-    systemctl disable dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
-  fi
-  if $SERVICE_WAS_ENABLED; then
-    systemctl enable dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false
-  else
-    systemctl disable dgx-spark-ops-agent.service >/dev/null 2>&1 || true
-  fi
+  case "$SOCKET_ENABLED_STATE" in
+    enabled) systemctl enable dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false ;;
+    enabled-runtime) systemctl enable --runtime dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false ;;
+    disabled) systemctl disable dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false ;;
+    not-found) ;;
+    *) restored=false ;;
+  esac
+  case "$SERVICE_ENABLED_STATE" in
+    enabled) systemctl enable dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false ;;
+    enabled-runtime) systemctl enable --runtime dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false ;;
+    disabled) systemctl disable dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false ;;
+    static|not-found) ;;
+    *) restored=false ;;
+  esac
 
-  if $SOCKET_WAS_ACTIVE; then
-    systemctl start dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false
-  else
-    systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
-  fi
-  if $SERVICE_WAS_ACTIVE; then
-    systemctl start dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false
-  else
-    systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || true
-  fi
+  case "$SOCKET_ACTIVE_STATE" in
+    active) systemctl start dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false ;;
+    inactive) systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false ;;
+    not-found) ;;
+    *) restored=false ;;
+  esac
+  case "$SERVICE_ACTIVE_STATE" in
+    active) systemctl start dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false ;;
+    inactive) systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false ;;
+    not-found) ;;
+    *) restored=false ;;
+  esac
 
-  if $SOCKET_WAS_ACTIVE || $SERVICE_WAS_ACTIVE; then
+  if [[ "$SOCKET_ACTIVE_STATE" == active || "$SERVICE_ACTIVE_STATE" == active ]]; then
     probe_health || restored=false
-    if ! $SERVICE_WAS_ACTIVE; then
-      systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || true
+    if [[ "$SERVICE_ACTIVE_STATE" == inactive ]]; then
+      systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false
     fi
-    if ! $SOCKET_WAS_ACTIVE; then
-      systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
+    if [[ "$SOCKET_ACTIVE_STATE" == inactive ]]; then
+      systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false
     fi
   fi
+  verify_systemd_state is-enabled dgx-spark-ops-agent.socket socket "$SOCKET_ENABLED_STATE" || restored=false
+  verify_systemd_state is-active dgx-spark-ops-agent.socket socket "$SOCKET_ACTIVE_STATE" || restored=false
+  verify_systemd_state is-enabled dgx-spark-ops-agent.service service "$SERVICE_ENABLED_STATE" || restored=false
+  verify_systemd_state is-active dgx-spark-ops-agent.service service "$SERVICE_ACTIVE_STATE" || restored=false
   $restored
 }
 
 rollback_install_transaction() {
-  local prior_errexit=false
   local restored=true
-  [[ "$-" == *e* ]] && prior_errexit=true
   set +e
   ROLLBACK_IN_PROGRESS=true
-  if $TRANSACTION_READY; then
-    systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1
-    systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1
+  if $SNAPSHOTS_READY; then
+    if [[ -e "$UNIT_DIR/dgx-spark-ops-agent.service" ]]; then
+      systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false
+      systemctl disable dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false
+    fi
+    if [[ -e "$UNIT_DIR/dgx-spark-ops-agent.socket" ]]; then
+      systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false
+      systemctl disable dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false
+    fi
     restore_package_snapshot || restored=false
     restore_unit_snapshot "$UNIT_DIR/dgx-spark-ops-agent.socket" socket.unit "$SOCKET_UNIT_EXISTED" || restored=false
     restore_unit_snapshot "$UNIT_DIR/dgx-spark-ops-agent.service" service.unit "$SERVICE_UNIT_EXISTED" || restored=false
     systemctl daemon-reload || restored=false
-    restore_systemd_state || restored=false
   fi
+  restore_systemd_state || restored=false
   if [[ -n "$PACKAGE_STAGING" && "$PACKAGE_STAGING" == "$PACKAGE_PARENT"/.install.* ]]; then
-    rm -rf --one-file-system -- "$PACKAGE_STAGING"
+    rm -rf --one-file-system -- "$PACKAGE_STAGING" || restored=false
+  fi
+  if [[ -n "$KEY_TEMP" && "$KEY_TEMP" == "$KEY_DIR"/.ops-agent.key.* ]]; then
+    rm -f -- "$KEY_TEMP" || restored=false
   fi
   if [[ -n "$PACKAGE_BACKUP" && -e "$PACKAGE_BACKUP" ]]; then
     restored=false
@@ -405,36 +482,49 @@ rollback_install_transaction() {
   fi
   TRANSACTION_DIR=""
   PACKAGE_STAGING=""
+  KEY_TEMP=""
   PACKAGE_UPDATE_ACTIVE=false
-  TRANSACTION_READY=false
+  SNAPSHOTS_READY=false
   ROLLBACK_IN_PROGRESS=false
-  if $prior_errexit; then
-    set -e
-  fi
   if $restored; then
     return 0
   fi
   return 1
 }
 
-rollback_failed_install() {
+clear_transaction_traps() {
+  trap - EXIT HUP INT TERM
+}
+
+transaction_exit() {
   local original_status="$?"
   if $ROLLBACK_IN_PROGRESS; then
-    trap - ERR
+    clear_transaction_traps
     exit "$original_status"
   fi
-  trap - ERR
-  if rollback_install_transaction; then
-    echo "Agent installation failed; the previous installation was restored." >&2
-  else
-    echo "Agent installation failed and automatic rollback was incomplete." >&2
-    echo "Inspect systemctl status and the protected Agent install paths before retrying." >&2
+  clear_transaction_traps
+  if $TRANSACTION_ACTIVE; then
+    if rollback_install_transaction; then
+      echo "Agent installation failed; the previous installation was restored." >&2
+    else
+      echo "Agent installation failed and automatic rollback was incomplete." >&2
+      echo "Inspect systemctl status and the protected Agent install paths before retrying." >&2
+    fi
   fi
   exit "$original_status"
 }
 
+begin_install_transaction() {
+  TRANSACTION_ACTIVE=true
+  trap transaction_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
 commit_install_transaction() {
-  trap - ERR
+  TRANSACTION_ACTIVE=false
+  clear_transaction_traps
   if [[ -n "$PACKAGE_BACKUP" ]]; then
     assert_exact_path "$PACKAGE_BACKUP" "/usr/local/lib/dgx-spark-ops-agent/.previous.$$"
     rm -rf --one-file-system -- "$PACKAGE_BACKUP" || {
@@ -449,7 +539,31 @@ commit_install_transaction() {
   PACKAGE_BACKUP=""
   TRANSACTION_DIR=""
   PACKAGE_UPDATE_ACTIVE=false
-  TRANSACTION_READY=false
+  SNAPSHOTS_READY=false
+}
+
+quiesce_existing_agent() {
+  if [[ "$SERVICE_ACTIVE_STATE" == active ]]; then
+    systemctl stop dgx-spark-ops-agent.service
+    verify_systemd_state is-active dgx-spark-ops-agent.service service inactive
+  fi
+  if [[ "$SOCKET_ACTIVE_STATE" == active ]]; then
+    systemctl stop dgx-spark-ops-agent.socket
+    verify_systemd_state is-active dgx-spark-ops-agent.socket socket inactive
+  fi
+}
+
+activate_new_agent() {
+  systemctl daemon-reload
+  systemctl disable dgx-spark-ops-agent.service
+  verify_systemd_state is-enabled dgx-spark-ops-agent.service service disabled
+  systemctl enable dgx-spark-ops-agent.socket
+  verify_systemd_state is-enabled dgx-spark-ops-agent.socket socket enabled
+  systemctl start dgx-spark-ops-agent.socket
+  verify_systemd_state is-active dgx-spark-ops-agent.socket socket active
+  systemctl restart dgx-spark-ops-agent.service
+  verify_systemd_state is-active dgx-spark-ops-agent.service service active
+  probe_health
 }
 
 apply_installation() {
@@ -467,28 +581,24 @@ apply_installation() {
   [[ -f "$SOURCE_UNITS/dgx-spark-ops-agent.service" ]] || fail "Agent service unit is missing"
   [[ -f "$SOURCE_UNITS/dgx-spark-ops-agent.socket" ]] || fail "Agent socket unit is missing"
 
+  capture_systemd_snapshot
+  begin_install_transaction
+  quiesce_existing_agent
+  snapshot_install_transaction
+
   if ! getent group "$GROUP_NAME" >/dev/null; then
     groupadd --system "$GROUP_NAME"
   fi
   getent group "$GROUP_NAME" >/dev/null || fail "Could not resolve $GROUP_NAME group"
-
   assert_exact_path "$JOBS_DIR" /var/lib/dgx-spark-ops-agent/jobs
   assert_no_symlink_chain "$JOBS_DIR"
   install -d -o root -g root -m 0750 -- "$(dirname "$JOBS_DIR")"
   install -d -o root -g root -m 0750 -- "$JOBS_DIR"
-
   create_key_if_missing
-  trap rollback_failed_install ERR
-  snapshot_install_transaction
-  systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
-  systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || true
   install_package
   install_unit dgx-spark-ops-agent.service
   install_unit dgx-spark-ops-agent.socket
-  systemctl daemon-reload
-  systemctl enable --now dgx-spark-ops-agent.socket
-  systemctl try-restart dgx-spark-ops-agent.service >/dev/null 2>&1 || true
-  probe_health
+  activate_new_agent
   commit_install_transaction
   echo "DGX Spark host operations agent installed"
 }

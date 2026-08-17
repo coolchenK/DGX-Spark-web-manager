@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -99,8 +98,14 @@ def _fake_agent_system(
     health = tmp_path / "health-results"
     health.write_text("\n".join(health_results) + "\n", encoding="utf-8")
     for kind in ("socket", "service"):
-        (state / f"{kind}.enabled").write_text(str(enabled).lower(), encoding="ascii")
-        (state / f"{kind}.active").write_text(str(active).lower(), encoding="ascii")
+        (state / f"{kind}.enabled").write_text(
+            "enabled" if enabled else "disabled",
+            encoding="ascii",
+        )
+        (state / f"{kind}.active").write_text(
+            "active" if active else "inactive",
+            encoding="ascii",
+        )
     if fail_first_reload:
         (state / "fail-reload-once").touch()
 
@@ -161,16 +166,31 @@ def _fake_agent_system(
             (
                 "#!/bin/sh",
                 f'STATE="{state.as_posix()}"',
+                f'UNIT_DIR="{(tmp_path / "root/etc/systemd/system").as_posix()}"',
                 f'printf "%s\\n" "$*" >> "{log.as_posix()}"',
                 "command=$1",
                 "shift",
                 "case \"$command\" in",
                 "  is-enabled|is-active)",
+                "    [ -e \"$STATE/query-transport-failure\" ] && exit 55",
                 "    [ \"${1:-}\" = --quiet ] && shift",
                 "    unit=$1",
                 "    case \"$unit\" in *.socket) kind=socket ;; *) kind=service ;; esac",
+                "    if [ ! -e \"$UNIT_DIR/$unit\" ]; then",
+                "      printf 'not-found\\n'",
+                "      exit 4",
+                "    fi",
                 "    suffix=${command#is-}",
-                "    [ \"$(cat \"$STATE/$kind.$suffix\")\" = true ]",
+                "    value=$(cat \"$STATE/$kind.$suffix\")",
+                "    printf '%s\\n' \"$value\"",
+                "    [ -e \"$STATE/query-rc-mismatch\" ] && exit 22",
+                "    case \"$command:$value\" in",
+                "      is-enabled:enabled|is-enabled:enabled-runtime) exit 0 ;;",
+                "      is-enabled:static|is-active:active) exit 0 ;;",
+                "      is-enabled:disabled) exit 1 ;;",
+                "      is-active:inactive) exit 3 ;;",
+                "      *) exit 23 ;;",
+                "    esac",
                 "    ;;",
                 "  daemon-reload)",
                 "    if [ -e \"$STATE/fail-reload-once\" ]; then",
@@ -179,23 +199,45 @@ def _fake_agent_system(
                 "    fi",
                 "    ;;",
                 "  enable|disable)",
+                "    if [ \"$command\" = enable ] && [ -e \"$STATE/fail-enable\" ]; then",
+                "      rm -f \"$STATE/fail-enable\"; exit 32",
+                "    fi",
+                "    if [ \"$command\" = disable ] && [ -e \"$STATE/fail-disable\" ]; then",
+                "      rm -f \"$STATE/fail-disable\"; exit 33",
+                "    fi",
                 "    now=false",
+                "    runtime=false",
                 "    [ \"${1:-}\" = --now ] && { now=true; shift; }",
-                "    value=false; [ \"$command\" = enable ] && value=true",
+                "    [ \"${1:-}\" = --runtime ] && { runtime=true; shift; }",
+                "    value=disabled",
+                "    if [ \"$command\" = enable ]; then",
+                "      value=enabled; $runtime && value=enabled-runtime",
+                "    fi",
                 "    for unit in \"$@\"; do",
                 "      case \"$unit\" in *.socket) kind=socket ;; *) kind=service ;; esac",
                 "      printf '%s' \"$value\" > \"$STATE/$kind.enabled\"",
-                "      $now && printf '%s' \"$value\" > \"$STATE/$kind.active\"",
+                "      if $now; then",
+                "        active=inactive; [ \"$command\" = enable ] && active=active",
+                "        printf '%s' \"$active\" > \"$STATE/$kind.active\"",
+                "      fi",
                 "    done",
                 "    ;;",
-                "  start|stop)",
-                "    value=false; [ \"$command\" = start ] && value=true",
+                "  start|stop|restart)",
+                "    if [ \"$command\" = stop ] && [ -e \"$STATE/fail-stop\" ]; then",
+                "      rm -f \"$STATE/fail-stop\"; exit 31",
+                "    fi",
+                "    if [ \"$command\" = start ] && [ -e \"$STATE/fail-start\" ]; then",
+                "      rm -f \"$STATE/fail-start\"; exit 34",
+                "    fi",
+                "    if [ \"$command\" = restart ] && [ -e \"$STATE/fail-restart\" ]; then",
+                "      rm -f \"$STATE/fail-restart\"; exit 35",
+                "    fi",
+                "    [ \"$command\" = stop ] && [ -e \"$STATE/sticky-stop\" ] && exit 0",
+                "    value=inactive; [ \"$command\" != stop ] && value=active",
                 "    for unit in \"$@\"; do",
                 "      case \"$unit\" in *.socket) kind=socket ;; *) kind=service ;; esac",
                 "      printf '%s' \"$value\" > \"$STATE/$kind.active\"",
                 "    done",
-                "    ;;",
-                "  try-restart)",
                 "    ;;",
                 "esac",
                 "exit 0",
@@ -297,7 +339,8 @@ def test_installer_has_preview_and_strict_apply_contract() -> None:
     assert "openssl rand -hex 32" in script
     assert "0640" in script
     assert "daemon-reload" in script
-    assert "enable --now dgx-spark-ops-agent.socket" in script
+    assert "systemctl enable dgx-spark-ops-agent.socket" in script
+    assert "systemctl start dgx-spark-ops-agent.socket" in script
     assert "agent.health" in script
     assert "recovery" not in script.lower() or "rollback" in script.lower()
 
@@ -354,71 +397,11 @@ def test_apply_is_idempotent_and_preserves_key_and_jobs_with_fake_system(
     _bash()
     if os.name == "nt":
         pytest.skip("requires native POSIX ownership semantics")
-    real_install = "/usr/bin/install" if os.name == "nt" else shutil.which("install")
-    real_python = Path(sys.executable).as_posix() if os.name == "nt" else shutil.which("python3")
-    real_stat = "/usr/bin/stat" if os.name == "nt" else shutil.which("stat")
-    if not all((real_install, real_python, real_stat)):
-        pytest.skip("required POSIX tools are unavailable")
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    log = tmp_path / "systemctl.log"
-    _write_executable(
-        fake_bin / "install",
-        "\n".join(
-            (
-                "#!/usr/bin/env bash",
-                "args=()",
-                "while [[ $# -gt 0 ]]; do",
-                "  case \"$1\" in -o|-g) shift 2 ;; *) args+=(\"$1\"); shift ;; esac",
-                "done",
-                f'exec "{Path(real_install).as_posix()}" "${{args[@]}}"',
-                "",
-            )
-        ),
-    )
-    _write_executable(fake_bin / "chown", "#!/bin/sh\nexit 0\n")
-    _write_executable(
-        fake_bin / "getent",
-        "#!/bin/sh\nprintf 'dgx-spark-ops:x:2345:\\n'\n",
-    )
-    _write_executable(fake_bin / "groupadd", "#!/bin/sh\nexit 0\n")
-    _write_executable(
-        fake_bin / "openssl",
-        "#!/bin/sh\nprintf '%064d\\n' 0\n",
-    )
-    _write_executable(
-        fake_bin / "stat",
-        "\n".join(
-            (
-                "#!/bin/sh",
-                "if [ \"${1:-}\" = \"-c\" ]; then",
-                "  printf 'root:dgx-spark-ops:640\\n'",
-                "  exit 0",
-                "fi",
-                f'exec "{Path(real_stat).as_posix()}" "$@"',
-                "",
-            )
-        ),
-    )
-    _write_executable(
-        fake_bin / "python3",
-        "\n".join(
-            (
-                "#!/bin/sh",
-                "if [ \"${1:-}\" = \"-\" ] && [ \"$#\" -eq 3 ]; then",
-                "  cat >/dev/null",
-                "  printf 'Agent health check passed\\n'",
-                "  exit 0",
-                "fi",
-                f'exec "{Path(real_python).as_posix()}" "$@"',
-                "",
-            )
-        ),
-    )
-    _write_executable(
-        fake_bin / "systemctl",
-        f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log.as_posix()}"\nexit 0\n',
+    fake_bin, _, log, _ = _fake_agent_system(
+        tmp_path,
+        enabled=False,
+        active=False,
+        health_results=("pass", "pass"),
     )
 
     install_root = tmp_path / "root"
@@ -426,13 +409,7 @@ def test_apply_is_idempotent_and_preserves_key_and_jobs_with_fake_system(
     jobs.mkdir(parents=True)
     marker = jobs / "existing.json"
     marker.write_text("preserve", encoding="utf-8")
-    env = {
-        "PATH": _fake_path(fake_bin),
-        "DGX_OPS_AGENT_TESTING": "1",
-        "DGX_OPS_AGENT_TEST_ARCH": "aarch64",
-        "DGX_OPS_AGENT_TEST_EUID": "0",
-        "DGX_OPS_AGENT_INSTALL_ROOT": _shell_path(install_root),
-    }
+    env = _agent_test_env(fake_bin, install_root)
 
     first = _run_bash(INSTALLER, "--apply", env=env)
     assert first.returncode == 0, first.stderr
@@ -479,8 +456,8 @@ def test_upgrade_health_failure_restores_old_agent_units_and_systemd_state(
     assert service.stat().st_mode & 0o777 == 0o640
     assert socket_unit.stat().st_mode & 0o777 == 0o600
     for kind in ("socket", "service"):
-        assert (state / f"{kind}.enabled").read_text() == "true"
-        assert (state / f"{kind}.active").read_text() == "true"
+        assert (state / f"{kind}.enabled").read_text() == "enabled"
+        assert (state / f"{kind}.active").read_text() == "active"
     calls = log.read_text(encoding="utf-8")
     assert calls.count("daemon-reload") == 2
     assert "start dgx-spark-ops-agent.socket" in calls
@@ -515,8 +492,8 @@ def test_first_install_health_failure_removes_new_artifacts_and_disables_units(
     assert not (install_root / "etc/systemd/system/dgx-spark-ops-agent.service").exists()
     assert not (install_root / "etc/systemd/system/dgx-spark-ops-agent.socket").exists()
     for kind in ("socket", "service"):
-        assert (state / f"{kind}.enabled").read_text() == "false"
-        assert (state / f"{kind}.active").read_text() == "false"
+        assert (state / f"{kind}.enabled").read_text() == "disabled"
+        assert (state / f"{kind}.active").read_text() == "inactive"
     assert health.read_text(encoding="utf-8") == "pass\n"
 
 
@@ -547,10 +524,174 @@ def test_systemctl_mid_install_failure_uses_the_same_complete_rollback(
     assert service.read_text(encoding="utf-8") == "old-service"
     assert socket_unit.read_text(encoding="utf-8") == "old-socket"
     for kind in ("socket", "service"):
-        assert (state / f"{kind}.enabled").read_text() == "true"
-        assert (state / f"{kind}.active").read_text() == "true"
+        assert (state / f"{kind}.enabled").read_text() == "enabled"
+        assert (state / f"{kind}.active").read_text() == "active"
     assert log.read_text(encoding="utf-8").count("daemon-reload") == 2
     assert health.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize("failure", ["fail-stop", "sticky-stop"])
+def test_install_stop_failures_exit_before_writing_artifacts(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    _bash()
+    if os.name == "nt":
+        pytest.skip("requires native POSIX metadata semantics")
+    fake_bin, state, _, _ = _fake_agent_system(
+        tmp_path,
+        enabled=True,
+        active=True,
+        health_results=("pass",),
+    )
+    (state / failure).touch()
+    install_root = tmp_path / "root"
+    package, service, socket_unit = _seed_old_agent(install_root)
+
+    result = _run_bash(INSTALLER, "--apply", env=_agent_test_env(fake_bin, install_root))
+
+    assert result.returncode != 0
+    assert (package / "old-agent.txt").read_text() == "old-package"
+    assert service.read_text() == "old-service"
+    assert socket_unit.read_text() == "old-socket"
+    assert not (install_root / "var/lib/dgx-spark-ops-agent/jobs").exists()
+    assert not list(package.parent.glob(".transaction.*"))
+    assert not list(package.parent.glob(".previous.*"))
+
+
+@pytest.mark.parametrize(
+    ("marker", "expected_status"),
+    [("fail-enable", 32), ("fail-start", 34), ("fail-restart", 35)],
+)
+def test_new_systemd_activation_failure_rolls_back_without_committing_backup(
+    tmp_path: Path,
+    marker: str,
+    expected_status: int,
+) -> None:
+    _bash()
+    if os.name == "nt":
+        pytest.skip("requires native POSIX metadata semantics")
+    fake_bin, state, _, _ = _fake_agent_system(
+        tmp_path,
+        enabled=True,
+        active=True,
+        health_results=("pass",),
+    )
+    (state / marker).touch()
+    install_root = tmp_path / "root"
+    package, service, socket_unit = _seed_old_agent(install_root)
+
+    result = _run_bash(INSTALLER, "--apply", env=_agent_test_env(fake_bin, install_root))
+
+    assert result.returncode == expected_status
+    assert (package / "old-agent.txt").is_file()
+    assert service.read_text() == "old-service"
+    assert socket_unit.read_text() == "old-socket"
+    assert not list(package.parent.glob(".transaction.*"))
+    assert not list(package.parent.glob(".previous.*"))
+
+
+@pytest.mark.parametrize(
+    "query_failure",
+    ["masked", "query-transport-failure", "query-rc-mismatch"],
+)
+def test_invalid_systemd_query_fails_closed_before_install_writes(
+    tmp_path: Path,
+    query_failure: str,
+) -> None:
+    _bash()
+    if os.name == "nt":
+        pytest.skip("requires native POSIX metadata semantics")
+    fake_bin, state, _, _ = _fake_agent_system(
+        tmp_path,
+        enabled=True,
+        active=True,
+        health_results=("pass",),
+    )
+    if query_failure == "masked":
+        (state / "socket.enabled").write_text("masked", encoding="ascii")
+    else:
+        (state / query_failure).touch()
+    install_root = tmp_path / "root"
+    package, service, socket_unit = _seed_old_agent(install_root)
+
+    result = _run_bash(INSTALLER, "--apply", env=_agent_test_env(fake_bin, install_root))
+
+    assert result.returncode != 0
+    assert (package / "old-agent.txt").is_file()
+    assert service.read_text() == "old-service"
+    assert socket_unit.read_text() == "old-socket"
+    assert not (install_root / "var/lib/dgx-spark-ops-agent/jobs").exists()
+    assert not list(package.parent.glob(".transaction.*"))
+
+
+@pytest.mark.parametrize(
+    ("termination", "expected_status"),
+    [("exit 37", 37), ("kill -TERM $$", 143)],
+)
+def test_exit_and_term_restore_an_active_upgrade_transaction(
+    tmp_path: Path,
+    termination: str,
+    expected_status: int,
+) -> None:
+    bash = _bash()
+    if os.name == "nt":
+        pytest.skip("requires native POSIX signal and metadata semantics")
+    fake_bin, _, _, _ = _fake_agent_system(
+        tmp_path,
+        enabled=True,
+        active=True,
+        health_results=("pass",),
+    )
+    install_root = tmp_path / "root"
+    package, service, socket_unit = _seed_old_agent(install_root)
+    command = "; ".join(
+        (
+            f'source "{INSTALLER.as_posix()}"',
+            "capture_systemd_snapshot",
+            "begin_install_transaction",
+            "quiesce_existing_agent",
+            "snapshot_install_transaction",
+            "install_package",
+            termination,
+        )
+    )
+
+    result = subprocess.run(
+        [bash, "-c", command],
+        cwd=ROOT,
+        env={**os.environ, **_agent_test_env(fake_bin, install_root)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_status
+    assert (package / "old-agent.txt").is_file()
+    assert service.read_text() == "old-service"
+    assert socket_unit.read_text() == "old-socket"
+    assert not list(package.parent.glob(".transaction.*"))
+
+
+def test_bad_openssl_output_never_publishes_a_key(tmp_path: Path) -> None:
+    _bash()
+    if os.name == "nt":
+        pytest.skip("requires native POSIX ownership semantics")
+    fake_bin, _, _, _ = _fake_agent_system(
+        tmp_path,
+        enabled=False,
+        active=False,
+        health_results=("pass",),
+    )
+    _write_executable(fake_bin / "openssl", "#!/bin/sh\nprintf 'not-a-valid-key\\n'\n")
+    install_root = tmp_path / "root"
+
+    result = _run_bash(INSTALLER, "--apply", env=_agent_test_env(fake_bin, install_root))
+
+    key_dir = install_root / "etc/dgx-spark-manager"
+    assert result.returncode != 0
+    assert not (key_dir / "ops-agent.key").exists()
+    assert not list(key_dir.glob(".ops-agent.key.*"))
 
 
 def test_installer_validates_existing_key_and_updates_package_atomically() -> None:
@@ -574,7 +715,7 @@ def test_installer_retains_package_backup_until_health_succeeds() -> None:
     commit = script.index("commit_install_transaction", probe)
     assert install < probe < commit
     assert "rollback_install_transaction" in script
-    assert "trap rollback_failed_install ERR" in script
+    assert "trap transaction_exit EXIT" in script
     moved = script.index('mv -- "$STAGED_PACKAGE" "$PACKAGE_DIR"')
     active = script.index("PACKAGE_UPDATE_ACTIVE=true", moved)
     staging_cleanup = script.index('rmdir -- "$PACKAGE_STAGING"', moved)
@@ -587,10 +728,10 @@ def test_installer_snapshots_and_restores_complete_upgrade_transaction() -> None
     assert "snapshot_install_transaction" in script
     assert "snapshot_unit" in script
     assert "restore_unit_snapshot" in script
-    assert "SOCKET_WAS_ENABLED" in script
-    assert "SOCKET_WAS_ACTIVE" in script
-    assert "SERVICE_WAS_ENABLED" in script
-    assert "SERVICE_WAS_ACTIVE" in script
+    assert "SOCKET_ENABLED_STATE" in script
+    assert "SOCKET_ACTIVE_STATE" in script
+    assert "SERVICE_ENABLED_STATE" in script
+    assert "SERVICE_ACTIVE_STATE" in script
     snapshot = script.index("snapshot_install_transaction")
     stop = script.index("systemctl stop dgx-spark-ops-agent.socket", snapshot)
     assert snapshot < stop
@@ -601,6 +742,48 @@ def test_installer_snapshots_and_restores_complete_upgrade_transaction() -> None
     assert rollback < restore_unit < reload_units < restore_state
     assert "ROLLBACK_IN_PROGRESS" in script
     assert "local original_status" in script
+
+
+def test_installer_fails_closed_on_systemd_state_and_quiesces_before_writes() -> None:
+    script = _read(INSTALLER)
+
+    assert "query_systemd_state" in script
+    assert "validate_systemd_state" in script
+    assert "enabled-runtime" in script
+    assert "not-found" in script
+    assert "quiesce_existing_agent" in script
+    apply = script.index("apply_installation()")
+    capture = script.index("capture_systemd_snapshot", apply)
+    quiesce = script.index("quiesce_existing_agent", capture)
+    artifact_snapshot = script.index("snapshot_install_transaction", quiesce)
+    key = script.index("create_key_if_missing", artifact_snapshot)
+    assert apply < capture < quiesce < artifact_snapshot < key
+    assert "verify_systemd_state" in script
+    assert "enable --now dgx-spark-ops-agent.socket" not in script
+    assert "try-restart" not in script
+
+
+def test_installer_uses_exit_and_signal_transaction_guards() -> None:
+    script = _read(INSTALLER)
+
+    assert "TRANSACTION_ACTIVE" in script
+    assert "transaction_exit" in script
+    assert "trap transaction_exit EXIT" in script
+    assert "trap 'exit 129' HUP" in script
+    assert "trap 'exit 130' INT" in script
+    assert "trap 'exit 143' TERM" in script
+    assert "clear_transaction_traps" in script
+
+
+def test_new_key_is_validated_before_atomic_publish() -> None:
+    script = _read(INSTALLER)
+
+    openssl = script.index('openssl rand -hex 32 > "$KEY_TEMP"')
+    validate = script.index('validate_key_content "$KEY_TEMP"', openssl)
+    metadata = script.index('chmod 0640 -- "$KEY_TEMP"', validate)
+    publish = script.index('mv -- "$KEY_TEMP" "$KEY_FILE"', metadata)
+    assert openssl < validate < metadata < publish
+    assert "KEY_CREATED_THIS_RUN" in script
 
 
 def test_health_probe_authenticates_response_without_printing_key() -> None:
@@ -645,11 +828,48 @@ def test_uninstaller_preserves_jobs_and_key_unless_explicitly_purged() -> None:
     assert "/models" not in script
 
 
+def test_uninstaller_prevalidates_every_target_before_strict_systemd_shutdown() -> None:
+    script = _read(UNINSTALLER)
+
+    assert "validate_all_removal_targets" in script
+    assert "strict_shutdown" in script
+    validate = script.index("validate_all_removal_targets", script.index("main()"))
+    shutdown = script.index("strict_shutdown", validate)
+    first_remove = script.index("rm -", shutdown)
+    assert validate < shutdown < first_remove
+    for name in (
+        "PACKAGE_DIR",
+        "KEY_FILE",
+        "JOBS_DIR",
+        "SERVICE_UNIT",
+        "SOCKET_UNIT",
+        "SOCKET_PATH",
+        "SOCKET_DIR",
+    ):
+        assert script.count(f'"${name}"') >= 2
+    assert "query_systemd_state" in script
+    assert "verify_systemd_state" in script
+    assert "|| true" not in script
+
+
 def test_uninstall_apply_preserves_key_and_jobs_with_fake_system(tmp_path: Path) -> None:
     _bash()
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    _write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 0\n")
+    _write_executable(
+        fake_bin / "systemctl",
+        "\n".join(
+            (
+                "#!/bin/sh",
+                "case \"$1\" in",
+                "  is-enabled) printf 'disabled\\n'; exit 1 ;;",
+                "  is-active) printf 'inactive\\n'; exit 3 ;;",
+                "  *) exit 0 ;;",
+                "esac",
+                "",
+            )
+        ),
+    )
     install_root = tmp_path / "root"
     package = install_root / "usr/local/lib/dgx-spark-ops-agent/dgx_ops_agent"
     key = install_root / "etc/dgx-spark-manager/ops-agent.key"
@@ -679,7 +899,52 @@ def test_uninstall_apply_preserves_key_and_jobs_with_fake_system(tmp_path: Path)
     assert job.read_text(encoding="utf-8") == "keep"
 
 
-@pytest.mark.parametrize("target", ["package", "key", "jobs"])
+@pytest.mark.parametrize(
+    "failure",
+    ["fail-stop", "sticky-stop", "fail-disable", "query-transport-failure"],
+)
+def test_uninstall_systemd_failure_preserves_every_artifact(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    _bash()
+    if os.name == "nt":
+        pytest.skip("requires native POSIX metadata semantics")
+    fake_bin, state, _, _ = _fake_agent_system(
+        tmp_path,
+        enabled=True,
+        active=True,
+        health_results=("pass",),
+    )
+    (state / failure).touch()
+    install_root = tmp_path / "root"
+    package, service, socket_unit = _seed_old_agent(install_root)
+    jobs = install_root / "var/lib/dgx-spark-ops-agent/jobs"
+    jobs.mkdir(parents=True)
+    job = jobs / "job.json"
+    job.write_text("keep-job", encoding="utf-8")
+    key = install_root / "etc/dgx-spark-manager/ops-agent.key"
+
+    result = _run_bash(
+        UNINSTALLER,
+        "--apply",
+        env={
+            "PATH": _fake_path(fake_bin),
+            "DGX_OPS_AGENT_TESTING": "1",
+            "DGX_OPS_AGENT_TEST_EUID": "0",
+            "DGX_OPS_AGENT_INSTALL_ROOT": _shell_path(install_root),
+        },
+    )
+
+    assert result.returncode != 0
+    assert (package / "old-agent.txt").is_file()
+    assert service.read_text() == "old-service"
+    assert socket_unit.read_text() == "old-socket"
+    assert key.is_file()
+    assert job.read_text() == "keep-job"
+
+
+@pytest.mark.parametrize("target", ["package", "key", "jobs", "unit", "run"])
 def test_uninstall_rejects_symlinked_purge_ancestors(
     tmp_path: Path,
     target: str,
@@ -711,13 +976,27 @@ def test_uninstall_rejects_symlinked_purge_ancestors(
         (sentinel / "ops-agent.key").write_text("secret", encoding="utf-8")
         arguments.append("--purge-key")
         confirmation = "PURGE OPS AGENT KEY\n"
-    else:
+    elif target == "jobs":
         ancestor = install_root / "var/lib/dgx-spark-ops-agent"
         ancestor.parent.mkdir(parents=True)
         ancestor.symlink_to(sentinel, target_is_directory=True)
         (sentinel / "jobs").mkdir()
         arguments.append("--purge-jobs")
         confirmation = "PURGE OPS AGENT JOBS\n"
+    elif target == "unit":
+        ancestor = install_root / "etc/systemd"
+        ancestor.parent.mkdir(parents=True)
+        ancestor.symlink_to(sentinel, target_is_directory=True)
+        (sentinel / "system").mkdir()
+        (sentinel / "system/dgx-spark-ops-agent.service").write_text(
+            "unit",
+            encoding="utf-8",
+        )
+    else:
+        ancestor = install_root / "run/dgx-spark-manager"
+        ancestor.parent.mkdir(parents=True)
+        ancestor.symlink_to(sentinel, target_is_directory=True)
+        (sentinel / "ops-agent.sock").write_text("socket", encoding="utf-8")
 
     result = _run_bash(
         UNINSTALLER,
@@ -800,6 +1079,37 @@ def test_env_upsert_is_idempotent_and_preserves_secrets(tmp_path: Path) -> None:
     assert values["PUID"] == "1000"
     assert values["OPS_AGENT_GID"] == "1234"
     assert sum(line.startswith("PUID=") for line in env_file.read_text().splitlines()) == 1
+
+
+def test_env_upsert_preserves_literal_backslashes_without_injecting_lines(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "DGX_SECRET_KEY=keep-secret\nCUSTOM_VALUE=keep-me\n",
+        encoding="utf-8",
+    )
+    command = (
+        f'source "{MANAGER_INSTALLER.as_posix()}"; '
+        f'upsert_env "{_shell_path(env_file)}" MODEL_HOME_HOST '
+        "'/safe\\nINJECTED=yes'"
+    )
+
+    result = subprocess.run(
+        [bash, "-c", command],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert "MODEL_HOME_HOST=/safe\\nINJECTED=yes" in lines
+    assert "INJECTED=yes" not in lines
+    assert "DGX_SECRET_KEY=keep-secret" in lines
+    assert "CUSTOM_VALUE=keep-me" in lines
 
 
 def test_env_example_declares_non_secret_agent_configuration() -> None:
