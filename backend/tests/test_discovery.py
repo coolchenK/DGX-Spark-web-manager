@@ -355,6 +355,41 @@ def test_container_candidate_extracts_openai_endpoint_and_model():
     assert candidate["managed"] is False
 
 
+def test_stopped_llama_container_uses_host_binding_and_api_alias():
+    attrs = {
+        "Id": "llama123",
+        "Name": "/qwen-gguf",
+        "Config": {
+            "Image": "nvidia/cuda:12.9.0-devel-ubuntu24.04",
+            "Cmd": [
+                "/opt/llamacpp/llama-server",
+                "--model",
+                "/models/model.gguf",
+                "--alias",
+                "qwen35-9b-gguf",
+                "--port",
+                "8000",
+            ],
+            "Labels": {},
+        },
+        "HostConfig": {
+            "PortBindings": {
+                "8000/tcp": [{"HostIp": "", "HostPort": "8014"}]
+            }
+        },
+        "State": {"Status": "created"},
+        "NetworkSettings": {"Ports": {}},
+    }
+
+    candidate = container_candidate(attrs)
+
+    assert candidate is not None
+    assert candidate["runtime"] == "llama_cpp"
+    assert candidate["endpoint_url"] == "http://127.0.0.1:8014"
+    assert candidate["api_model_name"] == "qwen35-9b-gguf"
+    assert candidate["health"] == "unknown"
+
+
 def test_scan_does_not_probe_stopped_container_endpoint_reused_by_live_service(
     settings, monkeypatch
 ):
@@ -376,6 +411,11 @@ def test_scan_does_not_probe_stopped_container_endpoint_reused_by_live_service(
             },
             "State": {"Status": "exited"},
             "NetworkSettings": {"Ports": {}},
+            "HostConfig": {
+                "PortBindings": {
+                    "8000/tcp": [{"HostIp": "", "HostPort": "8011"}]
+                }
+            },
         }
 
         def reload(self):
@@ -426,7 +466,9 @@ def test_scan_does_not_probe_stopped_container_endpoint_reused_by_live_service(
     assert discovered == [stopped]
     assert stopped.api_model_name == "nemotron-3.5-lightning"
     assert stopped.status == "exited"
-    assert stopped.health == "unhealthy"
+    assert stopped.endpoint_url == "http://127.0.0.1:8011"
+    assert stopped.port == 8011
+    assert stopped.health == "unknown"
 
 
 def test_model_metadata_is_derived_from_snapshot_and_config(tmp_path):

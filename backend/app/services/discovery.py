@@ -127,11 +127,14 @@ def container_candidate(attrs: dict[str, Any]) -> dict[str, Any] | None:
     internal_port = _argument(command, "--port") or "8000"
     ports = (attrs.get("NetworkSettings") or {}).get("Ports") or {}
     bindings = ports.get(f"{internal_port}/tcp") or []
+    if not bindings:
+        port_bindings = (attrs.get("HostConfig") or {}).get("PortBindings") or {}
+        bindings = port_bindings.get(f"{internal_port}/tcp") or []
     host_port = bindings[0].get("HostPort") if bindings else internal_port
     if not host_port or not str(host_port).isdigit():
         return None
 
-    model_name = _argument(command, "--served-model-name")
+    model_name = _argument(command, "--served-model-name", "--alias")
     model_path = _argument(command, "--model", "--model-path")
     model_name = model_name or model_path or attrs.get("Name", "").lstrip("/")
     state = attrs.get("State") or {}
@@ -320,7 +323,7 @@ class DiscoveryService:
             probe = (
                 self._probe(candidate)
                 if candidate["status"] == "running"
-                else {"health": "unhealthy"}
+                else {}
             )
             candidate.update(probe)
             existing = db.scalar(
