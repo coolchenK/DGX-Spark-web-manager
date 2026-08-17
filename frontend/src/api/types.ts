@@ -124,6 +124,7 @@ export interface Provider {
   headers: Record<string, string>
   enabled: boolean
   last_test_status: string | null
+  last_test_result: ProviderProbeResult
   last_tested_at: string | null
   created_at: string
   updated_at: string
@@ -157,6 +158,20 @@ export interface OperationPlan {
   result: Record<string, unknown>
   created_at: string
   updated_at: string
+}
+
+export interface ProviderProbeResult {
+  status?: string
+  connection?: {
+    status?: string
+    models_seen?: number
+    error?: string
+  }
+  default_model?: {
+    status?: string
+    model?: string
+    error?: string
+  }
 }
 
 export interface OpsSessionSummary {

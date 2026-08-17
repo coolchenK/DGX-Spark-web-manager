@@ -1,10 +1,10 @@
-import { ApiOutlined, DeleteOutlined, EditOutlined, MinusCircleOutlined, PlusOutlined } from '@ant-design/icons'
+import { ApiOutlined, CheckCircleFilled, DeleteOutlined, EditOutlined, MinusCircleOutlined, PlusOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Button, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Tag, message } from 'antd'
+import { Alert, Button, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Tag, message } from 'antd'
 import { useState } from 'react'
 
 import { api } from '../api/client'
-import type { Provider } from '../api/types'
+import type { Provider, ProviderProbeResult } from '../api/types'
 import { PageHeader } from '../components/PageHeader'
 import { QueryState } from '../components/QueryState'
 import { ResponsiveDataView } from '../components/ResponsiveDataView'
@@ -20,6 +20,41 @@ interface ProviderForm {
   timeout_seconds: number
   enabled: boolean
   header_pairs?: Array<{ key?: string; value?: string }>
+}
+
+function ProbeError({ title, error }: { title: string; error?: string }) {
+  return (
+    <Alert
+      className="provider-probe-error"
+      type="error"
+      showIcon
+      message={title}
+      description={error && (
+        <details>
+          <summary>技术详情</summary>
+          <code>{error}</code>
+        </details>
+      )}
+    />
+  )
+}
+
+function ProviderProbeSummary({ result }: { result: ProviderProbeResult }) {
+  const connection = result.connection
+  const defaultModel = result.default_model
+  if (!connection && !defaultModel) return null
+  return (
+    <div className="provider-probe" aria-label="Provider 测试详情">
+      {connection?.status === 'healthy'
+        ? <div className="provider-probe-ok"><CheckCircleFilled /><span>API 连接正常</span>{connection.models_seen != null && <small>已发现 {connection.models_seen} 个模型</small>}</div>
+        : connection?.status === 'failed' && <ProbeError title="API 连接失败" error={connection.error} />}
+      {defaultModel?.status === 'healthy'
+        ? <div className="provider-probe-ok"><CheckCircleFilled /><span>默认模型可用</span><small>{defaultModel.model}</small></div>
+        : defaultModel?.status === 'failed'
+          ? <ProbeError title="默认模型不可用" error={defaultModel.error} />
+          : defaultModel?.status === 'not_tested' && <div className="provider-probe-muted"><MinusCircleOutlined /><span>默认模型未测试</span></div>}
+    </div>
+  )
 }
 
 
@@ -44,7 +79,16 @@ export function ProvidersPage() {
       queryClient.invalidateQueries({ queryKey: ['providers'] })
     },
   })
-  const test = useMutation({ mutationFn: (id: string) => api.post<{ status: string }>(`/api/providers/${id}/test`), onSuccess: (result) => { message[result.status === 'healthy' ? 'success' : 'error'](result.status === 'healthy' ? '连接成功' : '连接失败'); queryClient.invalidateQueries({ queryKey: ['providers'] }) } })
+  const test = useMutation({
+    mutationFn: (id: string) => api.post<ProviderProbeResult>(`/api/providers/${id}/test`),
+    onSuccess: (result, id) => {
+      queryClient.setQueryData<Provider[]>(['providers'], (current = []) => current.map((provider) => provider.id === id ? { ...provider, last_test_status: result.status ?? 'failed', last_test_result: result, last_tested_at: new Date().toISOString() } : provider))
+      message[result.status === 'healthy' ? 'success' : 'error'](result.status === 'healthy' ? '连接与默认模型测试成功' : 'Provider 测试未通过')
+      void queryClient.invalidateQueries({ queryKey: ['providers'] })
+      void queryClient.invalidateQueries({ queryKey: ['diagnostics'] })
+    },
+    onError: (error) => message.error(error instanceof Error ? error.message : 'Provider 测试失败'),
+  })
   const remove = useMutation({ mutationFn: (id: string) => api.delete(`/api/providers/${id}`), onSuccess: () => { message.success('服务已删除'); queryClient.invalidateQueries({ queryKey: ['providers'] }) } })
 
   const createProvider = () => {
@@ -65,7 +109,7 @@ export function ProvidersPage() {
     })
     setOpen(true)
   }
-  const actions = (provider: Provider) => <Space wrap><Button size="small" icon={<ApiOutlined />} loading={test.isPending} onClick={() => test.mutate(provider.id)}>测试</Button><Button size="small" icon={<EditOutlined />} onClick={() => editProvider(provider)}>编辑</Button><Popconfirm title={`删除 ${provider.name}`} onConfirm={() => remove.mutate(provider.id)}><Button size="small" danger icon={<DeleteOutlined />} aria-label="删除服务" /></Popconfirm></Space>
+  const actions = (provider: Provider) => <Space wrap><Button aria-label="测试连接" size="small" icon={<ApiOutlined />} loading={test.isPending && test.variables === provider.id} onClick={() => test.mutate(provider.id)}>测试连接</Button><Button size="small" icon={<EditOutlined />} onClick={() => editProvider(provider)}>编辑</Button><Popconfirm title={`删除 ${provider.name}`} onConfirm={() => remove.mutate(provider.id)}><Button size="small" danger icon={<DeleteOutlined />} aria-label="删除服务" /></Popconfirm></Space>
 
   return (
     <div className="page-stack">
@@ -75,12 +119,12 @@ export function ProvidersPage() {
           { title: '名称', dataIndex: 'name', render: (_, item) => <div className="primary-cell"><strong>{item.name}</strong><small>{item.base_url}</small></div> },
           { title: '默认模型', dataIndex: 'default_model' },
           { title: '密钥', dataIndex: 'api_key_masked', render: (value) => <Tag>{value}</Tag> },
-          { title: '状态', dataIndex: 'last_test_status', render: (value) => <StatusBadge status={value ?? 'unknown'} /> },
+          { title: '状态', dataIndex: 'last_test_status', width: 280, render: (_, item) => <div className="provider-status"><StatusBadge status={item.last_test_status ?? 'unknown'} /><ProviderProbeSummary result={item.last_test_result} /></div> },
           { title: '最后测试', dataIndex: 'last_tested_at', render: formatDate },
           { title: '操作', render: (_, item) => actions(item) },
-        ]} renderMobile={(item) => <div className="mobile-record"><Space><strong>{item.name}</strong><StatusBadge status={item.last_test_status ?? 'unknown'} /></Space><span>{item.base_url}</span><dl><div><dt>默认模型</dt><dd>{item.default_model}</dd></div><div><dt>最后测试</dt><dd>{formatDate(item.last_tested_at)}</dd></div></dl>{actions(item)}</div>} />
+        ]} renderMobile={(item) => <div className="mobile-record"><Space><strong>{item.name}</strong><StatusBadge status={item.last_test_status ?? 'unknown'} /></Space><span>{item.base_url}</span><dl><div><dt>默认模型</dt><dd>{item.default_model}</dd></div><div><dt>最后测试</dt><dd>{formatDate(item.last_tested_at)}</dd></div></dl><ProviderProbeSummary result={item.last_test_result} />{actions(item)}</div>} />
       </QueryState>
-      <Modal title={editing ? '编辑在线 AI 服务' : '添加在线 AI 服务'} open={open} footer={null} onCancel={() => { setOpen(false); setEditing(null) }} destroyOnClose>
+      <Modal title={editing ? '编辑在线 AI 服务' : '添加在线 AI 服务'} open={open} footer={null} onCancel={() => { setOpen(false); setEditing(null) }} destroyOnHidden>
         <Form form={form} layout="vertical" onFinish={(values) => save.mutate(values)}>
           <Form.Item name="name" label="名称" rules={[{ required: true }]}><Input /></Form.Item>
           <Form.Item name="base_url" label="Base URL" rules={[{ required: true, type: 'url' }]}><Input placeholder="https://api.example.com/v1" /></Form.Item>

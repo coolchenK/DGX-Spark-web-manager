@@ -134,6 +134,18 @@ button, input, textarea, select { letter-spacing: 0; }
 .hf-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
 .provider-headers { width: 100%; }
+.provider-status { min-width: 0; display: grid; gap: 8px; }
+.provider-probe { min-width: 0; display: grid; gap: 6px; }
+.provider-probe-ok, .provider-probe-muted { min-width: 0; display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 2px 7px; align-items: center; font-size: 12px; }
+.provider-probe-ok > .anticon { color: oklch(0.58 0.15 145); }
+.provider-probe-muted > .anticon { color: var(--color-muted); }
+.provider-probe-ok small { grid-column: 2; color: var(--color-muted); overflow-wrap: anywhere; }
+.provider-probe-error { padding: 7px 9px; }
+.provider-probe-error .ant-alert-message { font-size: 12px; }
+.provider-probe-error .ant-alert-description { font-size: 11px; }
+.provider-probe-error details { min-width: 0; margin-top: 3px; }
+.provider-probe-error summary { cursor: pointer; color: var(--color-muted); }
+.provider-probe-error code { display: block; max-height: 96px; overflow: auto; margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .deployment-preview { display: grid; gap: 16px; }
 .deployment-preview h5.ant-typography { margin: 0 0 6px; font-size: 14px; }
 .deployment-preview pre { overflow: auto; margin: 0; padding: 12px; border-radius: 6px; background: var(--color-surface); }

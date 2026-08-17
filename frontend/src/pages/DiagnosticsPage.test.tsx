@@ -20,6 +20,7 @@ const provider: Provider = {
   headers: {},
   enabled: true,
   last_test_status: 'healthy',
+  last_test_result: {},
   last_tested_at: '2026-08-18T00:00:00Z',
   created_at: '2026-08-18T00:00:00Z',
   updated_at: '2026-08-18T00:00:00Z',
