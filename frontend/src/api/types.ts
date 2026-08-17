@@ -130,7 +130,11 @@ export interface Provider {
 }
 
 export interface OperationStep {
+  id?: string
   operation: string
+  command?: string
+  cwd?: string
+  timeout?: number
   deployment_id: string | null
   reason: string
   impact: string
@@ -153,6 +157,52 @@ export interface OperationPlan {
   result: Record<string, unknown>
   created_at: string
   updated_at: string
+}
+
+export interface OpsSessionSummary {
+  id: string
+  title: string
+  provider_id: string | null
+  provider_name: string | null
+  deployment_id: string | null
+  deployment_name: string | null
+  status: string
+  requested_by: string
+  created_at: string
+  updated_at: string
+}
+
+export interface OpsMessage {
+  id: string
+  session_id: string
+  role: 'user' | 'assistant' | 'system' | 'tool'
+  content: string
+  metadata: Record<string, unknown>
+  operation_plan_id: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface OpsToolRun {
+  id: string
+  session_id: string
+  tool_name: string
+  risk: string
+  status: string
+  arguments: Record<string, unknown>
+  result: Record<string, unknown>
+  agent_job_id: string | null
+  error: string | null
+  started_at: string | null
+  finished_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface OpsSession extends OpsSessionSummary {
+  messages: OpsMessage[]
+  tool_runs: OpsToolRun[]
+  plans: OperationPlan[]
 }
 
 export interface AuditEvent {
