@@ -59,6 +59,9 @@ export function ModelsPage() {
       <Button danger size="small" icon={<DeleteOutlined />} aria-label={`删除模型 ${item.name}`} onClick={() => openDelete(item)} />
     </Tooltip>
   )
+  const sizeLabel = (item: ModelAsset) => (
+    item.status === 'unavailable' && item.size_bytes === 0 ? '缓存不完整' : formatBytes(item.size_bytes)
+  )
   return (
     <div className="page-stack">
       <PageHeader title="模型库" description="统一查看 Hugging Face 缓存、本地目录与部署关联" extra={<Button icon={<ReloadOutlined />} loading={scan.isPending} onClick={() => scan.mutate()}>扫描模型</Button>} />
@@ -67,11 +70,11 @@ export function ModelsPage() {
         <ResponsiveDataView data={data} rowKey="id" columns={[
           { title: '模型', dataIndex: 'name', render: (_, item) => <div className="primary-cell"><strong>{item.name}</strong><small>{item.repository_id ?? item.local_path}</small></div> },
           { title: '来源', dataIndex: 'source', width: 120, render: (value) => <Tag>{value}</Tag> },
-          { title: '大小', dataIndex: 'size_bytes', width: 110, render: (value) => formatBytes(value) },
+          { title: '大小', dataIndex: 'size_bytes', width: 110, render: (_, item) => sizeLabel(item) },
           { title: '能力', dataIndex: 'capabilities', render: (values: string[]) => <Space size={[2, 4]} wrap>{values.map((value) => <Tag key={value}>{value}</Tag>)}</Space> },
           { title: '状态', dataIndex: 'status', width: 100, render: (value) => <StatusBadge status={value} /> },
-          { title: '', width: 132, render: (_, item) => <Space size="small"><Button size="small" icon={<RocketOutlined />} onClick={() => navigate(`/deployments?model=${item.id}`)}>部署</Button>{deleteButton(item)}</Space> },
-        ]} renderMobile={(item) => <div className="mobile-record"><Flex justify="space-between"><Space><AppstoreAddOutlined /><strong>{item.name}</strong></Space><StatusBadge status={item.status} /></Flex><Typography.Text type="secondary">{item.repository_id ?? item.local_path}</Typography.Text><dl><div><dt>大小</dt><dd>{formatBytes(item.size_bytes)}</dd></div><div><dt>更新</dt><dd>{formatDate(item.updated_at)}</dd></div></dl><Flex gap="small"><Button block icon={<RocketOutlined />} onClick={() => navigate(`/deployments?model=${item.id}`)}>部署模型</Button>{deleteButton(item)}</Flex></div>} />
+          { title: '', width: 132, render: (_, item) => <Space size="small"><Button size="small" icon={<RocketOutlined />} disabled={item.status !== 'available'} onClick={() => navigate(`/deployments?model=${item.id}`)}>部署</Button>{deleteButton(item)}</Space> },
+        ]} renderMobile={(item) => <div className="mobile-record"><Flex justify="space-between"><Space><AppstoreAddOutlined /><strong>{item.name}</strong></Space><StatusBadge status={item.status} /></Flex><Typography.Text type="secondary">{item.repository_id ?? item.local_path}</Typography.Text><dl><div><dt>大小</dt><dd>{sizeLabel(item)}</dd></div><div><dt>更新</dt><dd>{formatDate(item.updated_at)}</dd></div></dl><Flex gap="small"><Button block icon={<RocketOutlined />} disabled={item.status !== 'available'} onClick={() => navigate(`/deployments?model=${item.id}`)}>部署模型</Button>{deleteButton(item)}</Flex></div>} />
       </QueryState>
       <Modal
         title="永久删除模型"
@@ -103,7 +106,7 @@ export function ModelsPage() {
                 {deleteTarget.repository_id ?? deleteTarget.local_path}
               </Descriptions.Item>
               <Descriptions.Item label="格式">{deleteTarget.format ?? '未知'}</Descriptions.Item>
-              <Descriptions.Item label="大小">{formatBytes(deleteTarget.size_bytes)}</Descriptions.Item>
+              <Descriptions.Item label="大小">{sizeLabel(deleteTarget)}</Descriptions.Item>
             </Descriptions>
             {references.length > 0 && (
               <Alert

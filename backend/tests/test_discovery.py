@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import pytest
 from app.db import Database
@@ -8,6 +9,7 @@ from app.services import discovery
 from app.services.discovery import (
     DiscoveryService,
     container_candidate,
+    hf_snapshot_is_complete,
     infer_runtime,
     parse_hf_cache_repository,
     resolve_hf_snapshot,
@@ -51,6 +53,55 @@ def test_resolve_hf_snapshot_returns_none_without_a_valid_snapshot(tmp_path):
     repository.mkdir()
 
     assert resolve_hf_snapshot(repository) is None
+
+
+def test_hf_snapshot_requires_resolvable_repository_blobs(tmp_path):
+    repository = tmp_path / "models--org--model"
+    snapshot = repository / "snapshots" / "commit123"
+    blob = repository / "blobs" / ("a" * 64)
+    snapshot.mkdir(parents=True)
+    blob.parent.mkdir()
+    link = snapshot / "model.safetensors"
+    try:
+        link.symlink_to(Path("../../blobs") / blob.name)
+    except OSError:
+        pytest.skip("Symlink creation is unavailable")
+
+    assert hf_snapshot_is_complete(repository, snapshot) is False
+
+    blob.write_bytes(b"weights")
+
+    assert hf_snapshot_is_complete(repository, snapshot) is True
+
+
+def test_scan_marks_broken_hf_snapshot_unavailable_and_recovers(settings):
+    repository = settings.model_root_paths[0] / "models--org--broken-model"
+    snapshot = repository / "snapshots" / "commit123"
+    blob = repository / "blobs" / ("b" * 64)
+    snapshot.mkdir(parents=True)
+    blob.parent.mkdir()
+    link = snapshot / "model.safetensors"
+    try:
+        link.symlink_to(Path("../../blobs") / blob.name)
+    except OSError:
+        pytest.skip("Symlink creation is unavailable")
+    database = Database(settings.database_url)
+    database.create_schema()
+
+    with database.session_factory() as db:
+        first = DiscoveryService(settings.model_root_paths).scan_models(db)[0]
+        assert first.status == "unavailable"
+        assert first.local_path == str(repository)
+        assert first.size_bytes == 0
+        assert first.format is None
+
+        blob.write_bytes(b"weights")
+        recovered = DiscoveryService(settings.model_root_paths).scan_models(db)[0]
+
+    assert recovered.status == "available"
+    assert recovered.local_path == str(snapshot)
+    assert recovered.size_bytes == len(b"weights")
+    assert recovered.format == "safetensors"
 
 
 def test_scan_hf_repository_without_snapshot_creates_unavailable_asset(settings):

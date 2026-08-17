@@ -51,6 +51,47 @@ def resolve_hf_snapshot(repository_path: Path) -> Path | None:
     return None
 
 
+def hf_snapshot_is_complete(repository_path: Path, snapshot_path: Path) -> bool:
+    """Require every snapshot file link to resolve to this repository's blob store."""
+    try:
+        repository = Path(os.path.abspath(repository_path))
+        snapshot = Path(os.path.abspath(snapshot_path))
+        if repository.is_symlink() or not snapshot.is_dir() or snapshot.is_symlink():
+            return False
+        lexical_blob_root = repository / "blobs"
+        blob_root: Path | None = None
+
+        saw_file = False
+        saw_nonempty_file = False
+        for path in snapshot.rglob("*"):
+            if path.is_symlink():
+                if lexical_blob_root.is_symlink():
+                    return False
+                if blob_root is None:
+                    blob_root = lexical_blob_root.resolve(strict=True)
+                    if not blob_root.is_dir():
+                        return False
+                target = path.resolve(strict=True)
+                if (
+                    target.parent != blob_root
+                    or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target.name) is None
+                    or not target.is_file()
+                ):
+                    return False
+                size = target.stat().st_size
+            elif path.is_dir():
+                continue
+            elif path.is_file():
+                size = path.stat().st_size
+            else:
+                return False
+            saw_file = True
+            saw_nonempty_file = saw_nonempty_file or size > 0
+        return saw_file and saw_nonempty_file
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def infer_runtime(image: str, command: list[str]) -> str | None:
     haystack = " ".join([image, *command]).lower()
     if "sglang" in haystack:
@@ -373,7 +414,9 @@ class DiscoveryService:
                     if lifecycle_status is not None
                     else None
                 )
-                if repository_id and snapshot is None:
+                if repository_id and (
+                    snapshot is None or not hf_snapshot_is_complete(child, snapshot)
+                ):
                     _mark_model_unavailable(
                         existing,
                         local_path=child,

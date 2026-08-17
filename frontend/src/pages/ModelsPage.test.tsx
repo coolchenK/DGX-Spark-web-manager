@@ -80,9 +80,9 @@ function deferred<T>() {
   return { promise, reject, resolve }
 }
 
-function renderModelsPage() {
+function renderModelsPage(items = models) {
   const user = userEvent.setup()
-  vi.spyOn(api, 'get').mockResolvedValue(models)
+  vi.spyOn(api, 'get').mockResolvedValue(items)
   const deleteSpy = vi.spyOn(api, 'delete').mockResolvedValue(task)
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -114,6 +114,25 @@ async function openDeleteDialog(
 
 
 describe('ModelsPage permanent deletion', () => {
+  it('labels an incomplete cache and disables deployment', async () => {
+    const incomplete: ModelAsset = {
+      ...models[0],
+      id: 'incomplete-model',
+      name: 'RadixArk/Qwen3.8-27B-DSpark',
+      repository_id: 'RadixArk/Qwen3.8-27B-DSpark',
+      size_bytes: 0,
+      status: 'unavailable',
+      format: null,
+      capabilities: [],
+    }
+    renderModelsPage([incomplete])
+
+    const record = (await screen.findByText(incomplete.name, { selector: 'strong' })).closest('.mobile-record')
+    expect(record).not.toBeNull()
+    expect(within(record as HTMLElement).getByText('缓存不完整')).toBeInTheDocument()
+    expect(within(record as HTMLElement).getByRole('button', { name: /部署模型/ })).toBeDisabled()
+  })
+
   it('offers model-specific delete actions in the mobile list', async () => {
     renderModelsPage()
 
