@@ -7,6 +7,7 @@ import os
 import signal
 import stat
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -1411,6 +1412,263 @@ def test_launcher_waits_for_go_and_eof_never_executes(tmp_path):
     assert not worker.is_alive()
     assert calls == [(expected_argv[0], list(expected_argv), expected_environment)]
     assert result == [0]
+
+
+def test_launcher_request_serialization_handles_utf8_worst_cases():
+    from host_agent.dgx_ops_agent import launcher
+
+    command = "x"
+    control_argument = "\x01" * (launcher.MAX_ARGUMENT_BYTES - len(command))
+    control_payload = launcher.serialize_request(
+        argv=(command, control_argument),
+        cwd="/",
+        environment={"PATH": SAFE_PATH},
+    )
+    assert len(control_payload) <= launcher.MAX_LAUNCH_REQUEST_SIZE
+    assert json.loads(control_payload.decode("utf-8"))["argv"] == [
+        command,
+        control_argument,
+    ]
+
+    emoji_count = (launcher.MAX_ARGUMENT_BYTES - len(command)) // 4
+    emoji_remainder = launcher.MAX_ARGUMENT_BYTES - len(command) - emoji_count * 4
+    emoji_argument = "\U0001f642" * emoji_count + "x" * emoji_remainder
+    emoji_payload = launcher.serialize_request(
+        argv=(command, emoji_argument),
+        cwd="/",
+        environment={"PATH": SAFE_PATH},
+    )
+    assert len(emoji_payload) <= launcher.MAX_LAUNCH_REQUEST_SIZE
+    assert json.loads(emoji_payload.decode("utf-8"))["argv"] == [
+        command,
+        emoji_argument,
+    ]
+
+
+def test_launcher_write_request_closes_owned_descriptor_on_all_failures(
+    monkeypatch,
+):
+    from host_agent.dgx_ops_agent import launcher
+
+    def assert_closed_after_failure(**request):
+        request_read, request_write = os.pipe()
+        with pytest.raises((TypeError, ValueError)):
+            launcher.write_request(request_write, **request)
+        with pytest.raises(OSError):
+            os.fstat(request_write)
+        os.close(request_read)
+
+    valid_request = {
+        "argv": ("command",),
+        "cwd": "/",
+        "environment": {"PATH": SAFE_PATH},
+    }
+    assert_closed_after_failure(
+        argv=(),
+        cwd=valid_request["cwd"],
+        environment=valid_request["environment"],
+    )
+
+    original_dumps = launcher.json.dumps
+    monkeypatch.setattr(
+        launcher.json,
+        "dumps",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TypeError("serialize")),
+    )
+    assert_closed_after_failure(**valid_request)
+    monkeypatch.setattr(launcher.json, "dumps", original_dumps)
+
+    assert_closed_after_failure(
+        argv=valid_request["argv"],
+        cwd="x" * launcher.MAX_LAUNCH_REQUEST_SIZE,
+        environment=valid_request["environment"],
+    )
+
+
+def test_runner_rejects_oversized_launcher_request_before_creating_job(tmp_path):
+    from host_agent.dgx_ops_agent import launcher
+
+    runner = JobRunner(tmp_path)
+
+    with pytest.raises(ValueError, match="launcher request"):
+        runner.start(
+            ["command"],
+            cwd="x" * launcher.MAX_LAUNCH_REQUEST_SIZE,
+            environment={"LANG": "C"},
+        )
+
+    assert list(tmp_path.glob("*.json")) == []
+    assert runner._jobs == {}
+
+
+def test_spawn_closes_first_pipe_when_second_pipe_creation_fails(
+    tmp_path, monkeypatch
+):
+    runner = JobRunner(tmp_path)
+    real_pipe = os.pipe
+    created_descriptors = []
+    calls = 0
+
+    def fail_second_pipe():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second pipe failure")
+        descriptors = real_pipe()
+        created_descriptors.extend(descriptors)
+        return descriptors
+
+    monkeypatch.setattr(runner_module, "_HAS_PROCESS_GROUPS", True)
+    monkeypatch.setattr(runner_module.os, "pipe", fail_second_pipe)
+
+    with pytest.raises(OSError, match="second pipe failure"):
+        runner._spawn_process(
+            ("command",),
+            None,
+            {"PATH": SAFE_PATH},
+            "recovery-token",
+        )
+
+    assert len(created_descriptors) == 2
+    for descriptor in created_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_spawn_closes_all_pipes_when_launcher_resolution_fails(
+    tmp_path, monkeypatch
+):
+    runner = JobRunner(tmp_path)
+    real_pipe = os.pipe
+    created_descriptors = []
+
+    def tracking_pipe():
+        descriptors = real_pipe()
+        created_descriptors.extend(descriptors)
+        return descriptors
+
+    def fail_resolve(*_args, **_kwargs):
+        raise OSError("injected launcher resolution failure")
+
+    monkeypatch.setattr(runner_module, "_HAS_PROCESS_GROUPS", True)
+    monkeypatch.setattr(runner_module.os, "pipe", tracking_pipe)
+    monkeypatch.setattr(runner_module.Path, "resolve", fail_resolve)
+
+    with pytest.raises(OSError, match="launcher resolution failure"):
+        runner._spawn_process(
+            ("command",),
+            None,
+            {"PATH": SAFE_PATH},
+            "recovery-token",
+        )
+
+    assert len(created_descriptors) == 4
+    for descriptor in created_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_cancel_before_launcher_go_never_executes_and_reaps(
+    tmp_path, monkeypatch
+):
+    marker = tmp_path / "must-not-run"
+    ready_persisted = threading.Event()
+    release_worker = threading.Event()
+    launcher_exited = threading.Event()
+    wait_calls = []
+    gate_read, gate_write = os.pipe()
+
+    class FakeLauncherProcess:
+        pid = 4242
+        stdout = io.BytesIO()
+        exit_code = None
+
+        def poll(self):
+            return self.exit_code
+
+        def wait(self, timeout=None):
+            wait_calls.append(timeout)
+            if not launcher_exited.wait(timeout):
+                raise subprocess.TimeoutExpired("launcher", timeout)
+            return self.exit_code
+
+    process = FakeLauncherProcess()
+
+    def fake_launcher():
+        try:
+            if os.read(gate_read, 1) == b"G":
+                marker.touch()
+                process.exit_code = 0
+            else:
+                process.exit_code = 75
+        finally:
+            os.close(gate_read)
+            launcher_exited.set()
+
+    launcher_thread = threading.Thread(target=fake_launcher)
+    launcher_thread.start()
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+    original_persist = runner._persist
+    blocked_once = False
+
+    def block_after_ready_fsync(state):
+        nonlocal blocked_once
+        original_persist(state)
+        if state.launch_phase == "ready" and not blocked_once:
+            blocked_once = True
+            runner._lock.release()
+            try:
+                ready_persisted.set()
+                assert release_worker.wait(1)
+            finally:
+                runner._lock.acquire()
+
+    def capture_identity(_pid, recovery_token):
+        return runner_module._ProcessIdentity(
+            pid=process.pid,
+            process_group=process.pid,
+            session_id=process.pid,
+            start_time_ticks=1,
+            boot_id="boot-id",
+            recovery_token=recovery_token,
+        )
+
+    monkeypatch.setattr(runner_module, "_HAS_PROCESS_GROUPS", True)
+    monkeypatch.setattr(runner, "_persist", block_after_ready_fsync)
+    monkeypatch.setattr(
+        runner,
+        "_spawn_process",
+        lambda *_args, **_kwargs: (process, gate_write),
+    )
+    monkeypatch.setattr(runner, "_capture_process_identity", capture_identity)
+    monkeypatch.setattr(
+        runner,
+        "_process_group_exists",
+        lambda _process_group: process.poll() is None,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_terminate",
+        lambda *_args: setattr(process, "exit_code", -signal.SIGTERM),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_kill",
+        lambda *_args: setattr(process, "exit_code", -signal.SIGKILL),
+    )
+
+    job = runner.start(["command"], cwd=tmp_path, timeout=1)
+    assert ready_persisted.wait(1)
+    cancelled = runner.cancel(job.id)
+    assert cancelled.status == "running"
+    release_worker.set()
+
+    result = _wait_for_terminal(runner, job.id)
+    launcher_thread.join(timeout=1)
+    assert not launcher_thread.is_alive()
+    assert result.status == "cancelled"
+    assert not marker.exists()
+    assert wait_calls
 
 
 def test_runner_persists_pre_spawn_recovery_token(tmp_path, monkeypatch):

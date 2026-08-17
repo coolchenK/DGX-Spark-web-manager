@@ -13,7 +13,7 @@ EXIT_GATE_CLOSED = 75
 EXIT_INVALID_REQUEST = 76
 EXIT_EXEC_FAILED = 126
 GO = b"G"
-MAX_REQUEST_SIZE = 128 * 1024
+MAX_LAUNCH_REQUEST_SIZE = 512 * 1024
 MAX_ARGUMENTS = 256
 MAX_ARGUMENT_BYTES = 64 * 1024
 MAX_ENVIRONMENT_VARIABLES = 18
@@ -32,21 +32,40 @@ def write_request(
 ) -> None:
     """Write one bounded request and close the pipe to mark it complete."""
 
+    try:
+        payload = serialize_request(
+            argv=argv,
+            cwd=cwd,
+            environment=environment,
+        )
+        _write_all(descriptor, struct.pack(">I", len(payload)) + payload)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def serialize_request(
+    *,
+    argv: Sequence[str],
+    cwd: str | None,
+    environment: Mapping[str, str],
+) -> bytes:
+    """Validate and encode the exact launcher request representation."""
+
     request = _validate_request(
         {"argv": list(argv), "cwd": cwd, "environment": dict(environment)}
     )
     payload = json.dumps(
         request,
-        ensure_ascii=True,
+        ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
-    ).encode("ascii")
-    if not payload or len(payload) > MAX_REQUEST_SIZE:
+    ).encode("utf-8")
+    if not payload or len(payload) > MAX_LAUNCH_REQUEST_SIZE:
         raise ValueError("invalid launcher request")
-    try:
-        _write_all(descriptor, struct.pack(">I", len(payload)) + payload)
-    finally:
-        os.close(descriptor)
+    return payload
 
 
 def run_launcher(
@@ -62,14 +81,14 @@ def run_launcher(
         if len(header) != 4:
             return EXIT_INVALID_REQUEST
         length = struct.unpack(">I", header)[0]
-        if not 0 < length <= MAX_REQUEST_SIZE:
+        if not 0 < length <= MAX_LAUNCH_REQUEST_SIZE:
             return EXIT_INVALID_REQUEST
         payload = _read_exact(request_descriptor, length)
         if len(payload) != length or os.read(request_descriptor, 1):
             return EXIT_INVALID_REQUEST
         try:
             request = json.loads(
-                payload.decode("ascii"),
+                payload.decode("utf-8"),
                 object_pairs_hook=_reject_duplicate_keys,
                 parse_constant=lambda _value: _raise_invalid_request(),
             )
@@ -183,4 +202,12 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["EXIT_GATE_CLOSED", "run_launcher", "write_request"]
+__all__ = [
+    "EXIT_GATE_CLOSED",
+    "MAX_ARGUMENT_BYTES",
+    "MAX_ARGUMENTS",
+    "MAX_LAUNCH_REQUEST_SIZE",
+    "run_launcher",
+    "serialize_request",
+    "write_request",
+]

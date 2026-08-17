@@ -13,11 +13,18 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .launcher import GO, write_request
+from .launcher import (
+    GO,
+    MAX_ARGUMENT_BYTES,
+    MAX_ARGUMENTS,
+    serialize_request,
+    write_request,
+)
 from .policy import ValidatedAction
 from .redaction import StreamingRedactor, redact_text
 
@@ -30,8 +37,6 @@ _RECOVERY_ENVIRONMENT_KEY = "DGX_OPS_RECOVERY_TOKEN"
 DEFAULT_OUTPUT_LIMIT = 64 * 1024
 MAX_OUTPUT_LIMIT = 16 * 1024 * 1024
 MAX_ERROR_BYTES = 512
-MAX_ARGUMENTS = 256
-MAX_ARGUMENT_BYTES = 64 * 1024
 TERMINAL_STATUSES = frozenset(
     {"succeeded", "failed", "timed_out", "cancelled"}
 )
@@ -49,6 +54,7 @@ _ALLOWED_ENVIRONMENT = frozenset(
         "TZ",
     }
 )
+_RECOVERY_TOKEN_PLACEHOLDER = "x" * 43
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +122,28 @@ class _JobState:
     launch_phase: str | None = None
     recovery_token: str | None = None
     cancel_requested: threading.Event = field(default_factory=threading.Event)
+
+
+class _OwnedDescriptor:
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor: int | None = descriptor
+
+    def take(self) -> int:
+        descriptor = self._descriptor
+        if descriptor is None:
+            raise RuntimeError("descriptor ownership already transferred")
+        self._descriptor = None
+        return descriptor
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor is None:
+            return
+        self._descriptor = None
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 class JobRunner:
@@ -260,12 +288,16 @@ class JobRunner:
             not isinstance(resolved_cwd, str) or not resolved_cwd or "\x00" in resolved_cwd
         ):
             raise ValueError("invalid cwd")
-        return (
-            argv,
-            resolved_cwd,
-            float(resolved_timeout),
-            safe_environment(environment_items),
+        resolved_environment = safe_environment(environment_items)
+        serialize_request(
+            argv=argv,
+            cwd=resolved_cwd,
+            environment={
+                **resolved_environment,
+                _RECOVERY_ENVIRONMENT_KEY: _RECOVERY_TOKEN_PLACEHOLDER,
+            },
         )
+        return argv, resolved_cwd, float(resolved_timeout), resolved_environment
 
     @staticmethod
     def _validate_argv(invocation: Sequence[str]) -> tuple[str, ...]:
@@ -303,16 +335,26 @@ class JobRunner:
             )
             return process, None
 
-        request_read, request_write = os.pipe()
-        gate_read, gate_write = os.pipe()
-        launcher_path = Path(__file__).with_name("launcher.py").resolve(strict=True)
-        launcher_argv = (
-            sys.executable,
-            str(launcher_path),
-            str(request_read),
-            str(gate_read),
-        )
-        try:
+        with ExitStack() as descriptor_stack:
+            request_read, request_write = os.pipe()
+            request_read_owner = _OwnedDescriptor(request_read)
+            request_write_owner = _OwnedDescriptor(request_write)
+            descriptor_stack.callback(request_read_owner.close)
+            descriptor_stack.callback(request_write_owner.close)
+
+            gate_read, gate_write = os.pipe()
+            gate_read_owner = _OwnedDescriptor(gate_read)
+            gate_write_owner = _OwnedDescriptor(gate_write)
+            descriptor_stack.callback(gate_read_owner.close)
+            descriptor_stack.callback(gate_write_owner.close)
+
+            launcher_path = Path(__file__).with_name("launcher.py").resolve(strict=True)
+            launcher_argv = (
+                sys.executable,
+                str(launcher_path),
+                str(request_read),
+                str(gate_read),
+            )
             process = subprocess.Popen(
                 launcher_argv,
                 cwd=None,
@@ -324,30 +366,25 @@ class JobRunner:
                 start_new_session=True,
                 **common_options,
             )
-        except Exception:
-            for descriptor in (request_read, request_write, gate_read, gate_write):
-                self._close_descriptor(descriptor)
-            raise
 
-        self._close_descriptor(request_read)
-        self._close_descriptor(gate_read)
-        try:
-            write_request(
-                request_write,
-                argv=argv,
-                cwd=cwd,
-                environment=environment,
-            )
-        except Exception:
-            self._close_descriptor(gate_write)
-            self._terminate(process, process.pid)
+            self._close_descriptor(request_read_owner.take())
+            self._close_descriptor(gate_read_owner.take())
             try:
-                process.wait(timeout=max(self.termination_grace, 0.1))
-            except subprocess.TimeoutExpired:
-                self._kill(process, process.pid)
-                process.wait()
-            raise
-        return process, gate_write
+                write_request(
+                    request_write_owner.take(),
+                    argv=argv,
+                    cwd=cwd,
+                    environment=environment,
+                )
+            except Exception:
+                self._terminate(process, process.pid)
+                try:
+                    process.wait(timeout=max(self.termination_grace, 0.1))
+                except subprocess.TimeoutExpired:
+                    self._kill(process, process.pid)
+                    process.wait()
+                raise
+            return process, gate_write_owner.take()
 
     @staticmethod
     def _close_descriptor(descriptor: int | None) -> None:
@@ -462,27 +499,53 @@ class JobRunner:
                     pass
             return
 
+        gate_error: OSError | None = None
+        cancelled_before_go = False
         if gate_descriptor is not None:
+            with self._lock:
+                if state.cancel_requested.is_set():
+                    self._close_descriptor(gate_descriptor)
+                    gate_descriptor = None
+                    cancelled_before_go = True
+                else:
+                    try:
+                        if os.write(gate_descriptor, GO) != len(GO):
+                            raise OSError("launcher gate write failed")
+                    except OSError as exc:
+                        gate_error = exc
+                    finally:
+                        self._close_descriptor(gate_descriptor)
+                        gate_descriptor = None
+
+        if cancelled_before_go:
             try:
-                if os.write(gate_descriptor, GO) != len(GO):
-                    raise OSError("launcher gate write failed")
-            except OSError as exc:
-                self._close_descriptor(gate_descriptor)
+                exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
+            except subprocess.TimeoutExpired:
                 self._terminate(process, process_group)
                 try:
                     exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
                 except subprocess.TimeoutExpired:
                     self._kill(process, process_group)
                     exit_code = process.wait()
-                with self._lock:
-                    self._finish(
-                        state,
-                        "failed",
-                        exit_code,
-                        error=self._bounded_error(exc),
-                    )
-                return
-            self._close_descriptor(gate_descriptor)
+            with self._lock:
+                self._finish(state, "cancelled", exit_code)
+            return
+
+        if gate_error is not None:
+            self._terminate(process, process_group)
+            try:
+                exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
+            except subprocess.TimeoutExpired:
+                self._kill(process, process_group)
+                exit_code = process.wait()
+            with self._lock:
+                self._finish(
+                    state,
+                    "failed",
+                    exit_code,
+                    error=self._bounded_error(gate_error),
+                )
+            return
 
         redactor = StreamingRedactor(secret_values=(recovery_token,))
         reader_error: list[Exception] = []
