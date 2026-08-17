@@ -302,6 +302,62 @@ def test_unknown_credential_assignments_redact_the_entire_value(
     assert opaque not in result.error
 
 
+@pytest.mark.parametrize(
+    ("credential", "opaque"),
+    [
+        ("AZURE_OPENAI_API_KEY=multi-prefix-secret", "multi-prefix-secret"),
+        ("HUGGINGFACE_ACCESS_TOKEN=hf-secret", "hf-secret"),
+        ("MY_CUSTOM_CLIENT_SECRET=client-secret-value", "client-secret-value"),
+        ('"AZURE_OPENAI_API_KEY": "double-json-secret"', "double-json-secret"),
+        ("'MY_CUSTOM_CLIENT_SECRET': 'single-json-secret'", "single-json-secret"),
+        ("Authorization: Bearer multi-auth-secret", "multi-auth-secret"),
+    ],
+)
+def test_multi_segment_credential_labels_share_structured_key_semantics(
+    database: Database,
+    secret_box: SecretBox,
+    credential: str,
+    opaque: str,
+) -> None:
+    registry = OpsToolRegistry(
+        FakeAgent({"status": "succeeded", "output": credential}),
+        database.session_factory,
+        secret_box,
+    )
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = result.model_dump_json()
+
+    assert opaque not in dumped
+    assert result.output["output"] == "[REDACTED]"
+
+
+def test_bounded_credential_label_and_url_redaction_preserve_non_secret_text(
+    database: Database, secret_box: SecretBox
+) -> None:
+    bounded_label = f"{'A' * 120}_API_KEY"
+    assert len(bounded_label) == 128
+    output = (
+        f"{bounded_label}=bounded-secret "
+        "...?AZURE_OPENAI_API_KEY=query-secret&mode=read "
+        "token count is 7; password rotation pending"
+    )
+    registry = OpsToolRegistry(
+        FakeAgent({"status": "succeeded", "output": output}),
+        database.session_factory,
+        secret_box,
+    )
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    sanitized = result.output["output"]
+
+    assert "bounded-secret" not in sanitized
+    assert "query-secret" not in sanitized
+    assert "mode=read" in sanitized
+    assert "token count is 7" in sanitized
+    assert "password rotation pending" in sanitized
+
+
 def test_sensitive_key_matching_preserves_public_token_metrics(
     database: Database, secret_box: SecretBox
 ) -> None:

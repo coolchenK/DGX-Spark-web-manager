@@ -81,13 +81,9 @@ _SENSITIVE_KEY_SUFFIXES = (
     "_secret",
     "_secret_key",
 )
-_CREDENTIAL_LABEL = (
-    r"(?:authorization|(?:[a-z0-9]+[_-])?api[_-]?key|apikey|"
-    r"(?:[a-z0-9]+[_-])?token|password|passwd|"
-    r"(?:[a-z0-9]+[_-])?secret(?:[_-]key)?)"
-)
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
-    rf"(?<![A-Za-z0-9_])\"?{_CREDENTIAL_LABEL}\"?\s*[:=]\s*"
+    r"(?<![A-Za-z0-9_-])(?P<quote>[\"']?)"
+    r"(?P<label>[A-Za-z0-9][A-Za-z0-9_-]{0,127})(?P=quote)\s*[:=]\s*"
     r"(?:(?:bearer|basic)\s+)?"
     r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)''',
     re.IGNORECASE,
@@ -389,8 +385,16 @@ def _is_sensitive_key(value: str) -> bool:
     )
 
 
+def _redact_credential_assignment(match: re.Match[str]) -> str:
+    if _is_sensitive_key(match.group("label")):
+        return _REDACTED
+    return match.group(0)
+
+
 def _sanitize_string(value: str, secrets: tuple[str, ...], limit: int) -> str:
-    sanitized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(_REDACTED, value)
+    sanitized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
+        _redact_credential_assignment, value
+    )
     for secret in secrets:
         sanitized = sanitized.replace(secret, _REDACTED)
     if len(sanitized) <= limit:
