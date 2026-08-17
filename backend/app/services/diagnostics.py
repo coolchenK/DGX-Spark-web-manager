@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Deployment, Provider
+from app.services.provider_errors import OpsProviderError, ProviderConfigurationChanged
 from app.services.providers import ProviderService
 
 ALLOWED_OPERATIONS = {
@@ -17,6 +18,10 @@ ALLOWED_OPERATIONS = {
     "restart_deployment",
     "rescan_inventory",
 }
+
+
+class ProviderReadinessError(ValueError):
+    pass
 
 
 def build_diagnostic_request(
@@ -147,6 +152,42 @@ class DiagnosticService:
                 }
             )
         return {"system": self.system_service.snapshot(), "deployments": deployment_rows}
+
+    def ensure_provider_ready(self, db: Session, provider: Provider) -> None:
+        result = dict(provider.last_test_result or {})
+        if result:
+            default_model = result.get("default_model")
+            if (
+                result.get("status") == "healthy"
+                and isinstance(default_model, dict)
+                and default_model.get("status") == "healthy"
+            ):
+                return
+            raise ProviderReadinessError(
+                "Provider default model test is not healthy; test the Provider in Settings"
+            )
+
+        if provider.last_test_status != "healthy":
+            raise ProviderReadinessError(
+                "Provider has not passed a default model test; test the Provider in Settings"
+            )
+
+        try:
+            result = self.provider_service.test(db, provider)
+        except (OpsProviderError, ProviderConfigurationChanged, ValueError):
+            raise ProviderReadinessError(
+                "Provider readiness changed during its compatibility test; "
+                "test the Provider in Settings and retry"
+            ) from None
+        default_model = result.get("default_model")
+        if (
+            result.get("status") != "healthy"
+            or not isinstance(default_model, dict)
+            or default_model.get("status") != "healthy"
+        ):
+            raise ProviderReadinessError(
+                "Provider default model compatibility test failed; test the Provider in Settings"
+            )
 
     def diagnose(
         self,

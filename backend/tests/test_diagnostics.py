@@ -1,12 +1,24 @@
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.db import Database
-from app.models import Deployment, OperationPlan
+from app.models import (
+    AuditEvent,
+    Deployment,
+    OperationPlan,
+    OpsMessage,
+    OpsSession,
+    OpsToolRun,
+    Provider,
+    TaskRecord,
+)
 from app.operations.executor import OperationExecutor
 from app.services import deployments as deployment_service
 from app.services import diagnostics
 from app.services.diagnostics import parse_diagnostic_content, sanitize_steps
+from app.services.ops_provider import AssistantTurn
+from sqlalchemy import select
 
 
 class ExecutorContext:
@@ -254,3 +266,293 @@ def test_plan_must_be_approved_before_execution(authenticated_client):
         approved = db.get(OperationPlan, plan_id)
         assert approved.status in {"approved", "executing", "completed"}
         assert approved.approved_by == "admin"
+
+
+def _add_ops_provider(
+    authenticated_client,
+    *,
+    last_test_status="healthy",
+    last_test_result=None,
+    enabled=True,
+):
+    if last_test_result is None:
+        last_test_result = {
+            "status": "healthy",
+            "connection": {"status": "healthy", "models_seen": 1},
+            "default_model": {"status": "healthy", "model": "ops-model"},
+        }
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = Provider(
+            name=f"ops-provider-{last_test_status}-{len(last_test_result)}",
+            base_url="https://provider.example/v1",
+            default_model="ops-model",
+            encrypted_api_key=authenticated_client.app.state.secret_box.encrypt("provider-key"),
+            enabled=enabled,
+            last_test_status=last_test_status,
+            last_test_result=last_test_result,
+        )
+        db.add(provider)
+        db.commit()
+        return provider.id
+
+
+def test_create_session_and_queue_message_without_calling_provider_in_request(
+    authenticated_client, monkeypatch
+):
+    authenticated_client.app.state.task_engine.stop()
+    provider_id = _add_ops_provider(authenticated_client)
+
+    def unexpected_complete(*_args, **_kwargs):
+        raise AssertionError("message endpoint must not call the Provider")
+
+    monkeypatch.setattr(
+        authenticated_client.app.state.ops_provider_client,
+        "complete",
+        unexpected_complete,
+    )
+
+    created = authenticated_client.post(
+        "/api/diagnostics/sessions",
+        json={
+            "provider_id": provider_id,
+            "title": "Repair gateway",
+            "deployment_id": None,
+        },
+    )
+
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    response = authenticated_client.post(
+        f"/api/diagnostics/sessions/{session_id}/messages",
+        json={"content": "Inspect the gateway and repair it if required"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["type"] == "ops.respond"
+    assert response.json()["status"] == "queued"
+    with authenticated_client.app.state.database.session_factory() as db:
+        task = db.get(TaskRecord, response.json()["id"])
+        assert task.input_json == {
+            "session_id": session_id,
+            "prompt": "Inspect the gateway and repair it if required",
+            "actor": "admin",
+        }
+        audit = db.scalar(
+            select(AuditEvent).where(AuditEvent.action == "ops.respond.queue")
+        )
+        assert audit.resource_id == session_id
+        assert audit.details["task_id"] == task.id
+        assert "Inspect the gateway" not in str(audit.details)
+
+
+def test_session_history_contains_messages_tools_and_linked_plan(authenticated_client):
+    provider_id = _add_ops_provider(authenticated_client)
+    started_at = datetime(2026, 8, 18, tzinfo=UTC)
+    with authenticated_client.app.state.database.session_factory() as db:
+        session = OpsSession(
+            title="Repair gateway",
+            provider_id=provider_id,
+            requested_by="admin",
+        )
+        plan = OperationPlan(
+            provider_id=provider_id,
+            summary="Restart gateway",
+            diagnosis="Gateway is unhealthy",
+            risk="medium",
+            steps=[{"operation": "shell", "command": "systemctl restart gateway"}],
+        )
+        db.add_all([session, plan])
+        db.flush()
+        db.add_all(
+            [
+                OpsMessage(
+                    session_id=session.id,
+                    role="user",
+                    content="Inspect gateway",
+                    created_at=started_at,
+                ),
+                OpsMessage(
+                    session_id=session.id,
+                    role="assistant",
+                    content="Approval is required",
+                    operation_plan_id=plan.id,
+                    metadata_json={"action": "plan", "plan_id": plan.id},
+                    created_at=started_at + timedelta(seconds=1),
+                ),
+                OpsToolRun(
+                    session_id=session.id,
+                    tool_name="systemd.status",
+                    status="succeeded",
+                    arguments_json={"unit": "gateway.service"},
+                    result_json={"active": False},
+                ),
+            ]
+        )
+        db.commit()
+        session_id = session.id
+
+    response = authenticated_client.get(f"/api/diagnostics/sessions/{session_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [message["role"] for message in body["messages"]] == ["user", "assistant"]
+    assert body["tool_runs"][0]["tool_name"] == "systemd.status"
+    assert body["tool_runs"][0]["result"] == {"active": False}
+    assert body["plans"][0]["id"] == plan.id
+    assert body["plans"][0]["status"] == "pending"
+
+
+def test_failed_structured_provider_probe_blocks_session_message(authenticated_client):
+    authenticated_client.app.state.task_engine.stop()
+    provider_id = _add_ops_provider(
+        authenticated_client,
+        last_test_status="failed",
+        last_test_result={
+            "status": "failed",
+            "connection": {"status": "healthy", "models_seen": 1},
+            "default_model": {
+                "status": "failed",
+                "model": "ops-model",
+                "error": "model not found provider-key",
+            },
+        },
+    )
+    created = authenticated_client.post(
+        "/api/diagnostics/sessions",
+        json={"provider_id": provider_id, "title": "Blocked provider"},
+    )
+
+    response = authenticated_client.post(
+        f"/api/diagnostics/sessions/{created.json()['id']}/messages",
+        json={"content": "Inspect"},
+    )
+
+    assert response.status_code == 409
+    assert "test" in response.json()["detail"].lower()
+    assert "provider-key" not in response.text
+    with authenticated_client.app.state.database.session_factory() as db:
+        assert db.scalars(select(TaskRecord).where(TaskRecord.type == "ops.respond")).all() == []
+
+
+def test_legacy_healthy_provider_is_reprobed_before_first_message(authenticated_client):
+    authenticated_client.app.state.task_engine.stop()
+    provider_id = _add_ops_provider(
+        authenticated_client,
+        last_test_status="healthy",
+        last_test_result={},
+    )
+    calls = []
+
+    class ProbeClient:
+        def list_models(self, provider):
+            calls.append(("models", provider.id))
+            return ["ops-model"]
+
+        def complete(self, provider, messages):
+            calls.append(("complete", provider.id, messages[-1]["content"]))
+            return AssistantTurn(action="answer", summary="probe ok")
+
+    authenticated_client.app.state.provider_service.ops_provider_client = ProbeClient()
+    created = authenticated_client.post(
+        "/api/diagnostics/sessions",
+        json={"provider_id": provider_id, "title": "Legacy provider"},
+    )
+    response = authenticated_client.post(
+        f"/api/diagnostics/sessions/{created.json()['id']}/messages",
+        json={"content": "Inspect"},
+    )
+
+    assert response.status_code == 202
+    assert [call[0] for call in calls] == ["models", "complete"]
+    with authenticated_client.app.state.database.session_factory() as db:
+        provider = db.get(Provider, provider_id)
+        assert provider.last_test_result["default_model"]["status"] == "healthy"
+
+
+def test_legacy_diagnostic_create_queues_first_session_message(authenticated_client):
+    authenticated_client.app.state.task_engine.stop()
+    provider_id = _add_ops_provider(authenticated_client)
+
+    response = authenticated_client.post(
+        "/api/diagnostics",
+        json={
+            "provider_id": provider_id,
+            "deployment_id": None,
+            "prompt": "Inspect memory pressure",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["type"] == "ops.respond"
+    with authenticated_client.app.state.database.session_factory() as db:
+        task = db.get(TaskRecord, response.json()["id"])
+        session = db.get(OpsSession, task.input_json["session_id"])
+        assert session.title == "Inspect memory pressure"
+
+
+def test_session_mutation_requires_csrf_and_enabled_provider(authenticated_client):
+    provider_id = _add_ops_provider(authenticated_client, enabled=False)
+    csrf = authenticated_client.headers.pop("X-CSRF-Token")
+    try:
+        forbidden = authenticated_client.post(
+            "/api/diagnostics/sessions",
+            json={"provider_id": provider_id, "title": "Forbidden"},
+        )
+    finally:
+        authenticated_client.headers["X-CSRF-Token"] = csrf
+
+    assert forbidden.status_code == 403
+    disabled = authenticated_client.post(
+        "/api/diagnostics/sessions",
+        json={"provider_id": provider_id, "title": "Disabled"},
+    )
+    assert disabled.status_code == 404
+
+
+@pytest.mark.parametrize("content", ["   ", "x" * 10_001])
+def test_session_message_enforces_content_bounds(authenticated_client, content):
+    authenticated_client.app.state.task_engine.stop()
+    provider_id = _add_ops_provider(authenticated_client)
+    created = authenticated_client.post(
+        "/api/diagnostics/sessions",
+        json={"provider_id": provider_id, "title": "Bounds"},
+    )
+
+    response = authenticated_client.post(
+        f"/api/diagnostics/sessions/{created.json()['id']}/messages",
+        json={"content": content},
+    )
+
+    assert response.status_code == 422
+
+
+def test_session_rejects_second_active_response_task(authenticated_client):
+    authenticated_client.app.state.task_engine.stop()
+    provider_id = _add_ops_provider(authenticated_client)
+    created = authenticated_client.post(
+        "/api/diagnostics/sessions",
+        json={"provider_id": provider_id, "title": "One at a time"},
+    )
+    path = f"/api/diagnostics/sessions/{created.json()['id']}/messages"
+
+    first = authenticated_client.post(path, json={"content": "First"})
+    second = authenticated_client.post(path, json={"content": "Second"})
+
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert "active response task" in second.json()["detail"]
+
+
+def test_list_sessions_is_newest_first(authenticated_client):
+    provider_id = _add_ops_provider(authenticated_client)
+    for title in ("First", "Second"):
+        response = authenticated_client.post(
+            "/api/diagnostics/sessions",
+            json={"provider_id": provider_id, "title": title},
+        )
+        assert response.status_code == 201
+
+    response = authenticated_client.get("/api/diagnostics/sessions")
+
+    assert response.status_code == 200
+    assert [item["title"] for item in response.json()[:2]] == ["Second", "First"]

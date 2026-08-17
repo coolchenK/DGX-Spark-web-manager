@@ -50,7 +50,11 @@ Authorization: Bearer dgx_...
 | DELETE | `/api/tasks/{id}` | Cancel task |
 | GET/POST/PATCH/DELETE | `/api/providers` | Encrypted online AI provider configuration |
 | POST | `/api/providers/{id}/test` | Provider connectivity test |
-| GET/POST | `/api/diagnostics` | Plans and new diagnosis |
+| GET | `/api/diagnostics` | Legacy operation-plan history |
+| POST | `/api/diagnostics` | Create an operations session and queue its first message |
+| GET/POST | `/api/diagnostics/sessions` | List or create persistent operations sessions |
+| GET | `/api/diagnostics/sessions/{id}` | Session messages, tool runs, and linked plans |
+| POST | `/api/diagnostics/sessions/{id}/messages` | Queue an asynchronous AI operations response |
 | POST | `/api/diagnostics/{id}/{approve|reject}` | Human decision |
 | GET | `/api/keys` | Gateway key metadata |
 | POST | `/api/keys` | Create and reveal a gateway key once |
@@ -119,6 +123,34 @@ A missing model returns `404`. A confirmation that does not exactly match the re
 returns `422`. Repeating an accepted request while its task is still queued and has not started
 reuses the same task. Once the worker starts and marks the model `deleting`, another request returns
 `409`; after deletion completes and the inventory record is removed, it returns `404`.
+
+### AI operations sessions
+
+Create a persistent session with an enabled Provider:
+
+```json
+{
+  "provider_id": "provider-id",
+  "deployment_id": null,
+  "title": "Repair gateway"
+}
+```
+
+`POST /api/diagnostics/sessions/{id}/messages` accepts
+`{"content":"Inspect the gateway"}` and returns `202` with an `ops.respond` task. Provider
+reasoning, read-only tools, and plan creation run in the task worker, not in the HTTP request. The
+queue audit contains the task ID but does not contain message text.
+
+Sending requires a successful structured connection and default-model probe. An upgraded Provider
+with the old `last_test_status="healthy"` state and no structured result is probed once before its
+first queued message. Untested or failed Providers return `409` with a retest instruction. A
+session that is processing, waiting for plan approval, or already has an active response task also
+returns `409`.
+
+`GET /api/diagnostics/sessions/{id}` returns the session fields plus ordered `messages`,
+`tool_runs`, and plans linked from assistant messages. `GET /api/diagnostics` remains the legacy
+plan-history endpoint. The old `POST /api/diagnostics` request body remains accepted, but now
+creates a session and returns its asynchronous task with `202`.
 
 ### Hugging Face Spark compatibility
 
