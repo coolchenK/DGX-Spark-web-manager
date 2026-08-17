@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -52,7 +53,9 @@ class Deployment(TimestampMixin, Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(255), unique=True)
-    model_id: Mapped[str | None] = mapped_column(ForeignKey("model_assets.id"))
+    model_id: Mapped[str | None] = mapped_column(
+        ForeignKey("model_assets.id", ondelete="SET NULL")
+    )
     runtime: Mapped[str] = mapped_column(String(32), index=True)
     container_id: Mapped[str | None] = mapped_column(String(128), unique=True)
     container_name: Mapped[str | None] = mapped_column(String(255), unique=True)
@@ -108,7 +111,7 @@ class Provider(TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     last_test_status: Mapped[str | None] = mapped_column(String(32))
     last_test_result: Mapped[dict[str, Any]] = mapped_column(
-        JSON, default=dict, server_default="{}"
+        MutableDict.as_mutable(JSON), default=dict, server_default="{}"
     )
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -133,8 +136,12 @@ class OperationPlan(TimestampMixin, Base):
     __tablename__ = "operation_plans"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    provider_id: Mapped[str | None] = mapped_column(ForeignKey("providers.id"))
-    deployment_id: Mapped[str | None] = mapped_column(ForeignKey("deployments.id"))
+    provider_id: Mapped[str | None] = mapped_column(
+        ForeignKey("providers.id", ondelete="SET NULL")
+    )
+    deployment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("deployments.id", ondelete="SET NULL")
+    )
     summary: Mapped[str] = mapped_column(Text)
     diagnosis: Mapped[str] = mapped_column(Text)
     risk: Mapped[str] = mapped_column(String(32), default="low")
@@ -197,7 +204,9 @@ class OpsMessage(TimestampMixin, Base):
     )
     role: Mapped[str] = mapped_column(String(32))
     content: Mapped[str] = mapped_column(Text)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
     operation_plan_id: Mapped[str | None] = mapped_column(
         ForeignKey("operation_plans.id", ondelete="SET NULL"), index=True
     )
@@ -224,8 +233,12 @@ class OpsToolRun(TimestampMixin, Base):
     tool_name: Mapped[str] = mapped_column(String(128))
     risk: Mapped[str] = mapped_column(String(32), default="read_only")
     status: Mapped[str] = mapped_column(String(32), default="queued")
-    arguments_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    arguments_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
+    result_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
     agent_job_id: Mapped[str | None] = mapped_column(String(128), index=True)
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

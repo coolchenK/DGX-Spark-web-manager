@@ -8,7 +8,7 @@ import pytest
 from app.config import Settings
 from app.db import Database
 from app.main import create_app
-from app.models import AuditEvent, Deployment, ModelAsset, TaskRecord
+from app.models import AuditEvent, Deployment, ModelAsset, OperationPlan, TaskRecord
 from app.runtime.base import (
     DeploymentSpec,
     GenerationDefaults,
@@ -3287,7 +3287,15 @@ def test_discovered_uninstall_removes_container_record_but_keeps_model(
             container_id=container.id,
             container_name=container.name,
         )
+        plan = OperationPlan(
+            deployment_id=deployment.id,
+            summary="Referenced deployment",
+            diagnosis="Uninstall should preserve plan",
+        )
+        db.add(plan)
+        db.commit()
         deployment_id, model_id = deployment.id, model.id
+        plan_id = plan.id
     service, _, _ = build_action_service(database, tmp_path, container)
 
     result = service.action_handler(
@@ -3312,6 +3320,7 @@ def test_discovered_uninstall_removes_container_record_but_keeps_model(
     with database.session_factory() as db:
         assert db.get(Deployment, deployment_id) is None
         assert db.get(ModelAsset, model_id) is not None
+        assert db.get(OperationPlan, plan_id).deployment_id is None
     assert model_path.is_dir()
     assert (model_path / "model.safetensors").is_file()
 

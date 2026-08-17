@@ -5,15 +5,129 @@ Revises: 20260816_0001
 """
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 
 revision = "20260817_0002"
 down_revision = "20260816_0001"
 branch_labels = None
 depends_on = None
 
+FOREIGN_KEY_NAMING_CONVENTION = {
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s"
+}
+
+
+def _foreign_key_name(
+    table_name: str,
+    column_name: str,
+    referred_table: str,
+    *,
+    legacy_schema: bool,
+) -> str:
+    deterministic_name = f"fk_{table_name}_{column_name}_{referred_table}"
+    bind = op.get_bind()
+    if context.is_offline_mode():
+        if bind.dialect.name == "postgresql" and legacy_schema:
+            return f"{table_name}_{column_name}_fkey"
+        return deterministic_name
+    if bind.dialect.name == "sqlite":
+        return deterministic_name
+    for foreign_key in sa.inspect(bind).get_foreign_keys(table_name):
+        if (
+            foreign_key["constrained_columns"] == [column_name]
+            and foreign_key["referred_table"] == referred_table
+        ):
+            return foreign_key["name"] or deterministic_name
+    raise RuntimeError(f"Missing legacy foreign key for {table_name}.{column_name}")
+
+
+def _replace_legacy_foreign_key(
+    table_name: str,
+    column_name: str,
+    referred_table: str,
+    *,
+    ondelete: str | None,
+    legacy_schema: bool,
+) -> None:
+    old_name = _foreign_key_name(
+        table_name,
+        column_name,
+        referred_table,
+        legacy_schema=legacy_schema,
+    )
+    new_name = f"fk_{table_name}_{column_name}_{referred_table}"
+    with op.batch_alter_table(
+        table_name, naming_convention=FOREIGN_KEY_NAMING_CONVENTION
+    ) as batch_op:
+        batch_op.drop_constraint(old_name, type_="foreignkey")
+        batch_op.create_foreign_key(
+            new_name,
+            referred_table,
+            [column_name],
+            ["id"],
+            ondelete=ondelete,
+        )
+
+
+def _repair_legacy_orphans() -> None:
+    op.execute(
+        sa.text(
+            "UPDATE deployments SET model_id = NULL "
+            "WHERE model_id IS NOT NULL AND NOT EXISTS "
+            "(SELECT 1 FROM model_assets WHERE model_assets.id = deployments.model_id)"
+        )
+    )
+    op.execute(
+        sa.text(
+            "UPDATE operation_plans SET provider_id = NULL "
+            "WHERE provider_id IS NOT NULL AND NOT EXISTS "
+            "(SELECT 1 FROM providers WHERE providers.id = operation_plans.provider_id)"
+        )
+    )
+    op.execute(
+        sa.text(
+            "UPDATE operation_plans SET deployment_id = NULL "
+            "WHERE deployment_id IS NOT NULL AND NOT EXISTS "
+            "(SELECT 1 FROM deployments "
+            "WHERE deployments.id = operation_plans.deployment_id)"
+        )
+    )
+
+
+def _verify_sqlite_foreign_keys() -> None:
+    bind = op.get_bind()
+    if context.is_offline_mode() or bind.dialect.name != "sqlite":
+        return
+    violations = bind.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        sample = ", ".join(str(tuple(row)) for row in violations[:10])
+        raise RuntimeError(f"SQLite foreign key check failed after migration: {sample}")
+
 
 def upgrade() -> None:
+    _repair_legacy_orphans()
+    _replace_legacy_foreign_key(
+        "deployments",
+        "model_id",
+        "model_assets",
+        ondelete="SET NULL",
+        legacy_schema=True,
+    )
+    _replace_legacy_foreign_key(
+        "operation_plans",
+        "provider_id",
+        "providers",
+        ondelete="SET NULL",
+        legacy_schema=True,
+    )
+    _replace_legacy_foreign_key(
+        "operation_plans",
+        "deployment_id",
+        "deployments",
+        ondelete="SET NULL",
+        legacy_schema=True,
+    )
+
     op.add_column(
         "providers",
         sa.Column(
@@ -94,6 +208,7 @@ def upgrade() -> None:
         "ops_tool_runs",
         ["session_id", "status", "created_at"],
     )
+    _verify_sqlite_foreign_keys()
 
 
 def downgrade() -> None:
@@ -109,6 +224,28 @@ def downgrade() -> None:
     op.drop_index("ix_ops_sessions_deployment_id", table_name="ops_sessions")
     op.drop_index("ix_ops_sessions_provider_id", table_name="ops_sessions")
     op.drop_table("ops_sessions")
+
+    _replace_legacy_foreign_key(
+        "operation_plans",
+        "deployment_id",
+        "deployments",
+        ondelete=None,
+        legacy_schema=False,
+    )
+    _replace_legacy_foreign_key(
+        "operation_plans",
+        "provider_id",
+        "providers",
+        ondelete=None,
+        legacy_schema=False,
+    )
+    _replace_legacy_foreign_key(
+        "deployments",
+        "model_id",
+        "model_assets",
+        ondelete=None,
+        legacy_schema=False,
+    )
 
     with op.batch_alter_table("providers") as batch_op:
         batch_op.drop_column("last_test_result")

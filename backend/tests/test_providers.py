@@ -92,6 +92,43 @@ def test_provider_api_encrypts_secret_and_returns_masked_value(authenticated_cli
         assert "sk-provider-secret-123456" not in provider.encrypted_api_key
 
 
+def test_provider_api_delete_sets_operation_plan_reference_null(
+    authenticated_client, monkeypatch
+):
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    response = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": "Deletable provider",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "sk-provider-secret-123456",
+            "default_model": "ops-model",
+        },
+    )
+    assert response.status_code == 201
+    provider_id = response.json()["id"]
+
+    with authenticated_client.app.state.database.session_factory() as db:
+        from app.models import OperationPlan
+
+        plan = OperationPlan(
+            provider_id=provider_id,
+            summary="Referenced provider",
+            diagnosis="Delete should preserve plan",
+        )
+        db.add(plan)
+        db.commit()
+        plan_id = plan.id
+
+    response = authenticated_client.delete(f"/api/providers/{provider_id}")
+
+    assert response.status_code == 204
+    with authenticated_client.app.state.database.session_factory() as db:
+        from app.models import OperationPlan
+
+        assert db.get(OperationPlan, plan_id).provider_id is None
+
+
 @pytest.mark.parametrize(
     "headers",
     [
