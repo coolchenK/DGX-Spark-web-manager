@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import desc, func, select
+from sqlalchemy import case, desc, func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -51,6 +51,9 @@ MAX_TOOL_RESULT_CHARS = 30_000
 MAX_STRUCTURE_DEPTH = 8
 MAX_COLLECTION_ITEMS = 100
 MAX_STRING_CHARS = 12_000
+MIN_EMBEDDED_SECRET_CHARS = 3
+MAX_TASK_LOG_CHARS = 4_000
+MAX_TASK_ERROR_CHARS = 2_000
 _TRUNCATED = "[truncated]"
 _REDACTED = "[REDACTED]"
 _SENSITIVE_KEY_NAMES = frozenset(
@@ -88,6 +91,8 @@ _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:\[REDACTED\]|[^\s,;&}\[\]]+)+)''',
     re.IGNORECASE,
 )
+_ACRONYM_BOUNDARY_PATTERN = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_CAMEL_BOUNDARY_PATTERN = re.compile(r"([a-z0-9])([A-Z])")
 
 
 class _AgentCaller(Protocol):
@@ -145,7 +150,20 @@ class OpsToolRegistry:
             except Exception as exc:
                 raise ToolExecutionError("unexpected Agent failure") from exc
         else:
-            output = self._execute_manager_tool(request)
+            try:
+                output = self._execute_manager_tool(request)
+                sanitized_output = sanitize_and_bound(output, secrets=secrets)
+                return _fit_tool_result(
+                    ToolResult(
+                        name=name,
+                        status="succeeded",
+                        output=sanitized_output,
+                    )
+                )
+            except ToolExecutionError:
+                raise
+            except Exception as exc:
+                raise ToolExecutionError("Manager read-only tool failed") from exc
 
         sanitized_output = sanitize_and_bound(output, secrets=secrets)
         if name in AGENT_READ_TOOLS and output.get("status") in {
@@ -184,13 +202,24 @@ class OpsToolRegistry:
                 for encrypted_api_key, headers in providers:
                     self._add_encrypted_secret(values, encrypted_api_key)
                     if isinstance(headers, Mapping):
-                        for header_value in headers.values():
-                            if isinstance(header_value, str) and header_value:
-                                values.add(header_value)
-                                scheme, separator, credential = header_value.partition(" ")
-                                if separator and scheme.casefold() in {"bearer", "basic"}:
-                                    if credential:
-                                        values.add(credential)
+                        for header_name, header_value in headers.items():
+                            if not (
+                                isinstance(header_name, str)
+                                and isinstance(header_value, str)
+                                and header_value
+                            ):
+                                continue
+                            scheme, separator, credential = header_value.partition(" ")
+                            has_auth_scheme = bool(
+                                separator
+                                and scheme.casefold() in {"bearer", "basic"}
+                                and credential
+                            )
+                            if not _is_sensitive_key(header_name) and not has_auth_scheme:
+                                continue
+                            self._add_plaintext_secret(values, header_value)
+                            if has_auth_scheme:
+                                self._add_plaintext_secret(values, credential)
                 for encrypted_value in settings:
                     self._add_encrypted_secret(values, encrypted_value)
         except ToolExecutionError:
@@ -207,8 +236,17 @@ class OpsToolRegistry:
             plaintext = self.secret_box.decrypt(encrypted)
         except (TypeError, ValueError) as exc:
             raise ToolExecutionError("configured secrets could not be loaded safely") from exc
-        if plaintext:
-            values.add(plaintext)
+        self._add_plaintext_secret(values, plaintext)
+
+    @staticmethod
+    def _add_plaintext_secret(values: set[str], plaintext: str) -> None:
+        if not plaintext:
+            raise ToolExecutionError("configured secrets could not be loaded safely")
+        if len(plaintext) < MIN_EMBEDDED_SECRET_CHARS:
+            raise ToolExecutionError(
+                "configured secrets are too short to sanitize safely"
+            )
+        values.add(plaintext)
 
     def _execute_manager_tool(self, request: ReadOnlyToolRequest) -> dict[str, Any]:
         with self.session_factory() as db:
@@ -273,6 +311,22 @@ class OpsToolRegistry:
 
     @staticmethod
     def _manager_tasks(db: Session, limit: int) -> dict[str, Any]:
+        log_length = func.length(TaskRecord.log)
+        error_length = func.length(TaskRecord.error)
+        log_tail = func.substr(
+            TaskRecord.log,
+            case(
+                (
+                    log_length > MAX_TASK_LOG_CHARS,
+                    log_length - MAX_TASK_LOG_CHARS + 1,
+                ),
+                else_=1,
+            ),
+            MAX_TASK_LOG_CHARS,
+        ).label("log_excerpt")
+        error_excerpt = func.substr(
+            TaskRecord.error, 1, MAX_TASK_ERROR_CHARS
+        ).label("error_excerpt")
         rows = db.execute(
             select(
                 TaskRecord.id,
@@ -283,8 +337,10 @@ class OpsToolRegistry:
                 TaskRecord.completed_bytes,
                 TaskRecord.total_bytes,
                 TaskRecord.cancel_requested,
-                TaskRecord.error,
-                TaskRecord.log,
+                error_excerpt,
+                (error_length > MAX_TASK_ERROR_CHARS).label("error_truncated"),
+                log_tail,
+                (log_length > MAX_TASK_LOG_CHARS).label("log_truncated"),
                 TaskRecord.created_at,
                 TaskRecord.updated_at,
                 TaskRecord.started_at,
@@ -304,8 +360,18 @@ class OpsToolRegistry:
                     "completed_bytes": row.completed_bytes,
                     "total_bytes": row.total_bytes,
                     "cancel_requested": row.cancel_requested,
-                    "error": row.error,
-                    "log": row.log,
+                    "error": (
+                        f"{row.error_excerpt}\n{_TRUNCATED}"
+                        if row.error_truncated
+                        else row.error_excerpt
+                    ),
+                    "error_truncated": bool(row.error_truncated),
+                    "log": (
+                        f"{_TRUNCATED}\n{row.log_excerpt}"
+                        if row.log_truncated
+                        else row.log_excerpt
+                    ),
+                    "log_truncated": bool(row.log_truncated),
                     "created_at": row.created_at,
                     "updated_at": row.updated_at,
                     "started_at": row.started_at,
@@ -318,31 +384,18 @@ class OpsToolRegistry:
     @staticmethod
     def _manager_gateway(db: Session, minutes: int, limit: int) -> dict[str, Any]:
         cutoff = datetime.now(UTC) - timedelta(minutes=minutes)
-        total = (
-            db.scalar(
-                select(func.count(RequestMetric.id)).where(
-                    RequestMetric.created_at >= cutoff
-                )
-            )
-            or 0
-        )
-        failed = (
-            db.scalar(
-                select(func.count(RequestMetric.id)).where(
-                    RequestMetric.created_at >= cutoff,
-                    RequestMetric.status_code >= 400,
-                )
-            )
-            or 0
-        )
-        average_latency = (
-            db.scalar(
-                select(func.avg(RequestMetric.latency_ms)).where(
-                    RequestMetric.created_at >= cutoff
-                )
-            )
-            or 0
-        )
+        aggregate = db.execute(
+            select(
+                func.count(RequestMetric.id).label("total"),
+                func.sum(
+                    case((RequestMetric.status_code >= 400, 1), else_=0)
+                ).label("failed"),
+                func.avg(RequestMetric.latency_ms).label("average_latency"),
+            ).where(RequestMetric.created_at >= cutoff)
+        ).one()
+        total = aggregate.total or 0
+        failed = aggregate.failed or 0
+        average_latency = aggregate.average_latency or 0
         recent_rows = db.execute(
             select(
                 RequestMetric.model,
@@ -379,7 +432,9 @@ class OpsToolRegistry:
 
 
 def _is_sensitive_key(value: str) -> bool:
-    normalized = re.sub(r"[-\s]+", "_", value.casefold()).strip("_")
+    normalized = re.sub(r"[-\s]+", "_", value).strip("_")
+    normalized = _ACRONYM_BOUNDARY_PATTERN.sub(r"\1_\2", normalized)
+    normalized = _CAMEL_BOUNDARY_PATTERN.sub(r"\1_\2", normalized).casefold()
     return normalized in _SENSITIVE_KEY_NAMES or normalized.endswith(
         _SENSITIVE_KEY_SUFFIXES
     )
@@ -393,7 +448,12 @@ def _redact_credential_assignment(match: re.Match[str]) -> str:
 
 def _sanitize_string(value: str, secrets: tuple[str, ...], limit: int) -> str:
     sanitized = value
-    for secret in sorted(set(secrets), key=len, reverse=True):
+    unique_secrets = sorted({secret for secret in secrets if secret}, key=len, reverse=True)
+    if sanitized in unique_secrets:
+        sanitized = _REDACTED
+    for secret in unique_secrets:
+        if len(secret) < MIN_EMBEDDED_SECRET_CHARS:
+            continue
         sanitized = sanitized.replace(secret, _REDACTED)
     sanitized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
         _redact_credential_assignment, sanitized

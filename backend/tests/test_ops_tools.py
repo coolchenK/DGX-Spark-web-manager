@@ -19,6 +19,7 @@ from app.services.ops_agent import OpsAgentUnavailable
 from app.services.ops_provider import ReadOnlyToolRequest
 from app.services.ops_tools import OpsToolRegistry, ToolExecutionError
 from pydantic import ValidationError
+from sqlalchemy import event
 
 
 class FakeAgent:
@@ -485,6 +486,161 @@ def test_sensitive_key_matching_preserves_public_token_metrics(
     assert "opaque-client-secret" not in dumped
 
 
+def test_camel_case_credentials_are_redacted_but_public_metrics_are_preserved(
+    database: Database, secret_box: SecretBox
+) -> None:
+    agent = FakeAgent(
+        {
+            "status": "succeeded",
+            "accessToken": "opaque-access",
+            "clientSecret": "opaque-client",
+            "apiToken": "opaque-api",
+            "secretKey": "opaque-key",
+            "promptTokens": 13,
+            "completionTokens": 8,
+            "tokenCount": 21,
+            "passwordRotation": "pending",
+            "log": (
+                "accessToken=log-access "
+                '"clientSecret": "log-client" '
+                "apiToken='log-api' secretKey=log-key"
+            ),
+        }
+    )
+    registry = OpsToolRegistry(agent, database.session_factory, secret_box)
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = result.model_dump_json()
+
+    for opaque in (
+        "opaque-access",
+        "opaque-client",
+        "opaque-api",
+        "opaque-key",
+        "log-access",
+        "log-client",
+        "log-api",
+        "log-key",
+    ):
+        assert opaque not in dumped
+    assert result.output["promptTokens"] == 13
+    assert result.output["completionTokens"] == 8
+    assert result.output["tokenCount"] == 21
+    assert result.output["passwordRotation"] == "pending"
+
+
+def test_short_provider_secret_fails_closed_without_calling_agent(
+    database: Database, secret_box: SecretBox
+) -> None:
+    with database.session_factory() as db:
+        db.add(
+            Provider(
+                name="short",
+                base_url="https://short.example/v1",
+                default_model="model",
+                encrypted_api_key=secret_box.encrypt("a"),
+            )
+        )
+        db.commit()
+    agent = FakeAgent({"status": "succeeded", "output": "database available"})
+    registry = OpsToolRegistry(agent, database.session_factory, secret_box)
+
+    with pytest.raises(
+        ToolExecutionError, match="configured secrets are too short to sanitize safely"
+    ):
+        registry.execute(ReadOnlyToolRequest(name="manager.summary", arguments={}))
+    assert agent.calls == []
+
+
+def test_non_credential_custom_header_is_not_collected_as_a_secret(
+    database: Database, secret_box: SecretBox
+) -> None:
+    with database.session_factory() as db:
+        db.add(
+            Provider(
+                name="tenant",
+                base_url="https://tenant.example/v1",
+                default_model="model",
+                encrypted_api_key=secret_box.encrypt("long-provider-secret"),
+                headers={"X-Tenant": "a"},
+            )
+        )
+        db.commit()
+    agent = FakeAgent(
+        {"status": "succeeded", "output": "database status available for tenant a"}
+    )
+    registry = OpsToolRegistry(agent, database.session_factory, secret_box)
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+
+    assert result.output["output"] == "database status available for tenant a"
+
+
+def test_bearer_custom_header_value_is_collected_even_with_a_custom_name(
+    database: Database, secret_box: SecretBox
+) -> None:
+    with database.session_factory() as db:
+        db.add(
+            Provider(
+                name="custom-auth",
+                base_url="https://custom-auth.example/v1",
+                default_model="model",
+                encrypted_api_key=secret_box.encrypt("long-provider-secret"),
+                headers={"X-Custom-Auth": "Bearer header-credential-secret"},
+            )
+        )
+        db.commit()
+    registry = OpsToolRegistry(
+        FakeAgent(
+            {
+                "status": "succeeded",
+                "output": "credential header-credential-secret",
+            }
+        ),
+        database.session_factory,
+        secret_box,
+    )
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+
+    assert "header-credential-secret" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("manager.summary", {}),
+        ("manager.tasks", {"limit": 5}),
+        ("manager.gateway", {"minutes": 60, "limit": 5}),
+    ],
+)
+def test_manager_database_failures_use_a_generic_tool_execution_error(
+    database: Database,
+    secret_box: SecretBox,
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    raw_detail = "postgresql://admin:raw-secret@host/db SELECT private"
+
+    class FailAfterSecretLoad:
+        calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 1:
+                return database.session_factory()
+            raise RuntimeError(raw_detail)
+
+    registry = OpsToolRegistry(FakeAgent(), FailAfterSecretLoad(), secret_box)
+
+    with pytest.raises(ToolExecutionError) as captured:
+        registry.execute(ReadOnlyToolRequest(name=name, arguments=arguments))
+
+    assert str(captured.value) == "Manager read-only tool failed"
+    assert raw_detail not in str(captured.value)
+    assert isinstance(captured.value.__cause__, RuntimeError)
+
+
 def test_credential_redaction_preserves_following_non_secret_query_parameters(
     database: Database, secret_box: SecretBox
 ) -> None:
@@ -539,6 +695,86 @@ def test_gateway_aggregates_use_the_requested_time_window(
     assert result.output["average_latency_ms"] == 100
     assert result.output["recent"][0]["prompt_tokens"] == 12
     assert result.output["recent"][0]["completion_tokens"] == 5
+
+
+def test_gateway_uses_one_aggregate_and_one_recent_metric_query(
+    database: Database, secret_box: SecretBox
+) -> None:
+    with database.session_factory() as db:
+        db.add(
+            RequestMetric(
+                model="model",
+                endpoint="chat",
+                status_code=200,
+                latency_ms=50,
+                created_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+    statements: list[str] = []
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        if "request_metrics" in statement.casefold():
+            statements.append(statement.casefold())
+
+    event.listen(database.engine, "before_cursor_execute", capture_statement)
+    try:
+        registry = OpsToolRegistry(FakeAgent(), database.session_factory, secret_box)
+        result = registry.execute(
+            ReadOnlyToolRequest(
+                name="manager.gateway", arguments={"minutes": 60, "limit": 5}
+            )
+        )
+    finally:
+        event.remove(database.engine, "before_cursor_execute", capture_statement)
+
+    assert result.output["total_requests"] == 1
+    assert len(statements) == 2
+    assert "case" in statements[0]
+    assert "avg(" in statements[0]
+    assert "order by" in statements[1]
+
+
+def test_manager_tasks_truncates_large_lobs_in_sql_and_keeps_recent_log_tail(
+    database: Database, secret_box: SecretBox
+) -> None:
+    with database.session_factory() as db:
+        db.add(
+            TaskRecord(
+                type="model.download",
+                status="failed",
+                title="Large task",
+                log="old-log-prefix" + ("x" * 100_000) + "recent-log-tail",
+                error="error-head" + ("y" * 100_000) + "error-tail",
+            )
+        )
+        db.commit()
+    statements: list[str] = []
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        if "from tasks" in statement.casefold():
+            statements.append(statement.casefold())
+
+    event.listen(database.engine, "before_cursor_execute", capture_statement)
+    try:
+        registry = OpsToolRegistry(FakeAgent(), database.session_factory, secret_box)
+        result = registry.execute(
+            ReadOnlyToolRequest(name="manager.tasks", arguments={"limit": 5})
+        )
+    finally:
+        event.remove(database.engine, "before_cursor_execute", capture_statement)
+
+    task = result.output["tasks"][0]
+    assert task["log"].startswith("[truncated]\n")
+    assert task["log"].endswith("recent-log-tail")
+    assert len(task["log"]) < 5_000
+    assert task["log_truncated"] is True
+    assert task["error"].startswith("error-head")
+    assert len(task["error"]) < 3_000
+    assert task["error_truncated"] is True
+    assert len(statements) == 1
+    assert "substr(tasks.log" in statements[0]
+    assert "substr(tasks.error" in statements[0]
 
 
 @pytest.mark.parametrize("agent_status", ["succeeded", "failed"])

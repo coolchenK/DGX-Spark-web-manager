@@ -217,10 +217,14 @@ def upgrade() -> None:
         "ops_tool_runs",
         ["session_id", "status", "created_at"],
     )
+    op.create_index(
+        "ix_request_metrics_created_at", "request_metrics", ["created_at"]
+    )
     _verify_sqlite_foreign_keys()
 
 
 def downgrade() -> None:
+    op.drop_index("ix_request_metrics_created_at", table_name="request_metrics")
     op.drop_index("ix_ops_tool_runs_session_status_created_at", table_name="ops_tool_runs")
     op.drop_index("ix_ops_tool_runs_agent_job_id", table_name="ops_tool_runs")
     op.drop_table("ops_tool_runs")

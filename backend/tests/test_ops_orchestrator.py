@@ -15,6 +15,7 @@ from app.models import (
     OpsSession,
     OpsToolRun,
     Provider,
+    RequestMetric,
 )
 from sqlalchemy import delete, inspect, select, text
 
@@ -362,6 +363,9 @@ def test_fresh_database_upgrades_directly_to_head(tmp_path, monkeypatch):
             column["name"] for column in inspector.get_columns("providers")
         }
         assert {"last_test_result", "config_revision"} <= provider_columns
+        assert "ix_request_metrics_created_at" in {
+            index["name"] for index in inspector.get_indexes("request_metrics")
+        }
         assert _foreign_key_ondelete(inspector, "deployments", "model_id") == "SET NULL"
         assert _foreign_key_ondelete(inspector, "operation_plans", "provider_id") == "SET NULL"
         assert (
@@ -371,6 +375,44 @@ def test_fresh_database_upgrades_directly_to_head(tmp_path, monkeypatch):
             "20260817_0002"
         )
     database.dispose()
+
+
+def test_request_metric_created_at_index_upgrade_downgrade_cycle(
+    tmp_path, monkeypatch
+):
+    database_url = f"sqlite:///{tmp_path / 'metric-index.db'}"
+    monkeypatch.setenv("DGX_DATABASE_URL", database_url)
+    config = _alembic_config(database_url)
+
+    command.upgrade(config, "20260816_0001")
+    database = _database(tmp_path / "metric-index.db")
+    with database.engine.connect() as connection:
+        assert "ix_request_metrics_created_at" not in {
+            index["name"] for index in inspect(connection).get_indexes("request_metrics")
+        }
+
+    command.upgrade(config, "head")
+    with database.engine.connect() as connection:
+        assert "ix_request_metrics_created_at" in {
+            index["name"] for index in inspect(connection).get_indexes("request_metrics")
+        }
+
+    command.downgrade(config, "20260816_0001")
+    with database.engine.connect() as connection:
+        assert "ix_request_metrics_created_at" not in {
+            index["name"] for index in inspect(connection).get_indexes("request_metrics")
+        }
+
+    command.upgrade(config, "head")
+    with database.engine.connect() as connection:
+        assert "ix_request_metrics_created_at" in {
+            index["name"] for index in inspect(connection).get_indexes("request_metrics")
+        }
+    database.dispose()
+
+
+def test_request_metric_created_at_orm_column_is_indexed():
+    assert RequestMetric.__table__.c.created_at.index is True
 
 
 def test_legacy_references_are_set_null_after_upgrade(tmp_path, monkeypatch):
