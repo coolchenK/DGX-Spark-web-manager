@@ -1000,6 +1000,76 @@ def test_unavailable_negative_only_hf_cache_is_removed_without_cli(database, tmp
     assert result["estimated_bytes"] == 0
 
 
+def test_unavailable_broken_snapshot_cache_is_removed_without_cli(database, tmp_path):
+    repository_root = tmp_path / "hf-cache" / "models--org--model"
+    revision = "85ef153be924f17ce4bf62726954eeaa4a73e854"
+    markers = repository_root / ".no_exist" / revision
+    snapshot = repository_root / "snapshots" / revision
+    markers.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    (markers / "missing.json").write_bytes(b"")
+    try:
+        (snapshot / "model.safetensors").symlink_to(
+            Path("../../blobs/9d268f1d4f9d183f6aab7b42be8ea89d6c61e930")
+        )
+    except OSError:
+        pytest.skip("Symlink creation is unavailable")
+    _add_asset(
+        database,
+        repository_root,
+        source="huggingface",
+        repository_id="org/model",
+        status="unavailable",
+    )
+    calls = []
+    service = _deletion_service(
+        database,
+        tmp_path,
+        command_runner=lambda argv: calls.append(argv),
+    )
+
+    result = service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert calls == []
+    assert not repository_root.exists()
+    assert _model_status(database) is None
+    assert result["source"] == "huggingface"
+
+
+def test_unavailable_snapshot_with_regular_file_does_not_bypass_cli(
+    database, tmp_path
+):
+    repository_root = tmp_path / "hf-cache" / "models--org--model"
+    snapshot = (
+        repository_root
+        / "snapshots"
+        / "85ef153be924f17ce4bf62726954eeaa4a73e854"
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_bytes(b"")
+    _add_asset(
+        database,
+        repository_root,
+        source="huggingface",
+        repository_id="org/model",
+        status="unavailable",
+    )
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        raise subprocess.CalledProcessError(1, argv)
+
+    service = _deletion_service(database, tmp_path, command_runner=runner)
+
+    with pytest.raises(RuntimeError, match="cache command failed"):
+        service.delete_handler(HandlerContext(), {"model_id": "target"})
+
+    assert len(calls) == 1
+    assert repository_root.exists()
+    assert _model_status(database) == "delete_failed"
+
+
 @pytest.mark.parametrize(
     "unsafe_entry",
     ["nonzero_marker", "cached_content", "linked_marker"],

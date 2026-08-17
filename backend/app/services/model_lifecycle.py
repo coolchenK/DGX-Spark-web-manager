@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -28,6 +29,7 @@ HF_TARGET_LIST_KEYS = {
     "repo_ids",
     "ids",
 }
+HF_OBJECT_ID_PATTERN = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 @dataclass(frozen=True)
@@ -403,28 +405,67 @@ class ModelLifecycleService:
             return False
 
     @classmethod
-    def _is_negative_only_hf_cache(cls, target: Path) -> bool:
-        """Return true only for an empty repo or zero-byte `.no_exist` markers."""
+    def _is_orphaned_hf_cache(cls, target: Path) -> bool:
+        """Return true only when a cache repository contains no model data."""
         try:
             if cls._is_link_or_reparse(target) or not target.is_dir():
                 return False
             entries = list(target.iterdir())
             if not entries:
                 return True
-            if len(entries) != 1 or entries[0].name != ".no_exist":
+            allowed_roots = {".no_exist", "refs", "snapshots"}
+            if any(entry.name not in allowed_roots for entry in entries):
                 return False
-            marker_root = entries[0]
-            if cls._is_link_or_reparse(marker_root) or not marker_root.is_dir():
-                return False
-            for path in marker_root.rglob("*"):
-                if cls._is_link_or_reparse(path):
+
+            blob_root = Path(os.path.abspath(target / "blobs"))
+
+            def inspect_tree(root: Path, kind: str) -> bool:
+                if cls._is_link_or_reparse(root) or not root.is_dir():
                     return False
-                if path.is_dir():
-                    continue
-                if not path.is_file() or path.stat().st_size != 0:
+                for path in root.iterdir():
+                    if path.is_symlink():
+                        if kind != "snapshots":
+                            return False
+                        raw_target = Path(os.readlink(path))
+                        if raw_target.is_absolute():
+                            return False
+                        linked_blob = Path(os.path.abspath(path.parent / raw_target))
+                        if (
+                            linked_blob.parent != blob_root
+                            or HF_OBJECT_ID_PATTERN.fullmatch(linked_blob.name) is None
+                            or not cls._path_is_absent(linked_blob)
+                        ):
+                            return False
+                        continue
+                    if cls._is_link_or_reparse(path):
+                        return False
+                    if path.is_dir():
+                        if not inspect_tree(path, kind):
+                            return False
+                        continue
+                    if not path.is_file():
+                        return False
+                    if kind == ".no_exist":
+                        if path.stat().st_size != 0:
+                            return False
+                    elif kind == "refs":
+                        if (
+                            path.stat().st_size > 128
+                            or HF_OBJECT_ID_PATTERN.fullmatch(
+                                path.read_text(encoding="ascii").strip()
+                            )
+                            is None
+                        ):
+                            return False
+                    else:
+                        return False
+                return True
+
+            for entry in entries:
+                if not inspect_tree(entry, entry.name):
                     return False
             return True
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, UnicodeError, ValueError):
             return False
 
     def _mark_delete_failed(self, model_id: str) -> None:
@@ -596,21 +637,21 @@ class ModelLifecycleService:
                     if not reentry:
                         context.check_control()
                     return complete_deletion()
-                elif missing_can_reconcile and self._is_negative_only_hf_cache(target):
+                elif missing_can_reconcile and self._is_orphaned_hf_cache(target):
                     estimated_bytes = directory_size(target)
                     usage_path = self.hf_cache_dir
                     usage_path.mkdir(parents=True, exist_ok=True)
                     free_before = self._disk_free(usage_path)
                     context.check_control()
-                    if not self._is_negative_only_hf_cache(target):
+                    if not self._is_orphaned_hf_cache(target):
                         raise RuntimeError(
-                            "Hugging Face negative cache changed before deletion"
+                            "Hugging Face orphaned cache changed before deletion"
                         )
                     destructive_started = True
                     self.local_remover(self.hf_cache_dir, target)
                     if not self._path_is_absent(target):
                         raise RuntimeError(
-                            "Hugging Face negative cache deletion did not remove the target"
+                            "Hugging Face orphaned cache deletion did not remove the target"
                         )
                     return complete_deletion()
                 else:
