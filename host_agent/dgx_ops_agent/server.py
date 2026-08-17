@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import errno
+import importlib
 import os
+import re
 import socket
 import stat
 import threading
@@ -30,7 +32,11 @@ from .runner import TERMINAL_STATUSES, JobRunner
 _READ_COMPLETION_GRACE = 1.0
 _READ_POLL_INTERVAL = 0.05
 _DEFAULT_KEY_PATH = "/etc/dgx-spark-manager/ops-agent.key"
-_MAX_KEY_FILE_SIZE = 4096
+_DEFAULT_KEY_GROUP = "dgx-spark-ops"
+_MAX_KEY_FILE_SIZE = 65
+_KEY_GROUP_PATTERN = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+_IS_POSIX = os.name == "posix"
+_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
 
 
 class _OperationTimeout(RuntimeError):
@@ -238,7 +244,9 @@ class AgentServer:
                 return current
             remaining = deadline - self._monotonic()
             if remaining <= 0:
-                self._runner.cancel(job_id)
+                cancelled = self._runner.cancel(job_id).as_dict()
+                if cancelled["status"] in TERMINAL_STATUSES:
+                    return cancelled
                 raise _OperationTimeout(job_id)
             self._sleeper(min(_READ_POLL_INTERVAL, remaining))
 
@@ -427,21 +435,33 @@ class UnixSocketAgentServer:
             self._listener.close()
         finally:
             if self._socket_path is not None and self._socket_identity is not None:
-                self._unlink_if_same_socket(
-                    self._socket_path,
-                    self._socket_identity,
-                )
+                try:
+                    self._validate_socket_parent(
+                        self._socket_path.parent,
+                        create=False,
+                    )
+                except ValueError:
+                    pass
+                else:
+                    self._unlink_if_same_socket(
+                        self._socket_path,
+                        self._socket_identity,
+                    )
 
     @staticmethod
-    def _unlink_if_same_socket(path: Path, identity: tuple[int, int]) -> bool:
+    def _socket_matches(path: Path, identity: tuple[int, int]) -> bool:
         try:
             metadata = path.lstat()
         except FileNotFoundError:
             return False
-        if (
-            not stat.S_ISSOCK(metadata.st_mode)
-            or (metadata.st_dev, metadata.st_ino) != identity
-        ):
+        return stat.S_ISSOCK(metadata.st_mode) and (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) == identity
+
+    @staticmethod
+    def _unlink_if_same_socket(path: Path, identity: tuple[int, int]) -> bool:
+        if not UnixSocketAgentServer._socket_matches(path, identity):
             return False
         try:
             path.unlink()
@@ -450,15 +470,68 @@ class UnixSocketAgentServer:
         return True
 
     @staticmethod
+    def _chmod_if_same_socket(
+        path: Path,
+        identity: tuple[int, int],
+        mode: int,
+    ) -> bool:
+        if not UnixSocketAgentServer._socket_matches(path, identity):
+            return False
+        try:
+            os.chmod(path, mode, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return UnixSocketAgentServer._socket_matches(path, identity)
+
+    @staticmethod
+    def _parent_metadata_is_secure(metadata: Any, *, expected_uid: int) -> bool:
+        return (
+            stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == expected_uid
+            and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        )
+
+    @staticmethod
+    def _validate_socket_parent(parent: Path, *, create: bool) -> None:
+        try:
+            created = not os.path.lexists(parent)
+            if created:
+                if not create:
+                    raise ValueError("invalid socket parent")
+                parent.mkdir(parents=True, mode=0o700)
+                before = parent.lstat()
+                if not stat.S_ISDIR(before.st_mode):
+                    raise ValueError("invalid socket parent")
+                if _IS_POSIX:
+                    os.chmod(parent, 0o700, follow_symlinks=False)
+                    after = parent.lstat()
+                    if (before.st_dev, before.st_ino) != (
+                        after.st_dev,
+                        after.st_ino,
+                    ):
+                        raise ValueError("invalid socket parent")
+            metadata = parent.lstat()
+            expected_uid = _effective_uid() if _IS_POSIX else metadata.st_uid
+            if not UnixSocketAgentServer._parent_metadata_is_secure(
+                metadata,
+                expected_uid=expected_uid,
+            ):
+                raise ValueError("invalid socket parent")
+            if _IS_POSIX and parent.resolve(strict=True) != parent:
+                raise ValueError("invalid socket parent")
+        except (OSError, RuntimeError):
+            raise ValueError("invalid socket parent") from None
+
+    @staticmethod
     def _bind(path: Path) -> socket.socket:
         if not path.is_absolute():
             raise ValueError("socket_path must be absolute")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        UnixSocketAgentServer._validate_socket_parent(path.parent, create=True)
         if os.path.lexists(path):
             metadata = path.lstat()
             if not stat.S_ISSOCK(metadata.st_mode):
                 raise ValueError("socket_path exists and is not a socket")
-            if os.name == "posix" and metadata.st_uid != os.getuid():
+            if _IS_POSIX and metadata.st_uid != _effective_uid():
                 raise ValueError("socket_path is not owned by this user")
             stale_identity = (metadata.st_dev, metadata.st_ino)
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -485,15 +558,15 @@ class UnixSocketAgentServer:
             if not stat.S_ISSOCK(metadata.st_mode):
                 raise ValueError("bound socket_path is invalid")
             bound_identity = (metadata.st_dev, metadata.st_ino)
-            if os.name == "posix":
-                path.chmod(0o660)
-            metadata = path.lstat()
-            if (
-                not stat.S_ISSOCK(metadata.st_mode)
-                or (metadata.st_dev, metadata.st_ino) != bound_identity
+            if _IS_POSIX and not UnixSocketAgentServer._chmod_if_same_socket(
+                path,
+                bound_identity,
+                0o660,
             ):
                 raise ValueError("socket_path changed while binding")
             listener.listen(16)
+            if not UnixSocketAgentServer._socket_matches(path, bound_identity):
+                raise ValueError("socket_path changed while binding")
         except Exception:
             listener.close()
             if bound_identity is not None:
@@ -507,12 +580,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--systemd", action="store_true")
     parser.add_argument("--socket", default="/run/dgx-spark-manager/ops-agent.sock")
     parser.add_argument("--key-file", default=_DEFAULT_KEY_PATH)
+    parser.add_argument("--key-group", default=_DEFAULT_KEY_GROUP)
     parser.add_argument("--job-dir", default="/var/lib/dgx-spark-ops-agent/jobs")
     parser.add_argument("--max-connections", type=int, default=4)
     parser.add_argument("--read-timeout", type=float, default=2.0)
     options = parser.parse_args(argv)
 
-    secret = _read_secret_file(options.key_file)
+    expected_gid = _resolve_key_group(options.key_group)
+    secret = _read_secret_file(options.key_file, expected_gid=expected_gid)
     runner = JobRunner(options.job_dir)
     agent = AgentServer(secret, runner)
     if options.systemd:
@@ -538,7 +613,68 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _read_secret_file(path: str | os.PathLike[str]) -> bytes:
+def _effective_uid() -> int:
+    getter = getattr(os, "geteuid", None)
+    if not callable(getter):
+        raise ValueError("effective user is unavailable")
+    return int(getter())
+
+
+def _resolve_key_group(name: str) -> int | None:
+    if not isinstance(name, str) or _KEY_GROUP_PATTERN.fullmatch(name) is None:
+        raise ValueError("invalid key group")
+    if not _IS_POSIX:
+        return None
+    group_module = importlib.import_module("grp")
+    try:
+        group = group_module.getgrnam(name)
+    except KeyError:
+        raise ValueError("invalid key group") from None
+    group_id = group.gr_gid
+    if type(group_id) is not int or group_id < 0:
+        raise ValueError("invalid key group")
+    return group_id
+
+
+def _validate_key_metadata(metadata: os.stat_result, expected_gid: int | None) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("invalid key file")
+    if not _IS_POSIX:
+        return
+    if expected_gid is not None and (type(expected_gid) is not int or expected_gid < 0):
+        raise ValueError("invalid key file")
+    if metadata.st_uid != _effective_uid():
+        raise ValueError("invalid key file")
+    mode = metadata.st_mode
+    allowed = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP
+    special = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+    if (
+        not mode & stat.S_IRUSR
+        or mode & special
+        or stat.S_IMODE(mode) & ~allowed
+    ):
+        raise ValueError("invalid key file")
+    if mode & stat.S_IRGRP and (
+        expected_gid is None or metadata.st_gid != expected_gid
+    ):
+        raise ValueError("invalid key file")
+
+
+def _decode_secret_file(value: bytes) -> bytes:
+    if len(value) == 32:
+        return value
+    if len(value) == 65 and value.endswith(b"\n"):
+        value = value[:-1]
+    if len(value) != 64 or any(byte not in _HEX_BYTES for byte in value):
+        raise ValueError("invalid key file")
+    return bytes.fromhex(value.decode("ascii"))
+
+
+def _read_secret_file(
+    path: str | os.PathLike[str],
+    *,
+    expected_gid: int | None = None,
+) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -547,11 +683,11 @@ def _read_secret_file(path: str | os.PathLike[str]) -> bytes:
     try:
         metadata = os.fstat(descriptor)
         if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_size <= 0
+            metadata.st_size <= 0
             or metadata.st_size > _MAX_KEY_FILE_SIZE
         ):
             raise ValueError("invalid key file")
+        _validate_key_metadata(metadata, expected_gid)
         chunks = bytearray()
         while len(chunks) <= _MAX_KEY_FILE_SIZE:
             chunk = os.read(
@@ -561,12 +697,12 @@ def _read_secret_file(path: str | os.PathLike[str]) -> bytes:
             if not chunk:
                 break
             chunks.extend(chunk)
-        value = bytes(chunks).strip()
+        value = bytes(chunks)
     finally:
         os.close(descriptor)
     if len(value) > _MAX_KEY_FILE_SIZE:
         raise ValueError("invalid key file")
-    return value
+    return _decode_secret_file(value)
 
 
 __all__ = ["AgentServer", "UnixSocketAgentServer", "main"]

@@ -16,6 +16,7 @@ import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -295,6 +296,13 @@ def test_server_bounds_read_job_polling_by_action_timeout():
                 {"as_dict": lambda self: dict(runner.jobs[job_id])},
             )()
 
+        def cancel(self, job_id):
+            return type(
+                "FakeJob",
+                (),
+                {"as_dict": lambda self: dict(runner.jobs[job_id])},
+            )()
+
     runner = NeverCompletesRunner()
     ticks = iter([0.0, 12.0])
     server = AgentServer(
@@ -316,9 +324,49 @@ def test_server_bounds_read_job_polling_by_action_timeout():
     assert response["result"] == {
         "job_id": "00000000-0000-4000-8000-000000000001"
     }
-    assert runner.jobs["00000000-0000-4000-8000-000000000001"]["status"] == (
-        "cancelled"
+    assert runner.jobs["00000000-0000-4000-8000-000000000001"]["status"] == "queued"
+
+
+def test_server_returns_terminal_snapshot_from_deadline_cancel_race():
+    class CompletesDuringCancelRunner(_FakeRunner):
+        def get(self, job_id, *, offset=None):
+            return type(
+                "FakeJob",
+                (),
+                {"as_dict": lambda self: dict(runner.jobs[job_id])},
+            )()
+
+        def cancel(self, job_id):
+            self.jobs[job_id].update(
+                status="succeeded",
+                output="completed during cancel",
+                output_offset=len("completed during cancel"),
+                exit_code=0,
+                finished=1000.0,
+            )
+            return type(
+                "FakeJob",
+                (),
+                {"as_dict": lambda self: dict(runner.jobs[job_id])},
+            )()
+
+    runner = CompletesDuringCancelRunner()
+    ticks = iter([0.0, 12.0])
+    server = AgentServer(
+        SECRET,
+        runner,
+        clock=lambda: 1000,
+        monotonic=lambda: next(ticks),
+        sleeper=lambda _seconds: pytest.fail("deadline should already be exceeded"),
     )
+
+    response = server.handle(
+        _server_request("host.memory", {}, nonce="cancel-race")
+    )
+
+    assert response["ok"] is True
+    assert response["result"]["status"] == "succeeded"
+    assert response["result"]["output"] == "completed during cancel"
 
 
 def test_server_rejects_invalid_secret_and_listener_at_startup():
@@ -791,11 +839,18 @@ def test_server_cli_systemd_mode_uses_fd3_and_default_key_path(tmp_path, monkeyp
         def close(self):
             calls["closed"] = True
 
-    def read_secret(path):
+    def read_secret(path, *, expected_gid):
         calls["key_path"] = os.fspath(path)
+        calls["key_gid"] = expected_gid
         return SECRET
 
     monkeypatch.setattr(server_module, "_read_secret_file", read_secret, raising=False)
+    monkeypatch.setattr(
+        server_module,
+        "_resolve_key_group",
+        lambda name: calls.setdefault("group_name", name) and 4242,
+        raising=False,
+    )
     monkeypatch.setattr(server_module, "JobRunner", lambda path: _FakeRunner())
     monkeypatch.setattr(server_module, "UnixSocketAgentServer", FakeTransport)
 
@@ -805,6 +860,8 @@ def test_server_cli_systemd_mode_uses_fd3_and_default_key_path(tmp_path, monkeyp
 
     assert result == 0
     assert calls["key_path"] == "/etc/dgx-spark-manager/ops-agent.key"
+    assert calls["key_gid"] == 4242
+    assert calls["group_name"] == "dgx-spark-ops"
     assert calls["systemd"]["descriptor"] == 3
     assert calls["served"] is True
     assert calls["closed"] is True
@@ -831,7 +888,12 @@ def test_server_cli_standalone_mode_ignores_activation_environment(
 
     monkeypatch.setenv("LISTEN_PID", str(os.getpid()))
     monkeypatch.setenv("LISTEN_FDS", "1")
-    monkeypatch.setattr(server_module, "_read_secret_file", lambda _path: SECRET)
+    monkeypatch.setattr(
+        server_module,
+        "_read_secret_file",
+        lambda _path, *, expected_gid: SECRET,
+    )
+    monkeypatch.setattr(server_module, "_resolve_key_group", lambda _name: 4242, raising=False)
     monkeypatch.setattr(server_module, "JobRunner", lambda path: _FakeRunner())
     monkeypatch.setattr(server_module, "UnixSocketAgentServer", FakeTransport)
     socket_path = tmp_path / "standalone.sock"
@@ -845,6 +907,7 @@ def test_server_cli_standalone_mode_ignores_activation_environment(
 def test_server_key_reader_handles_short_os_reads(tmp_path, monkeypatch):
     key_path = tmp_path / "ops-agent.key"
     key_path.write_bytes(SECRET)
+    key_path.chmod(0o600)
     original_read = os.read
 
     def short_read(descriptor, size):
@@ -853,6 +916,141 @@ def test_server_key_reader_handles_short_os_reads(tmp_path, monkeypatch):
     monkeypatch.setattr(server_module.os, "read", short_read)
 
     assert server_module._read_secret_file(key_path) == SECRET
+
+
+def _mock_posix_key_metadata(monkeypatch, *, mode, uid=1000, gid=2000):
+    original_fstat = os.fstat
+
+    def key_fstat(descriptor):
+        metadata = original_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=mode,
+            st_size=metadata.st_size,
+            st_uid=uid,
+            st_gid=gid,
+        )
+
+    monkeypatch.setattr(server_module, "_IS_POSIX", True, raising=False)
+    monkeypatch.setattr(server_module, "_effective_uid", lambda: 1000, raising=False)
+    monkeypatch.setattr(server_module.os, "fstat", key_fstat)
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o640])
+def test_server_key_reader_accepts_secure_posix_modes(
+    tmp_path, monkeypatch, mode
+):
+    key_path = tmp_path / "secure.key"
+    key_path.write_bytes(SECRET)
+    _mock_posix_key_metadata(
+        monkeypatch,
+        mode=stat.S_IFREG | mode,
+        gid=2000,
+    )
+
+    assert server_module._read_secret_file(key_path, expected_gid=2000) == SECRET
+
+
+@pytest.mark.parametrize(
+    ("mode", "uid", "gid", "expected_gid"),
+    [
+        (0o666, 1000, 2000, 2000),
+        (0o644, 1000, 2000, 2000),
+        (0o660, 1000, 2000, 2000),
+        (0o700, 1000, 2000, 2000),
+        (0o601, 1000, 2000, 2000),
+        (0o600, 1001, 2000, 2000),
+        (0o640, 1000, 3000, 2000),
+    ],
+)
+def test_server_key_reader_rejects_unsafe_posix_metadata(
+    tmp_path, monkeypatch, mode, uid, gid, expected_gid
+):
+    secret = b"secret-must-not-leak-1234567890x"
+    assert len(secret) == 32
+    key_path = tmp_path / "unsafe.key"
+    key_path.write_bytes(secret)
+    _mock_posix_key_metadata(
+        monkeypatch,
+        mode=stat.S_IFREG | mode,
+        uid=uid,
+        gid=gid,
+    )
+
+    with pytest.raises(ValueError) as captured:
+        server_module._read_secret_file(key_path, expected_gid=expected_gid)
+
+    assert secret.decode("ascii") not in str(captured.value)
+
+
+@pytest.mark.parametrize("file_type", [stat.S_IFDIR, stat.S_IFLNK])
+def test_server_key_reader_rejects_non_regular_files(
+    tmp_path, monkeypatch, file_type
+):
+    key_path = tmp_path / "not-regular.key"
+    key_path.write_bytes(SECRET)
+    _mock_posix_key_metadata(
+        monkeypatch,
+        mode=file_type | 0o600,
+    )
+
+    with pytest.raises(ValueError, match="key file"):
+        server_module._read_secret_file(key_path, expected_gid=2000)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="O_NOFOLLOW is POSIX")
+def test_server_key_reader_rejects_real_symlink(tmp_path):
+    target = tmp_path / "target.key"
+    target.write_bytes(SECRET)
+    target.chmod(0o600)
+    linked = tmp_path / "linked.key"
+    linked.symlink_to(target)
+
+    with pytest.raises(ValueError, match="key file"):
+        server_module._read_secret_file(linked)
+
+
+@pytest.mark.parametrize("group_name", ["", "BadGroup", "group/name", "组"])
+def test_server_key_group_name_is_strict(group_name):
+    with pytest.raises(ValueError, match="key group"):
+        server_module._resolve_key_group(group_name)
+
+
+def test_server_key_reader_preserves_exact_raw_whitespace_bytes(tmp_path):
+    raw_secret = b" " + (b"x" * 30) + b"\n"
+    assert len(raw_secret) == 32
+    key_path = tmp_path / "raw.key"
+    key_path.write_bytes(raw_secret)
+    key_path.chmod(0o600)
+
+    assert server_module._read_secret_file(key_path) == raw_secret
+
+
+@pytest.mark.parametrize("suffix", [b"", b"\n"])
+def test_server_key_reader_decodes_hex_secret(tmp_path, suffix):
+    key_path = tmp_path / "hex.key"
+    key_path.write_bytes((b"ab" * 32) + suffix)
+    key_path.chmod(0o600)
+
+    assert server_module._read_secret_file(key_path) == bytes.fromhex("ab" * 32)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        b"x" * 31,
+        b"x" * 33,
+        b"z" * 64,
+        (b"ab" * 32) + b"\n\n",
+        (b"ab" * 32) + b"\r\n",
+    ],
+)
+def test_server_key_reader_rejects_invalid_secret_encodings(tmp_path, value):
+    key_path = tmp_path / "invalid.key"
+    key_path.write_bytes(value)
+    key_path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="key file"):
+        server_module._read_secret_file(key_path)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="systemd file descriptors are POSIX")
@@ -954,6 +1152,83 @@ def test_unix_socket_cleanup_rechecks_identity_before_unlink(tmp_path, monkeypat
     assert unlinked == []
     assert UnixSocketAgentServer._unlink_if_same_socket(path, (10, 22)) is True
     assert unlinked == [path]
+
+
+@pytest.mark.parametrize(
+    ("mode", "uid", "expected"),
+    [
+        (stat.S_IFDIR | 0o700, 1000, True),
+        (stat.S_IFDIR | 0o755, 1000, True),
+        (stat.S_IFDIR | 0o770, 1000, False),
+        (stat.S_IFDIR | 0o707, 1000, False),
+        (stat.S_IFDIR | 0o700, 1001, False),
+        (stat.S_IFLNK | 0o700, 1000, False),
+        (stat.S_IFREG | 0o700, 1000, False),
+    ],
+)
+def test_unix_socket_parent_metadata_policy(mode, uid, expected):
+    metadata = SimpleNamespace(st_mode=mode, st_uid=uid)
+
+    assert (
+        UnixSocketAgentServer._parent_metadata_is_secure(metadata, expected_uid=1000)
+        is expected
+    )
+
+
+@pytest.mark.parametrize("replacement_type", [stat.S_IFREG, stat.S_IFLNK])
+def test_unix_socket_chmod_refuses_replacement_paths(
+    tmp_path, monkeypatch, replacement_type
+):
+    class ReplacementMetadata:
+        st_mode = replacement_type | 0o600
+        st_dev = 10
+        st_ino = 22
+
+    path = tmp_path / "replacement.sock"
+    monkeypatch.setattr(Path, "lstat", lambda self: ReplacementMetadata())
+    monkeypatch.setattr(
+        server_module.os,
+        "chmod",
+        lambda *_args, **_kwargs: pytest.fail("replacement must not be chmodded"),
+    )
+
+    assert (
+        UnixSocketAgentServer._chmod_if_same_socket(path, (10, 22), 0o660)
+        is False
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory modes only")
+def test_unix_socket_server_rejects_unsafe_parent_without_modifying_target(tmp_path):
+    unsafe_parent = tmp_path / "unsafe"
+    unsafe_parent.mkdir(mode=0o777)
+    unsafe_parent.chmod(0o777)
+    socket_path = unsafe_parent / "ops.sock"
+
+    with pytest.raises(ValueError, match="socket parent"):
+        UnixSocketAgentServer(
+            AgentServer(SECRET, _FakeRunner()),
+            socket_path=socket_path,
+        )
+
+    assert not socket_path.exists()
+    assert stat.S_IMODE(unsafe_parent.stat().st_mode) == 0o777
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink behavior only")
+def test_unix_socket_server_rejects_symlink_parent_without_touching_target(tmp_path):
+    real_parent = tmp_path / "real"
+    real_parent.mkdir(mode=0o700)
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="socket parent"):
+        UnixSocketAgentServer(
+            AgentServer(SECRET, _FakeRunner()),
+            socket_path=linked_parent / "ops.sock",
+        )
+
+    assert list(real_parent.iterdir()) == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX inode ownership only")
