@@ -4,6 +4,8 @@ import io
 import json
 import math
 import os
+import signal
+import stat
 import struct
 import sys
 import time
@@ -15,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from host_agent.dgx_ops_agent import protocol as protocol_module
+from host_agent.dgx_ops_agent import runner as runner_module
 from host_agent.dgx_ops_agent.policy import (
     READ_ONLY_ACTIONS,
     PolicyError,
@@ -1096,6 +1099,36 @@ def test_streaming_redactor_handles_split_and_invalid_utf8_without_leaking():
     assert "\ufffd" in decoded
 
 
+def test_streaming_redactor_covers_namespaced_sensitive_assignments():
+    redactor = StreamingRedactor()
+    chunks = [
+        b"AWS_SECRET_AC",
+        b"CESS_KEY=aws-value OPENAI_API_",
+        b"KEY:'openai-value' POSTGRES_PASSWORD=db-value ",
+        b"CLIENT_SECRET=client-value PRIVATE_KEY=private-value ",
+        b'"DGX_OPS_RECOVERY_TOKEN": "internal-value" ',
+        b"NOTSECRET=visible almost_notsecret=also-visible PUBLIC_KEY=public-value",
+    ]
+
+    output = b"".join(
+        [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
+    ).decode("utf-8")
+
+    for secret in (
+        "aws-value",
+        "openai-value",
+        "db-value",
+        "client-value",
+        "private-value",
+        "internal-value",
+    ):
+        assert secret not in output
+    assert output.count("[REDACTED]") == 6
+    assert "NOTSECRET=visible" in output
+    assert "almost_notsecret=also-visible" in output
+    assert "PUBLIC_KEY=public-value" in output
+
+
 def test_runner_uses_clean_environment_devnull_and_merged_output(tmp_path, monkeypatch):
     monkeypatch.setenv("BASH_ENV", "inherited-bash")
     monkeypatch.setenv("ENV", "inherited-env")
@@ -1106,7 +1139,8 @@ def test_runner_uses_clean_environment_devnull_and_merged_output(tmp_path, monke
         "import json, os, sys; "
         "sys.stderr.write('stderr\\n'); "
         "print('stdin=' + repr(sys.stdin.read())); "
-        "print(json.dumps(dict(os.environ), sort_keys=True))"
+        "print(json.dumps(dict(os.environ), sort_keys=True)); "
+        "print(os.environ['DGX_OPS_RECOVERY_TOKEN'])"
     )
     runner = JobRunner(tmp_path)
 
@@ -1119,8 +1153,13 @@ def test_runner_uses_clean_environment_devnull_and_merged_output(tmp_path, monke
     assert result.exit_code == 0
     lines = result.output.splitlines()
     assert lines[:2] == ["stderr", "stdin=''"]
-    environment = json.loads(lines[-1])
-    assert environment == {"LANG": "runner-test", "PATH": SAFE_PATH}
+    environment = json.loads(lines[-2])
+    assert environment == {
+        "DGX_OPS_RECOVERY_TOKEN": "[REDACTED]",
+        "LANG": "runner-test",
+        "PATH": SAFE_PATH,
+    }
+    assert lines[-1] == "[REDACTED]"
     assert "inherited-secret" not in result.output
 
 
@@ -1241,6 +1280,98 @@ def test_cancel_terminates_the_entire_posix_process_group(tmp_path):
         pytest.fail("child process group member survived cancellation")
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+def test_timeout_covers_background_group_after_leader_exits(tmp_path):
+    child_code = "import time; time.sleep(3)"
+    parent_code = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "print('leader-exited')"
+    )
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+
+    started_at = time.monotonic()
+    job = runner.start(
+        [sys.executable, "-c", parent_code], cwd=tmp_path, timeout=0.2
+    )
+    result = _wait_for_terminal(runner, job.id)
+
+    assert result.status == "timed_out"
+    assert "leader-exited" in result.output
+    assert time.monotonic() - started_at < 1.5
+
+
+def test_timeout_tracks_injected_process_group_after_leader_exit(
+    tmp_path, monkeypatch
+):
+    class ExitedLeader:
+        pid = 4242
+        stdout = io.BytesIO()
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    group_alive = True
+    signals = []
+
+    def fake_killpg(process_group, sent_signal):
+        nonlocal group_alive
+        signals.append((process_group, sent_signal))
+        if sent_signal == signal.SIGKILL:
+            group_alive = False
+
+    runner = JobRunner(tmp_path, termination_grace=0)
+    monkeypatch.setattr(runner_module, "_HAS_PROCESS_GROUPS", True)
+    monkeypatch.setattr(runner_module.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(runner_module.os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        JobRunner,
+        "_process_group_exists",
+        staticmethod(lambda _process_group: group_alive),
+    )
+    monkeypatch.setattr(runner_module.subprocess, "Popen", lambda *_args, **_kwargs: ExitedLeader())
+
+    job = runner.start(
+        [sys.executable, "-c", "unused"], cwd=tmp_path, timeout=0.05
+    )
+    result = _wait_for_terminal(runner, job.id)
+
+    assert result.status == "timed_out"
+    assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+def test_cancel_covers_background_group_after_leader_exits(tmp_path):
+    child_pid = tmp_path / "orphan-child.pid"
+    child_code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(3)"
+    parent_code = (
+        "import pathlib, subprocess, sys; "
+        f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))"
+    )
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+    job = runner.start(
+        [sys.executable, "-c", parent_code], cwd=tmp_path, timeout=2
+    )
+    deadline = time.monotonic() + 1
+    while not child_pid.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert child_pid.exists()
+    time.sleep(0.05)
+
+    started_at = time.monotonic()
+    runner.cancel(job.id)
+    result = _wait_for_terminal(runner, job.id)
+
+    assert result.status == "cancelled"
+    assert time.monotonic() - started_at < 1.5
+
+
 def test_runner_metadata_is_atomic_redacted_and_recovers_interrupted_jobs(tmp_path):
     runner = JobRunner(tmp_path)
     command_secret = "token=metadata-command-secret"
@@ -1271,6 +1402,174 @@ def test_runner_metadata_is_atomic_redacted_and_recovers_interrupted_jobs(tmp_pa
     assert "interrupted" in recovered.error
 
 
+def test_runner_metadata_never_contains_namespaced_assignment_values(tmp_path):
+    assignments = (
+        "AWS_SECRET_ACCESS_KEY=aws-metadata-value ",
+        "OPENAI_API_KEY=openai-metadata-value ",
+        "POSTGRES_PASSWORD=postgres-metadata-value ",
+        "CLIENT_SECRET=client-metadata-value ",
+        "PRIVATE_KEY=private-metadata-value",
+    )
+    runner = JobRunner(tmp_path)
+    job = runner.start(_test_action(tmp_path, f"print({''.join(assignments)!r})"))
+
+    result = _wait_for_terminal(runner, job.id)
+    metadata = (tmp_path / f"{job.id}.json").read_text(encoding="utf-8")
+
+    assert result.output.count("[REDACTED]") == 5
+    for secret in (
+        "aws-metadata-value",
+        "openai-metadata-value",
+        "postgres-metadata-value",
+        "client-metadata-value",
+        "private-metadata-value",
+    ):
+        assert secret not in result.output
+        assert secret not in metadata
+
+
+def test_runner_persists_private_process_identity_immediately_after_spawn(tmp_path):
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+    job = runner.start(
+        [sys.executable, "-c", "import time; time.sleep(3)"],
+        cwd=tmp_path,
+        timeout=5,
+    )
+    metadata_path = tmp_path / f"{job.id}.json"
+    deadline = time.monotonic() + 1
+    identity = None
+    while time.monotonic() < deadline:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        identity = metadata.get("process_identity")
+        if metadata["status"] == "running" and identity and identity.get("pid"):
+            break
+        time.sleep(0.01)
+
+    assert identity is not None
+    assert identity["pid"] > 0
+    assert identity["recovery_token"]
+    assert set(identity) == {
+        "pid",
+        "process_group",
+        "session_id",
+        "start_time_ticks",
+        "boot_id",
+        "recovery_token",
+    }
+    assert "recovery_token" not in job.as_dict()
+    assert identity["recovery_token"] not in json.dumps(job.as_dict())
+    runner.cancel(job.id)
+    assert _wait_for_terminal(runner, job.id).status == "cancelled"
+
+
+def test_runner_cleans_up_when_spawn_identity_cannot_be_persisted(
+    tmp_path, monkeypatch
+):
+    runner = JobRunner(tmp_path, termination_grace=0.05)
+    original_persist = runner._persist
+    injected = False
+
+    def fail_first_identity_persist(state):
+        nonlocal injected
+        if state.process_identity is not None and not injected:
+            injected = True
+            raise OSError("identity persistence failed")
+        return original_persist(state)
+
+    monkeypatch.setattr(runner, "_persist", fail_first_identity_persist)
+
+    job = runner.start(
+        [sys.executable, "-c", "import time; time.sleep(1)"],
+        cwd=tmp_path,
+        timeout=5,
+    )
+    result = _wait_for_terminal(runner, job.id, timeout=0.8)
+
+    assert injected is True
+    assert result.status == "failed"
+    assert "identity persistence failed" in result.error
+
+
+def test_restart_kills_only_exact_fake_proc_identity_match(tmp_path, monkeypatch):
+    jobs = tmp_path / "jobs"
+    proc_root = tmp_path / "proc"
+    jobs.mkdir()
+    boot_id = "11111111-1111-4111-8111-111111111111"
+    (proc_root / "sys" / "kernel" / "random").mkdir(parents=True)
+    (proc_root / "sys" / "kernel" / "random" / "boot_id").write_text(
+        f"{boot_id}\n", encoding="ascii"
+    )
+
+    def write_process(pid, token):
+        process_dir = proc_root / str(pid)
+        process_dir.mkdir()
+        stat_fields = ["S", "1", str(pid), str(pid), *(["0"] * 15), "777"]
+        (process_dir / "stat").write_text(
+            f"{pid} (python worker) {' '.join(stat_fields)}\n", encoding="ascii"
+        )
+        (process_dir / "environ").write_bytes(
+            f"DGX_OPS_RECOVERY_TOKEN={token}\0".encode()
+        )
+
+    def write_job(job_id, pid, token):
+        metadata = {
+            "job_id": job_id,
+            "status": "running",
+            "output": "",
+            "output_offset": 0,
+            "truncated_before": 0,
+            "exit_code": None,
+            "started": 1.0,
+            "finished": None,
+            "error": None,
+            "process_identity": {
+                "pid": pid,
+                "process_group": pid,
+                "session_id": pid,
+                "start_time_ticks": 777,
+                "boot_id": boot_id,
+                "recovery_token": token,
+            },
+        }
+        path = jobs / f"{job_id}.json"
+        path.write_text(json.dumps(metadata), encoding="utf-8")
+        path.chmod(0o600)
+
+    matching_id = "00000000-0000-4000-8000-000000000101"
+    mismatch_id = "00000000-0000-4000-8000-000000000202"
+    write_process(101, "matching-recovery-token")
+    write_process(202, "different-process-token")
+    write_job(matching_id, 101, "matching-recovery-token")
+    write_job(mismatch_id, 202, "metadata-token-does-not-match")
+
+    group_alive = {101: True, 202: True}
+    sent_signals = []
+
+    def fake_killpg(process_group, sent_signal):
+        sent_signals.append((process_group, sent_signal))
+        if sent_signal == 9:
+            group_alive[process_group] = False
+
+    monkeypatch.setattr(runner_module, "PROC_ROOT", proc_root, raising=False)
+    monkeypatch.setattr(runner_module, "_IS_LINUX", True, raising=False)
+    monkeypatch.setattr(runner_module.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(runner_module.os, "killpg", fake_killpg, raising=False)
+    monkeypatch.setattr(
+        JobRunner,
+        "_process_group_exists",
+        staticmethod(lambda process_group: group_alive[process_group]),
+    )
+
+    runner = JobRunner(jobs, termination_grace=0)
+
+    assert sent_signals == [(101, signal.SIGTERM), (101, 9)]
+    assert runner.get(matching_id).status == "failed"
+    assert runner.get(mismatch_id).status == "failed"
+    assert "interrupted" in runner.get(matching_id).error
+    assert "interrupted" in runner.get(mismatch_id).error
+    assert json.loads((jobs / f"{matching_id}.json").read_text())["process_identity"]
+
+
 def test_runner_rejects_invalid_limits_offsets_environment_and_job_ids(tmp_path):
     with pytest.raises(ValueError, match="output_limit"):
         JobRunner(tmp_path, output_limit=0)
@@ -1298,6 +1597,75 @@ def test_runner_rejects_invalid_limits_offsets_environment_and_job_ids(tmp_path)
         runner.get(result.id, offset=-1)
     with pytest.raises(ValueError, match="offset"):
         runner.get(result.id, offset=result.output_offset + 1)
+
+
+def test_runner_job_directory_chmod_failure_is_fatal(tmp_path, monkeypatch):
+    job_dir = tmp_path / "jobs"
+    job_dir.mkdir()
+    original_chmod = Path.chmod
+
+    def deny_job_directory_chmod(path, mode):
+        if path == job_dir:
+            raise PermissionError("chmod denied")
+        return original_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "chmod", deny_job_directory_chmod)
+
+    with pytest.raises(PermissionError, match="chmod denied"):
+        JobRunner(job_dir)
+
+
+def test_runner_metadata_chmod_failure_makes_start_fail(tmp_path, monkeypatch):
+    runner = JobRunner(tmp_path)
+    original_chmod = Path.chmod
+
+    def deny_metadata_chmod(path, mode):
+        if path.suffix == ".json":
+            raise PermissionError("metadata chmod denied")
+        return original_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "chmod", deny_metadata_chmod)
+
+    with pytest.raises(PermissionError, match="metadata chmod denied"):
+        runner.start([sys.executable, "-c", "pass"], cwd=tmp_path, timeout=1)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and modes only")
+def test_runner_rejects_symlink_job_directory(tmp_path):
+    real_directory = tmp_path / "real-jobs"
+    real_directory.mkdir(mode=0o700)
+    symlink = tmp_path / "linked-jobs"
+    symlink.symlink_to(real_directory, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="job_dir"):
+        JobRunner(symlink)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and modes only")
+def test_runner_enforces_private_directory_and_regular_metadata_modes(tmp_path):
+    job_dir = tmp_path / "jobs"
+    job_dir.mkdir(mode=0o755)
+    runner = JobRunner(job_dir)
+    directory_stat = job_dir.stat()
+
+    assert directory_stat.st_uid == os.getuid()
+    assert stat.S_IMODE(directory_stat.st_mode) == 0o700
+
+    result = _wait_for_terminal(
+        runner,
+        runner.start(
+            [sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout=1
+        ).id,
+    )
+    metadata_stat = (job_dir / f"{result.id}.json").lstat()
+    assert stat.S_ISREG(metadata_stat.st_mode)
+    assert metadata_stat.st_uid == os.getuid()
+    assert stat.S_IMODE(metadata_stat.st_mode) == 0o600
+
+    metadata_path = job_dir / f"{result.id}.json"
+    metadata_path.chmod(0o644)
+    with pytest.raises(PermissionError, match="metadata permissions"):
+        JobRunner(job_dir)
 
 
 def test_ci_lints_backend_and_host_agent():

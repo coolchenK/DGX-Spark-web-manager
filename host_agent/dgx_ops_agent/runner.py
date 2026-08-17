@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import signal
+import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -18,6 +21,11 @@ from .policy import ValidatedAction
 from .redaction import StreamingRedactor, redact_text
 
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PROC_ROOT = Path("/proc")
+_HAS_PROCESS_GROUPS = os.name == "posix"
+_IS_LINUX = sys.platform.startswith("linux")
+_IS_POSIX_FILESYSTEM = os.name == "posix"
+_RECOVERY_ENVIRONMENT_KEY = "DGX_OPS_RECOVERY_TOKEN"
 DEFAULT_OUTPUT_LIMIT = 64 * 1024
 MAX_OUTPUT_LIMIT = 16 * 1024 * 1024
 MAX_ERROR_BYTES = 512
@@ -70,6 +78,26 @@ class Job:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _ProcessIdentity:
+    pid: int
+    process_group: int | None
+    session_id: int | None
+    start_time_ticks: int | None
+    boot_id: str | None
+    recovery_token: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "process_group": self.process_group,
+            "session_id": self.session_id,
+            "start_time_ticks": self.start_time_ticks,
+            "boot_id": self.boot_id,
+            "recovery_token": self.recovery_token,
+        }
+
+
 @dataclass(slots=True)
 class _JobState:
     id: str
@@ -82,6 +110,8 @@ class _JobState:
     finished: float | None = None
     error: str | None = None
     process: subprocess.Popen[bytes] | None = None
+    process_group: int | None = None
+    process_identity: _ProcessIdentity | None = None
     cancel_requested: threading.Event = field(default_factory=threading.Event)
 
 
@@ -107,11 +137,10 @@ class JobRunner:
         ):
             raise ValueError("invalid termination_grace")
         self.job_dir = Path(job_dir)
+        if self.job_dir.is_symlink():
+            raise ValueError("invalid job_dir")
         self.job_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            self.job_dir.chmod(0o700)
-        except OSError:
-            pass
+        self._secure_job_directory()
         self.output_limit = output_limit
         self.termination_grace = float(termination_grace)
         self._lock = threading.RLock()
@@ -185,7 +214,12 @@ class JobRunner:
             if state.status in TERMINAL_STATUSES:
                 return self._snapshot(state)
             process = state.process
-            if process is None or process.poll() is None:
+            group_active = (
+                state.process_group is not None
+                and _HAS_PROCESS_GROUPS
+                and self._process_group_exists(state.process_group)
+            )
+            if process is None or process.poll() is None or group_active:
                 state.cancel_requested.set()
             return self._snapshot(state)
 
@@ -255,20 +289,21 @@ class JobRunner:
             if state.cancel_requested.is_set():
                 self._finish(state, "cancelled", None)
                 return
-            state.status = "running"
             state.started = time.time()
-            self._persist(state)
 
         popen_options: dict[str, Any] = {
             "cwd": cwd,
-            "env": environment,
+            "env": {
+                **environment,
+                _RECOVERY_ENVIRONMENT_KEY: secrets.token_urlsafe(32),
+            },
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
             "text": False,
             "shell": False,
         }
-        if os.name == "posix":
+        if _HAS_PROCESS_GROUPS:
             popen_options["start_new_session"] = True
         try:
             process = subprocess.Popen(argv, **popen_options)
@@ -277,10 +312,58 @@ class JobRunner:
                 self._finish(state, "failed", None, error=self._bounded_error(exc))
             return
 
+        recovery_token = popen_options["env"][_RECOVERY_ENVIRONMENT_KEY]
+        process_group = process.pid if _HAS_PROCESS_GROUPS else None
+        try:
+            identity = self._capture_process_identity(process.pid, recovery_token)
+        except (OSError, ValueError) as exc:
+            self._terminate(process, process_group)
+            try:
+                exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
+            except subprocess.TimeoutExpired:
+                self._kill(process, process_group)
+                exit_code = process.wait()
+            with self._lock:
+                state.process = process
+                state.process_group = process_group
+                self._finish(
+                    state,
+                    "failed",
+                    exit_code,
+                    error=self._bounded_error(exc),
+                )
+            return
+
+        persistence_error: OSError | None = None
         with self._lock:
             state.process = process
+            state.process_group = process_group
+            state.process_identity = identity
+            state.status = "running"
+            try:
+                self._persist(state)
+            except OSError as exc:
+                persistence_error = exc
+        if persistence_error is not None:
+            self._terminate(process, process_group)
+            try:
+                exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
+            except subprocess.TimeoutExpired:
+                self._kill(process, process_group)
+                exit_code = process.wait()
+            with self._lock:
+                try:
+                    self._finish(
+                        state,
+                        "failed",
+                        exit_code,
+                        error=self._bounded_error(persistence_error),
+                    )
+                except OSError:
+                    pass
+            return
 
-        redactor = StreamingRedactor()
+        redactor = StreamingRedactor(secret_values=(recovery_token,))
         reader_error: list[Exception] = []
         reader = threading.Thread(
             target=self._read_output,
@@ -292,19 +375,27 @@ class JobRunner:
 
         deadline = time.monotonic() + timeout
         outcome: str | None = None
-        while process.poll() is None:
+        while True:
+            leader_active = process.poll() is None
+            group_active = (
+                state.process_group is not None
+                and self._process_group_exists(state.process_group)
+            )
+            pipe_active = reader.is_alive()
+            if not leader_active and not group_active and not pipe_active:
+                break
             if state.cancel_requested.wait(timeout=0.01):
                 outcome = "cancelled"
-                self._terminate(process)
+                self._terminate(process, state.process_group)
                 break
             if time.monotonic() >= deadline:
                 outcome = "timed_out"
-                self._terminate(process)
+                self._terminate(process, state.process_group)
                 break
         try:
             exit_code = process.wait(timeout=max(self.termination_grace, 0.1))
         except subprocess.TimeoutExpired:
-            self._kill(process)
+            self._kill(process, state.process_group)
             exit_code = process.wait()
 
         reader.join(timeout=max(self.termination_grace, 1.0))
@@ -352,35 +443,44 @@ class JobRunner:
             state.truncated_before = state.output_offset - len(state.output)
             self._persist(state)
 
-    def _terminate(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
+    def _terminate(
+        self,
+        process: subprocess.Popen[bytes],
+        process_group: int | None,
+    ) -> None:
         deadline = time.monotonic() + self.termination_grace
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
+        if _HAS_PROCESS_GROUPS and process_group is not None:
+            if self._process_group_exists(process_group):
+                try:
+                    os.killpg(process_group, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        elif process.poll() is None:
+            try:
                 process.terminate()
-        except ProcessLookupError:
-            return
+            except ProcessLookupError:
+                pass
         try:
             process.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             pass
 
-        if os.name == "posix":
-            while self._process_group_exists(process.pid) and time.monotonic() < deadline:
+        if _HAS_PROCESS_GROUPS and process_group is not None:
+            while self._process_group_exists(process_group) and time.monotonic() < deadline:
                 time.sleep(0.01)
-            if self._process_group_exists(process.pid):
-                self._kill(process)
+            if self._process_group_exists(process_group):
+                self._kill(process, process_group)
         elif process.poll() is None:
-            self._kill(process)
+            self._kill(process, None)
 
     @staticmethod
-    def _kill(process: subprocess.Popen[bytes]) -> None:
+    def _kill(
+        process: subprocess.Popen[bytes],
+        process_group: int | None,
+    ) -> None:
         try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
+            if _HAS_PROCESS_GROUPS and process_group is not None:
+                os.killpg(process_group, signal.SIGKILL)
             elif process.poll() is None:
                 process.kill()
         except ProcessLookupError:
@@ -449,6 +549,11 @@ class JobRunner:
 
     def _persist(self, state: _JobState) -> None:
         metadata = self._snapshot(state).as_dict()
+        metadata["process_identity"] = (
+            None
+            if state.process_identity is None
+            else state.process_identity.as_dict()
+        )
         target = self.job_dir / f"{state.id}.json"
         temporary = self.job_dir / f".{state.id}.{uuid.uuid4().hex}.tmp"
         descriptor = os.open(
@@ -457,26 +562,88 @@ class JobRunner:
             0o600,
         )
         try:
+            try:
+                self._secure_metadata_descriptor(descriptor)
+            except Exception:
+                os.close(descriptor)
+                raise
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(metadata, handle, ensure_ascii=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, target)
-            try:
-                target.chmod(0o600)
-            except OSError:
-                pass
+            self._replace_metadata(temporary, target)
+            target.chmod(0o600)
+            self._verify_metadata_file(target)
         finally:
             try:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
 
+    @staticmethod
+    def _replace_metadata(temporary: Path, target: Path) -> None:
+        deadline = time.monotonic() + 0.2
+        while True:
+            try:
+                os.replace(temporary, target)
+                return
+            except PermissionError:
+                if sys.platform != "win32" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
+
+    def _secure_job_directory(self) -> None:
+        if not _IS_POSIX_FILESYSTEM:
+            metadata = self.job_dir.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("invalid job_dir")
+            self.job_dir.chmod(0o700)
+            return
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.job_dir, flags)
+        try:
+            os.fchmod(descriptor, 0o700)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise PermissionError("job_dir permissions are not private")
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _secure_metadata_descriptor(descriptor: int) -> None:
+        if _IS_POSIX_FILESYSTEM:
+            os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("metadata is not a regular file")
+        if _IS_POSIX_FILESYSTEM and (
+            metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise PermissionError("metadata permissions are not private")
+
+    @staticmethod
+    def _verify_metadata_file(path: Path) -> None:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("metadata is not a regular file")
+        if _IS_POSIX_FILESYSTEM and (
+            metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise PermissionError("metadata permissions are not private")
+
     def _load_jobs(self) -> None:
         for path in self.job_dir.glob("*.json"):
             job_id = path.stem
             if not _valid_job_id(job_id):
                 continue
+            self._verify_metadata_file(path)
             try:
                 if path.stat().st_size > self.output_limit * 4 + 4096:
                     continue
@@ -486,6 +653,12 @@ class JobRunner:
                 continue
             self._jobs[job_id] = state
             if state.status not in TERMINAL_STATUSES:
+                if _IS_LINUX and state.process_identity is not None:
+                    process_group = self._recoverable_process_group(
+                        state.process_identity
+                    )
+                    if process_group is not None:
+                        self._terminate_recovered_group(process_group)
                 state.status = "failed"
                 state.exit_code = None
                 state.finished = time.time()
@@ -518,6 +691,7 @@ class JobRunner:
         started = data.get("started")
         finished = data.get("finished")
         error = data.get("error")
+        process_identity = self._parse_process_identity(data.get("process_identity"))
         if exit_code is not None and type(exit_code) is not int:
             raise ValueError("invalid job metadata")
         if started is not None and not isinstance(started, (int, float)):
@@ -538,7 +712,140 @@ class JobRunner:
             started=None if started is None else float(started),
             finished=None if finished is None else float(finished),
             error=error,
+            process_group=(
+                None
+                if process_identity is None
+                else process_identity.process_group
+            ),
+            process_identity=process_identity,
         )
+
+    @staticmethod
+    def _parse_process_identity(value: Any) -> _ProcessIdentity | None:
+        if value is None:
+            return None
+        expected = {
+            "pid",
+            "process_group",
+            "session_id",
+            "start_time_ticks",
+            "boot_id",
+            "recovery_token",
+        }
+        if type(value) is not dict or set(value) != expected:
+            raise ValueError("invalid job metadata")
+        pid = value["pid"]
+        process_group = value["process_group"]
+        session_id = value["session_id"]
+        start_time_ticks = value["start_time_ticks"]
+        boot_id = value["boot_id"]
+        recovery_token = value["recovery_token"]
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("invalid job metadata")
+        if process_group is not None and (
+            type(process_group) is not int or process_group <= 0
+        ):
+            raise ValueError("invalid job metadata")
+        if session_id is not None and (
+            type(session_id) is not int or session_id <= 0
+        ):
+            raise ValueError("invalid job metadata")
+        if start_time_ticks is not None and (
+            type(start_time_ticks) is not int or start_time_ticks <= 0
+        ):
+            raise ValueError("invalid job metadata")
+        if boot_id is not None and (
+            not isinstance(boot_id, str) or not 1 <= len(boot_id) <= 128
+        ):
+            raise ValueError("invalid job metadata")
+        if (
+            not isinstance(recovery_token, str)
+            or not 16 <= len(recovery_token) <= 128
+            or not recovery_token.isascii()
+        ):
+            raise ValueError("invalid job metadata")
+        return _ProcessIdentity(
+            pid=pid,
+            process_group=process_group,
+            session_id=session_id,
+            start_time_ticks=start_time_ticks,
+            boot_id=boot_id,
+            recovery_token=recovery_token,
+        )
+
+    @staticmethod
+    def _capture_process_identity(pid: int, recovery_token: str) -> _ProcessIdentity:
+        if not _IS_LINUX:
+            return _ProcessIdentity(pid, None, None, None, None, recovery_token)
+        process_group, session_id, start_time_ticks = _read_linux_stat(
+            PROC_ROOT / str(pid) / "stat"
+        )
+        boot_id = _read_boot_id()
+        if process_group != pid or session_id != pid:
+            raise ValueError("process did not create an isolated session")
+        return _ProcessIdentity(
+            pid=pid,
+            process_group=process_group,
+            session_id=session_id,
+            start_time_ticks=start_time_ticks,
+            boot_id=boot_id,
+            recovery_token=recovery_token,
+        )
+
+    @staticmethod
+    def _recoverable_process_group(identity: _ProcessIdentity) -> int | None:
+        if (
+            identity.process_group is None
+            or identity.session_id is None
+            or identity.start_time_ticks is None
+            or identity.boot_id is None
+            or _read_boot_id() != identity.boot_id
+        ):
+            return None
+
+        candidates = [PROC_ROOT / str(identity.pid)]
+        try:
+            candidates.extend(
+                path
+                for path in PROC_ROOT.iterdir()
+                if path.name.isdecimal() and path.name != str(identity.pid)
+            )
+        except OSError:
+            return None
+        for process_dir in candidates:
+            try:
+                process_group, session_id, start_time_ticks = _read_linux_stat(
+                    process_dir / "stat"
+                )
+                if process_group != identity.process_group or session_id != identity.session_id:
+                    continue
+                if process_dir.name == str(identity.pid) and (
+                    start_time_ticks != identity.start_time_ticks
+                ):
+                    continue
+                if _proc_environment_has_token(
+                    process_dir / "environ", identity.recovery_token
+                ):
+                    return identity.process_group
+            except (OSError, ValueError):
+                continue
+        return None
+
+    def _terminate_recovered_group(self, process_group: int) -> None:
+        deadline = time.monotonic() + self.termination_grace
+        if not self._process_group_exists(process_group):
+            return
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        while self._process_group_exists(process_group) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if self._process_group_exists(process_group):
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     @staticmethod
     def _bounded_error(exc: Exception) -> str:
@@ -588,6 +895,44 @@ def _valid_job_id(value: object) -> bool:
         return str(uuid.UUID(value)) == value
     except (ValueError, AttributeError):
         return False
+
+
+def _read_linux_stat(path: Path) -> tuple[int, int, int]:
+    raw = _read_limited_bytes(path, 4096).decode("ascii")
+    command_end = raw.rfind(")")
+    if command_end < 0:
+        raise ValueError("invalid process stat")
+    fields = raw[command_end + 1 :].split()
+    if len(fields) <= 19:
+        raise ValueError("invalid process stat")
+    process_group = int(fields[2])
+    session_id = int(fields[3])
+    start_time_ticks = int(fields[19])
+    if process_group <= 0 or session_id <= 0 or start_time_ticks <= 0:
+        raise ValueError("invalid process stat")
+    return process_group, session_id, start_time_ticks
+
+
+def _read_boot_id() -> str:
+    value = _read_limited_bytes(
+        PROC_ROOT / "sys" / "kernel" / "random" / "boot_id", 128
+    ).decode("ascii").strip()
+    if not value or len(value) > 128 or not value.isascii():
+        raise ValueError("invalid boot id")
+    return value
+
+
+def _proc_environment_has_token(path: Path, token: str) -> bool:
+    expected = f"{_RECOVERY_ENVIRONMENT_KEY}={token}".encode("ascii")
+    return expected in _read_limited_bytes(path, 1024 * 1024).split(b"\0")
+
+
+def _read_limited_bytes(path: Path, limit: int) -> bytes:
+    with path.open("rb") as handle:
+        value = handle.read(limit + 1)
+    if len(value) > limit:
+        raise ValueError("process metadata is too large")
+    return value
 
 
 __all__ = [

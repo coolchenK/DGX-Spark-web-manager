@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import re
+from collections.abc import Iterable
 
 REDACTED = "[REDACTED]"
 _NORMAL_CARRY = 96
@@ -17,8 +18,10 @@ _AUTHORIZATION = re.compile(
 )
 _ASSIGNMENT = re.compile(
     r"(?i)(?<![A-Za-z0-9_])"
-    r"((?:api[_-]?key|access[_-]?token|auth[_-]?token|token|password|passwd|secret)"
-    r"\s*[:=]\s*(?P<quote>['\"]?))(?=\S)"
+    r"((?:[A-Za-z][A-Za-z0-9]*[_-])*"
+    r"(?:secret[_-]access[_-]key|private[_-]key|api[_-]?key|access[_-]?token|"
+    r"auth[_-]?token|token|password|passwd|secret)"
+    r"['\"]?\s*[:=]\s*(?P<quote>['\"]?))(?=\S)"
 )
 _DIRECT_TOKEN = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:github_pat_|gh[oprsu]_|hf_|dgx_|sk-|xox[baprs]-)"
@@ -29,12 +32,24 @@ _DIRECT_TOKEN = re.compile(
 class StreamingRedactor:
     """Redact credentials without exposing markers split across byte chunks."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, secret_values: Iterable[str] = ()) -> None:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._buffer = ""
         self._mode = "normal"
         self._quote = ""
         self._finished = False
+        secrets = tuple(value for value in secret_values if value)
+        self._secret_pattern = (
+            re.compile(
+                "|".join(
+                    re.escape(value)
+                    for value in sorted(secrets, key=len, reverse=True)
+                )
+            )
+            if secrets
+            else None
+        )
+        self._normal_carry = max((_NORMAL_CARRY, *(len(value) for value in secrets)))
 
     def feed(self, chunk: bytes) -> bytes:
         """Consume one bytes chunk and return only output safe to publish."""
@@ -68,8 +83,8 @@ class StreamingRedactor:
                 if final:
                     output.append(self._buffer)
                     self._buffer = ""
-                elif len(self._buffer) > _NORMAL_CARRY:
-                    stable = len(self._buffer) - _NORMAL_CARRY
+                elif len(self._buffer) > self._normal_carry:
+                    stable = len(self._buffer) - self._normal_carry
                     output.append(self._buffer[:stable])
                     self._buffer = self._buffer[stable:]
                 break
@@ -101,6 +116,10 @@ class StreamingRedactor:
             match = pattern.search(self._buffer)
             if match is not None:
                 candidates.append((kind, match))
+        if self._secret_pattern is not None:
+            match = self._secret_pattern.search(self._buffer)
+            if match is not None:
+                candidates.append(("direct", match))
         if not candidates:
             return None
         return min(candidates, key=lambda item: item[1].start())
