@@ -1131,6 +1131,95 @@ def test_streaming_redactor_covers_namespaced_sensitive_assignments():
     assert "PUBLIC_KEY=public-value" in output
 
 
+@pytest.mark.parametrize("split_offset", [97, 99, 101, 199])
+def test_streaming_redactor_finds_sensitive_suffix_after_long_namespace(split_offset):
+    payload = (b"A_" * 100) + b"API_KEY=leaked "
+    redactor = StreamingRedactor()
+
+    output = b"".join(
+        [
+            redactor.feed(payload[:split_offset]),
+            redactor.feed(payload[split_offset:]),
+            redactor.finish(),
+        ]
+    ).decode("utf-8")
+
+    assert "leaked" not in output
+    assert output.endswith("API_KEY=[REDACTED] ")
+
+
+@pytest.mark.parametrize(
+    "visible_assignment",
+    [
+        b"NOTSECRET=visible ",
+        b"almost_notsecret=also-visible ",
+        b"PUBLIC_KEY=public-value ",
+        b"MONKEY=value ",
+    ],
+)
+def test_streaming_redactor_does_not_treat_plain_suffixes_as_secrets(
+    visible_assignment,
+):
+    redactor = StreamingRedactor()
+
+    output = b"".join(
+        [
+            *(redactor.feed(bytes((byte,))) for byte in visible_assignment),
+            redactor.finish(),
+        ]
+    )
+
+    assert output == visible_assignment
+
+
+@pytest.mark.parametrize("backslash_count", [2, 4, 6])
+def test_streaming_redactor_closes_quote_after_even_cross_chunk_backslashes(
+    backslash_count,
+):
+    redactor = StreamingRedactor()
+    chunks = [b'API_KEY="secret']
+    chunks.extend(b"\\" for _ in range(backslash_count))
+    chunks.extend((b'" visible',))
+
+    output = b"".join(
+        [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
+    ).decode("utf-8")
+
+    assert output == 'API_KEY="[REDACTED]" visible'
+
+
+@pytest.mark.parametrize("backslash_count", [1, 3, 5])
+def test_streaming_redactor_keeps_quote_escaped_after_odd_cross_chunk_backslashes(
+    backslash_count,
+):
+    redactor = StreamingRedactor()
+    chunks = [b'API_KEY="secret']
+    chunks.extend(b"\\" for _ in range(backslash_count))
+    chunks.extend((b'"still-secret" visible',))
+
+    output = b"".join(
+        [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
+    ).decode("utf-8")
+
+    assert "still-secret" not in output
+    assert output == 'API_KEY="[REDACTED]" visible'
+
+
+@pytest.mark.parametrize("backslash_count", [2, 3, 6])
+def test_streaming_redactor_discards_unterminated_quoted_secret_at_eof(
+    backslash_count,
+):
+    redactor = StreamingRedactor()
+    chunks = [b'API_KEY="secret']
+    chunks.extend(b"\\" for _ in range(backslash_count))
+
+    output = b"".join(
+        [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
+    ).decode("utf-8")
+
+    assert output == 'API_KEY="[REDACTED]'
+
+
 def test_runner_uses_clean_environment_devnull_and_merged_output(tmp_path, monkeypatch):
     monkeypatch.setenv("BASH_ENV", "inherited-bash")
     monkeypatch.setenv("ENV", "inherited-env")
@@ -1243,6 +1332,61 @@ def test_cancel_is_idempotent_and_terminates_a_running_job(tmp_path):
     assert first.id == second.id == job.id
     assert result.status == "cancelled"
     assert runner.cancel(job.id).status == "cancelled"
+
+
+def test_cancel_sets_event_when_leader_exited_but_output_reader_is_active(
+    tmp_path, monkeypatch
+):
+    reader_started = threading.Event()
+    release_reader = threading.Event()
+
+    class ExitedLeader:
+        pid = 4242
+        stdout = io.BytesIO()
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    process = ExitedLeader()
+    runner = JobRunner(tmp_path, termination_grace=0)
+
+    def blocking_reader(_state, _process, _redactor, _errors):
+        reader_started.set()
+        assert release_reader.wait(1)
+
+    def capture_identity(_pid, recovery_token):
+        return runner_module._ProcessIdentity(
+            pid=process.pid,
+            process_group=None,
+            session_id=None,
+            start_time_ticks=None,
+            boot_id=None,
+            recovery_token=recovery_token,
+        )
+
+    monkeypatch.setattr(runner_module, "_HAS_PROCESS_GROUPS", False)
+    monkeypatch.setattr(
+        runner,
+        "_spawn_process",
+        lambda *_args, **_kwargs: (process, None),
+    )
+    monkeypatch.setattr(runner, "_capture_process_identity", capture_identity)
+    monkeypatch.setattr(runner, "_read_output", blocking_reader)
+    monkeypatch.setattr(runner, "_terminate", lambda *_args: release_reader.set())
+
+    job = runner.start(["command"], cwd=tmp_path, timeout=0.5)
+    assert reader_started.wait(1)
+    started_at = time.monotonic()
+    runner.cancel(job.id)
+    result = _wait_for_terminal(runner, job.id, timeout=1)
+
+    assert result.status == "cancelled"
+    assert time.monotonic() - started_at < 0.25
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")

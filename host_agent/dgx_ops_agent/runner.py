@@ -244,14 +244,7 @@ class JobRunner:
         with self._lock:
             if state.status in TERMINAL_STATUSES:
                 return self._snapshot(state)
-            process = state.process
-            group_active = (
-                state.process_group is not None
-                and _HAS_PROCESS_GROUPS
-                and self._process_group_exists(state.process_group)
-            )
-            if process is None or process.poll() is None or group_active:
-                state.cancel_requested.set()
+            state.cancel_requested.set()
             return self._snapshot(state)
 
     def _invocation(

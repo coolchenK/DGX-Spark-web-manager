@@ -17,7 +17,7 @@ _AUTHORIZATION = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(authorization\s*:\s*(?:bearer|basic)\s+)(?=\S)"
 )
 _ASSIGNMENT = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])"
+    r"(?i)(?<![A-Za-z0-9])"
     r"((?:[A-Za-z][A-Za-z0-9]*[_-])*"
     r"(?:secret[_-]access[_-]key|private[_-]key|api[_-]?key|access[_-]?token|"
     r"auth[_-]?token|token|password|passwd|secret)"
@@ -37,6 +37,7 @@ class StreamingRedactor:
         self._buffer = ""
         self._mode = "normal"
         self._quote = ""
+        self._quoted_escape = False
         self._finished = False
         secrets = tuple(value for value in secret_values if value)
         self._secret_pattern = (
@@ -102,6 +103,7 @@ class StreamingRedactor:
                 if kind == "assignment" and match.groupdict().get("quote"):
                     self._mode = "quoted"
                     self._quote = match.group("quote")
+                    self._quoted_escape = False
                 else:
                     self._mode = kind
         return "".join(output)
@@ -126,14 +128,20 @@ class StreamingRedactor:
 
     def _consume_secret(self, output: list[str], *, final: bool) -> bool:
         if self._mode == "quoted":
-            delimiter = self._find_unescaped_quote(self._buffer, self._quote)
+            delimiter, trailing_escape = self._find_unescaped_quote(
+                self._buffer,
+                self._quote,
+                self._quoted_escape,
+            )
             if delimiter is None:
-                self._buffer = "" if final else self._buffer[-1:]
+                self._buffer = ""
+                self._quoted_escape = False if final else trailing_escape
                 return False
             output.append(self._quote)
             self._buffer = self._buffer[delimiter + 1 :]
             self._mode = "normal"
             self._quote = ""
+            self._quoted_escape = False
             return True
 
         if self._mode == "direct":
@@ -166,16 +174,19 @@ class StreamingRedactor:
         return True
 
     @staticmethod
-    def _find_unescaped_quote(value: str, quote: str) -> int | None:
-        escaped = False
+    def _find_unescaped_quote(
+        value: str,
+        quote: str,
+        escaped: bool,
+    ) -> tuple[int | None, bool]:
         for index, character in enumerate(value):
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                return index
-        return None
+            if character == "\\":
+                escaped = not escaped
+                continue
+            if character == quote and not escaped:
+                return index, False
+            escaped = False
+        return None, escaped
 
 
 def redact_text(value: str) -> str:
