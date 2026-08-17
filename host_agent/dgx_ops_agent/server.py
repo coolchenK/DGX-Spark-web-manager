@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from .policy import PolicyError, validate_action
+from .policy import READ_ONLY_ACTIONS, PolicyError, validate_action
 from .protocol import (
     PROTOCOL_VERSION,
     NonceCache,
@@ -25,7 +25,26 @@ from .protocol import (
     verify_message,
     write_frame,
 )
-from .runner import JobRunner
+from .runner import TERMINAL_STATUSES, JobRunner
+
+_READ_COMPLETION_GRACE = 1.0
+_READ_POLL_INTERVAL = 0.05
+_DEFAULT_KEY_PATH = "/etc/dgx-spark-manager/ops-agent.key"
+_MAX_KEY_FILE_SIZE = 4096
+
+
+class _OperationTimeout(RuntimeError):
+    def __init__(self, job_id: str) -> None:
+        super().__init__("operation did not finish before the server deadline")
+        self.job_id = job_id
+
+
+class _ApprovalRequired(ValueError):
+    pass
+
+
+class _UnknownAction(ValueError):
+    pass
 
 
 class _DeadlineReader:
@@ -50,12 +69,16 @@ class AgentServer:
         runner: JobRunner,
         *,
         clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
         nonces: NonceCache | None = None,
     ) -> None:
         sign_message({}, secret)
         self._secret = secret
         self._runner = runner
         self._clock = clock
+        self._monotonic = monotonic
+        self._sleeper = sleeper
         self._nonces = NonceCache() if nonces is None else nonces
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -73,12 +96,34 @@ class AgentServer:
 
         try:
             result = self._dispatch(request)
-        except PolicyError as exc:
-            if str(exc) == "unknown action":
-                error = ("unknown_action", "unknown action")
-            else:
-                error = ("policy_rejected", "request rejected by policy")
-            return self._response(request["request_id"], error=error, now=now)
+        except _UnknownAction:
+            return self._response(
+                request["request_id"],
+                error=("unknown_action", "unknown action"),
+                now=now,
+            )
+        except _ApprovalRequired:
+            return self._response(
+                request["request_id"],
+                error=("approval_required", "shell execution requires approval"),
+                now=now,
+            )
+        except PolicyError:
+            return self._response(
+                request["request_id"],
+                error=("policy_rejected", "request rejected by policy"),
+                now=now,
+            )
+        except _OperationTimeout as exc:
+            return self._response(
+                request["request_id"],
+                result={"job_id": exc.job_id},
+                error=(
+                    "operation_timeout",
+                    "operation did not finish before the server deadline",
+                ),
+                now=now,
+            )
         except KeyError:
             return self._response(
                 request["request_id"],
@@ -153,13 +198,49 @@ class AgentServer:
             self._validate_job_id(parameters["job_id"])
             return self._runner.cancel(parameters["job_id"]).as_dict()
 
+        if action not in READ_ONLY_ACTIONS and action != "shell.execute":
+            raise _UnknownAction("unknown action")
+        if action == "shell.execute" and "approval" not in request:
+            raise _ApprovalRequired("shell execution requires approval")
+
         validated = validate_action(
             action,
             parameters,
             request.get("approval"),
             request_timestamp=request["timestamp"],
         )
-        return self._runner.start(validated).as_dict()
+        job = self._runner.start(validated)
+        if not validated.read_only:
+            return job.as_dict()
+        return self._await_read_job(job.as_dict(), validated.timeout)
+
+    def _await_read_job(
+        self,
+        initial: dict[str, Any],
+        action_timeout: int,
+    ) -> dict[str, Any]:
+        if initial["status"] in TERMINAL_STATUSES:
+            return initial
+        termination_grace = getattr(self._runner, "termination_grace", 5.0)
+        if not isinstance(termination_grace, (int, float)):
+            termination_grace = 5.0
+        termination_grace = min(max(float(termination_grace), 0.0), 5.0)
+        deadline = (
+            self._monotonic()
+            + action_timeout
+            + termination_grace
+            + _READ_COMPLETION_GRACE
+        )
+        job_id = initial["job_id"]
+        while True:
+            current = self._runner.get(job_id).as_dict()
+            if current["status"] in TERMINAL_STATUSES:
+                return current
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                self._runner.cancel(job_id)
+                raise _OperationTimeout(job_id)
+            self._sleeper(min(_READ_POLL_INTERVAL, remaining))
 
     @staticmethod
     def _require_keys(parameters: dict[str, Any], expected: frozenset[str]) -> None:
@@ -234,9 +315,12 @@ class UnixSocketAgentServer:
         ):
             raise ValueError("invalid read_timeout")
         if listener is not None:
+            unix_family = getattr(socket, "AF_UNIX", None)
             try:
                 valid_listener = (
                     isinstance(listener, socket.socket)
+                    and unix_family is not None
+                    and listener.family == unix_family
                     and listener.type & socket.SOCK_STREAM == socket.SOCK_STREAM
                     and listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
                 )
@@ -342,16 +426,28 @@ class UnixSocketAgentServer:
         try:
             self._listener.close()
         finally:
-            if self._socket_path is not None:
-                try:
-                    metadata = self._socket_path.lstat()
-                except FileNotFoundError:
-                    return
-                if (
-                    stat.S_ISSOCK(metadata.st_mode)
-                    and (metadata.st_dev, metadata.st_ino) == self._socket_identity
-                ):
-                    self._socket_path.unlink()
+            if self._socket_path is not None and self._socket_identity is not None:
+                self._unlink_if_same_socket(
+                    self._socket_path,
+                    self._socket_identity,
+                )
+
+    @staticmethod
+    def _unlink_if_same_socket(path: Path, identity: tuple[int, int]) -> bool:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISSOCK(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != identity
+        ):
+            return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
 
     @staticmethod
     def _bind(path: Path) -> socket.socket:
@@ -364,6 +460,7 @@ class UnixSocketAgentServer:
                 raise ValueError("socket_path exists and is not a socket")
             if os.name == "posix" and metadata.st_uid != os.getuid():
                 raise ValueError("socket_path is not owned by this user")
+            stale_identity = (metadata.st_dev, metadata.st_ino)
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 probe.settimeout(0.1)
@@ -375,38 +472,53 @@ class UnixSocketAgentServer:
                 raise ValueError("socket_path is an active socket")
             finally:
                 probe.close()
-            path.unlink()
+            if not UnixSocketAgentServer._unlink_if_same_socket(
+                path,
+                stale_identity,
+            ):
+                raise ValueError("socket_path changed while being verified")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound_identity: tuple[int, int] | None = None
         try:
             listener.bind(os.fspath(path))
+            metadata = path.lstat()
+            if not stat.S_ISSOCK(metadata.st_mode):
+                raise ValueError("bound socket_path is invalid")
+            bound_identity = (metadata.st_dev, metadata.st_ino)
             if os.name == "posix":
                 path.chmod(0o660)
+            metadata = path.lstat()
+            if (
+                not stat.S_ISSOCK(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != bound_identity
+            ):
+                raise ValueError("socket_path changed while binding")
             listener.listen(16)
         except Exception:
             listener.close()
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+            if bound_identity is not None:
+                UnixSocketAgentServer._unlink_if_same_socket(path, bound_identity)
             raise
         return listener
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DGX Spark host operations agent")
+    parser.add_argument("--systemd", action="store_true")
     parser.add_argument("--socket", default="/run/dgx-spark-manager/ops-agent.sock")
-    parser.add_argument("--key-file", required=True)
+    parser.add_argument("--key-file", default=_DEFAULT_KEY_PATH)
     parser.add_argument("--job-dir", default="/var/lib/dgx-spark-ops-agent/jobs")
     parser.add_argument("--max-connections", type=int, default=4)
     parser.add_argument("--read-timeout", type=float, default=2.0)
     options = parser.parse_args(argv)
 
-    secret = Path(options.key_file).read_bytes().strip()
+    secret = _read_secret_file(options.key_file)
     runner = JobRunner(options.job_dir)
     agent = AgentServer(secret, runner)
-    if os.environ.get("LISTEN_FDS"):
+    if options.systemd:
         transport = UnixSocketAgentServer.from_systemd(
             agent,
+            descriptor=3,
             max_connections=options.max_connections,
             read_timeout=options.read_timeout,
         )
@@ -424,6 +536,37 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         transport.close()
     return 0
+
+
+def _read_secret_file(path: str | os.PathLike[str]) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise ValueError("invalid key file") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > _MAX_KEY_FILE_SIZE
+        ):
+            raise ValueError("invalid key file")
+        chunks = bytearray()
+        while len(chunks) <= _MAX_KEY_FILE_SIZE:
+            chunk = os.read(
+                descriptor,
+                _MAX_KEY_FILE_SIZE + 1 - len(chunks),
+            )
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        value = bytes(chunks).strip()
+    finally:
+        os.close(descriptor)
+    if len(value) > _MAX_KEY_FILE_SIZE:
+        raise ValueError("invalid key file")
+    return value
 
 
 __all__ = ["AgentServer", "UnixSocketAgentServer", "main"]

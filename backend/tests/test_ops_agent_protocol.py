@@ -76,6 +76,9 @@ class _FakeRunner:
     def __init__(self):
         self.started = []
         self.jobs = {}
+        self.pending_reads = set()
+        self.read_terminal_status = "succeeded"
+        self.termination_grace = 0
 
     def start(self, action):
         self.started.append(action)
@@ -91,9 +94,22 @@ class _FakeRunner:
             "error": None,
         }
         self.jobs[job["job_id"]] = job
+        if action.read_only:
+            self.pending_reads.add(job["job_id"])
         return type("FakeJob", (), {"as_dict": lambda self: dict(job)})()
 
     def get(self, job_id, *, offset=None):
+        if job_id in self.pending_reads:
+            self.pending_reads.remove(job_id)
+            status = self.read_terminal_status
+            self.jobs[job_id].update(
+                status=status,
+                output=f"{status} output",
+                output_offset=len(f"{status} output"),
+                exit_code=0 if status == "succeeded" else None,
+                finished=1000.0,
+                error=None,
+            )
         job = dict(self.jobs[job_id])
         if offset is not None:
             if offset > job["output_offset"]:
@@ -173,7 +189,8 @@ def test_server_dispatches_health_read_and_shell_as_signed_jobs():
         _server_request("host.memory", {}, nonce="read")
     )
     _assert_signed_response(read, request_id="request-read")
-    assert read["result"]["status"] == "queued"
+    assert read["result"]["status"] == "succeeded"
+    assert read["result"]["output"] == "succeeded output"
     assert runner.started[-1].action == "host.memory"
 
     shell = server.handle(
@@ -189,6 +206,7 @@ def test_server_dispatches_health_read_and_shell_as_signed_jobs():
     )
     _assert_signed_response(shell, request_id="request-shell")
     assert shell["result"]["job_id"]
+    assert shell["result"]["status"] == "queued"
     assert runner.started[-1].argv == (
         "/bin/bash",
         "--noprofile",
@@ -211,9 +229,96 @@ def test_server_dispatches_every_policy_read_action():
             )
         )
         assert response["ok"] is True
+        assert response["result"]["status"] == "succeeded"
         assert runner.started[-1].action == action
 
     assert len(runner.started) == len(READ_ONLY_ACTIONS) == 11
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "timed_out"])
+def test_server_returns_read_failures_and_timeouts_as_terminal_jobs(terminal_status):
+    runner = _FakeRunner()
+    runner.read_terminal_status = terminal_status
+    server = AgentServer(SECRET, runner, clock=lambda: 1000)
+
+    response = server.handle(
+        _server_request("host.memory", {}, nonce=f"terminal-{terminal_status}")
+    )
+
+    assert response["ok"] is True
+    assert response["result"]["status"] == terminal_status
+    assert response["result"]["output"] == f"{terminal_status} output"
+    assert response["result"]["job_id"]
+
+
+@pytest.mark.parametrize(
+    ("code", "timeout", "expected_status"),
+    [
+        ("print('read output')", 1, "succeeded"),
+        ("raise SystemExit(3)", 1, "failed"),
+        ("import time; time.sleep(1)", 0.05, "timed_out"),
+    ],
+)
+def test_server_polls_real_job_runner_to_read_terminal_state(
+    tmp_path, monkeypatch, code, timeout, expected_status
+):
+    runner = JobRunner(tmp_path / "jobs", termination_grace=0.05)
+    validated = _test_action(tmp_path, code, timeout=timeout)
+    monkeypatch.setattr(
+        server_module,
+        "validate_action",
+        lambda *_args, **_kwargs: validated,
+    )
+    server = AgentServer(SECRET, runner, clock=lambda: 1000)
+
+    response = server.handle(
+        _server_request(
+            "host.memory",
+            {},
+            nonce=f"real-read-{expected_status}",
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["result"]["status"] == expected_status
+    assert response["result"]["job_id"]
+    if expected_status == "succeeded":
+        assert response["result"]["output"].splitlines() == ["read output"]
+
+
+def test_server_bounds_read_job_polling_by_action_timeout():
+    class NeverCompletesRunner(_FakeRunner):
+        def get(self, job_id, *, offset=None):
+            return type(
+                "FakeJob",
+                (),
+                {"as_dict": lambda self: dict(runner.jobs[job_id])},
+            )()
+
+    runner = NeverCompletesRunner()
+    ticks = iter([0.0, 12.0])
+    server = AgentServer(
+        SECRET,
+        runner,
+        clock=lambda: 1000,
+        monotonic=lambda: next(ticks),
+        sleeper=lambda _seconds: pytest.fail("deadline should already be exceeded"),
+    )
+
+    response = server.handle(
+        _server_request("host.memory", {}, nonce="read-deadline")
+    )
+
+    assert response["error"] == {
+        "code": "operation_timeout",
+        "message": "operation did not finish before the server deadline",
+    }
+    assert response["result"] == {
+        "job_id": "00000000-0000-4000-8000-000000000001"
+    }
+    assert runner.jobs["00000000-0000-4000-8000-000000000001"]["status"] == (
+        "cancelled"
+    )
 
 
 def test_server_rejects_invalid_secret_and_listener_at_startup():
@@ -233,6 +338,18 @@ def test_server_rejects_invalid_secret_and_listener_at_startup():
             AgentServer(SECRET, _FakeRunner()),
             listener=closed,
         )
+
+    internet_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    internet_listener.bind(("127.0.0.1", 0))
+    internet_listener.listen(1)
+    try:
+        with pytest.raises(ValueError, match="listener"):
+            UnixSocketAgentServer(
+                AgentServer(SECRET, _FakeRunner()),
+                listener=internet_listener,
+            )
+    finally:
+        internet_listener.close()
 
 
 def test_server_forwards_request_timestamp_to_shell_policy(monkeypatch):
@@ -400,6 +517,40 @@ def test_server_rejects_invalid_health_and_shell_policy_parameters():
         )
     )
     assert shell["error"] == {
+        "code": "approval_required",
+        "message": "shell execution requires approval",
+    }
+
+    malformed_approval = server.handle(
+        _server_request(
+            "shell.execute",
+            {"command": "true", "cwd": "/"},
+            approval={},
+            nonce="malformed-approval",
+        )
+    )
+    assert malformed_approval["error"] == {
+        "code": "policy_rejected",
+        "message": "request rejected by policy",
+    }
+
+
+def test_server_does_not_infer_unknown_action_from_policy_error_text(monkeypatch):
+    def misleading_policy_error(*_args, **_kwargs):
+        raise PolicyError("unknown action")
+
+    monkeypatch.setattr(server_module, "validate_action", misleading_policy_error)
+    server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    response = server.handle(
+        _server_request(
+            "shell.execute",
+            {"command": "true", "cwd": "/"},
+            approval={**VALID_APPROVAL, "approved_at": "1970-01-01T00:16:40Z"},
+            nonce="misleading-policy-error",
+        )
+    )
+
+    assert response["error"] == {
         "code": "policy_rejected",
         "message": "request rejected by policy",
     }
@@ -526,7 +677,9 @@ def test_server_read_timeout_is_an_absolute_deadline_for_trickle_clients():
     assert not worker.is_alive()
 
 
-def test_unix_socket_server_uses_injected_listener_and_bounds_concurrency():
+def test_unix_socket_server_uses_injected_listener_and_bounds_concurrency(
+    tmp_path, monkeypatch
+):
     class BlockingAgent:
         def __init__(self):
             self.lock = threading.Lock()
@@ -546,9 +699,17 @@ def test_unix_socket_server_uses_injected_listener_and_bounds_concurrency():
                 with self.lock:
                     self.active -= 1
 
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
+    unix_family = getattr(socket, "AF_UNIX", None)
+    if unix_family is None:
+        monkeypatch.setattr(socket, "AF_UNIX", socket.AF_INET, raising=False)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        address = listener.getsockname()
+    else:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address = os.fspath(tmp_path / "concurrency.sock")
+        listener.bind(address)
     listener.listen(4)
     agent = BlockingAgent()
     stop = threading.Event()
@@ -564,10 +725,15 @@ def test_unix_socket_server_uses_injected_listener_and_bounds_concurrency():
         daemon=True,
     )
     worker.start()
-    clients = [
-        socket.create_connection(listener.getsockname(), timeout=1)
-        for _ in range(3)
-    ]
+    clients = []
+    for _ in range(3):
+        if unix_family is None:
+            client = socket.create_connection(address, timeout=1)
+        else:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(1)
+            client.connect(address)
+        clients.append(client)
     try:
         assert agent.two_active.wait(1)
         time.sleep(0.05)
@@ -579,6 +745,11 @@ def test_unix_socket_server_uses_injected_listener_and_bounds_concurrency():
         stop.set()
         transport.close()
         worker.join(timeout=2)
+        if unix_family is not None:
+            try:
+                Path(address).unlink()
+            except FileNotFoundError:
+                pass
     assert not worker.is_alive()
     assert agent.maximum == 2
 
@@ -603,6 +774,85 @@ def test_systemd_socket_activation_rejects_untrusted_environment():
             descriptor=3,
             environment={"LISTEN_PID": str(os.getpid()), "LISTEN_FDS": "2"},
         )
+
+
+def test_server_cli_systemd_mode_uses_fd3_and_default_key_path(tmp_path, monkeypatch):
+    calls = {}
+
+    class FakeTransport:
+        @classmethod
+        def from_systemd(cls, agent, **options):
+            calls["systemd"] = options
+            return cls()
+
+        def serve_forever(self):
+            calls["served"] = True
+
+        def close(self):
+            calls["closed"] = True
+
+    def read_secret(path):
+        calls["key_path"] = os.fspath(path)
+        return SECRET
+
+    monkeypatch.setattr(server_module, "_read_secret_file", read_secret, raising=False)
+    monkeypatch.setattr(server_module, "JobRunner", lambda path: _FakeRunner())
+    monkeypatch.setattr(server_module, "UnixSocketAgentServer", FakeTransport)
+
+    result = server_module.main(
+        ["--systemd", "--job-dir", os.fspath(tmp_path / "jobs")]
+    )
+
+    assert result == 0
+    assert calls["key_path"] == "/etc/dgx-spark-manager/ops-agent.key"
+    assert calls["systemd"]["descriptor"] == 3
+    assert calls["served"] is True
+    assert calls["closed"] is True
+
+
+def test_server_cli_standalone_mode_ignores_activation_environment(
+    tmp_path, monkeypatch
+):
+    calls = {}
+
+    class FakeTransport:
+        def __init__(self, agent, **options):
+            calls["standalone"] = options
+
+        @classmethod
+        def from_systemd(cls, *_args, **_kwargs):
+            pytest.fail("standalone mode must not adopt systemd descriptors")
+
+        def serve_forever(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("LISTEN_PID", str(os.getpid()))
+    monkeypatch.setenv("LISTEN_FDS", "1")
+    monkeypatch.setattr(server_module, "_read_secret_file", lambda _path: SECRET)
+    monkeypatch.setattr(server_module, "JobRunner", lambda path: _FakeRunner())
+    monkeypatch.setattr(server_module, "UnixSocketAgentServer", FakeTransport)
+    socket_path = tmp_path / "standalone.sock"
+
+    result = server_module.main(["--socket", os.fspath(socket_path)])
+
+    assert result == 0
+    assert calls["standalone"]["socket_path"] == os.fspath(socket_path)
+
+
+def test_server_key_reader_handles_short_os_reads(tmp_path, monkeypatch):
+    key_path = tmp_path / "ops-agent.key"
+    key_path.write_bytes(SECRET)
+    original_read = os.read
+
+    def short_read(descriptor, size):
+        return original_read(descriptor, min(size, 3))
+
+    monkeypatch.setattr(server_module.os, "read", short_read)
+
+    assert server_module._read_secret_file(key_path) == SECRET
 
 
 @pytest.mark.skipif(os.name != "posix", reason="systemd file descriptors are POSIX")
@@ -687,6 +937,23 @@ def test_unix_socket_server_refuses_to_replace_active_listener(tmp_path):
             socket_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def test_unix_socket_cleanup_rechecks_identity_before_unlink(tmp_path, monkeypatch):
+    class SocketMetadata:
+        st_mode = stat.S_IFSOCK | 0o600
+        st_dev = 10
+        st_ino = 22
+
+    path = tmp_path / "identity.sock"
+    unlinked = []
+    monkeypatch.setattr(Path, "lstat", lambda self: SocketMetadata())
+    monkeypatch.setattr(Path, "unlink", lambda self: unlinked.append(self))
+
+    assert UnixSocketAgentServer._unlink_if_same_socket(path, (10, 11)) is False
+    assert unlinked == []
+    assert UnixSocketAgentServer._unlink_if_same_socket(path, (10, 22)) is True
+    assert unlinked == [path]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX inode ownership only")
