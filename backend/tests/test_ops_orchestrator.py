@@ -1162,6 +1162,39 @@ def test_runtime_orchestrator_rejects_concurrent_response_for_same_session(tmp_p
     assert errors == []
 
 
+def test_bounded_call_runner_releases_capacity_when_thread_start_fails(monkeypatch):
+    import threading
+    import time
+
+    from app.services.ops_orchestrator import _BoundedCallRunner
+
+    runner = _BoundedCallRunner(max_workers=1, poll_seconds=0.001)
+    real_start = threading.Thread.start
+
+    def fail_start(_thread):
+        raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        runner.run(
+            lambda: "unused",
+            deadline=time.monotonic() + 0.1,
+            monotonic=time.monotonic,
+            check_control=lambda: None,
+        )
+
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    assert (
+        runner.run(
+            lambda: "ok",
+            deadline=time.monotonic() + 0.1,
+            monotonic=time.monotonic,
+            check_control=lambda: None,
+        )
+        == "ok"
+    )
+
+
 def test_runtime_orchestrator_task_handler_validates_payload_and_returns_result(tmp_path):
     from app.services.ops_provider import AssistantTurn
 
@@ -1750,6 +1783,22 @@ def test_recover_interrupted_finishes_tools_only_for_processing_sessions(tmp_pat
         assert "output" not in recovered.result_json
         assert unaffected.status == "running"
         assert unaffected.finished_at is None
+        event = db.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "ops.tool.execute",
+                AuditEvent.resource_id == processing_tool_id,
+            )
+        )
+        assert event is not None
+        assert event.actor == "system"
+        assert event.outcome == "failure"
+        assert event.details == {
+            "session_id": processing_id,
+            "tool_name": "host.memory",
+            "risk": "read_only",
+            "status": "failed",
+            "argument_keys": [],
+        }
 
 
 def test_task_retry_does_not_duplicate_user_prompt(tmp_path):

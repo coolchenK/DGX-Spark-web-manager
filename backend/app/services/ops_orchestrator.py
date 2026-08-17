@@ -103,7 +103,12 @@ class _BoundedCallRunner:
                 state.done.set()
                 self._capacity.release()
 
-        threading.Thread(target=worker, name="ops-bounded-call", daemon=True).start()
+        thread = threading.Thread(target=worker, name="ops-bounded-call", daemon=True)
+        try:
+            thread.start()
+        except BaseException:
+            self._capacity.release()
+            raise
         while True:
             check_control()
             remaining = deadline - monotonic()
@@ -280,6 +285,21 @@ class OpsOrchestrator:
                                 "tool_fingerprint": internal.get("_tool_fingerprint"),
                             },
                         )
+                    )
+                    record_audit(
+                        db,
+                        actor="system",
+                        action="ops.tool.execute",
+                        resource_type="ops_tool_run",
+                        resource_id=tool_run.id,
+                        outcome="failure",
+                        details={
+                            "session_id": tool_run.session_id,
+                            "tool_name": tool_run.tool_name,
+                            "risk": "read_only",
+                            "status": "failed",
+                            "argument_keys": sorted(tool_run.arguments_json),
+                        },
                     )
             for session in sessions:
                 session.status = "active"

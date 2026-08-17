@@ -207,6 +207,41 @@ def test_complete_shares_one_timeout_across_fallback_and_repair() -> None:
     assert configured_timeouts[0] <= 1.0
 
 
+def test_complete_enforces_absolute_deadline_while_reading_trickle_response() -> None:
+    class Clock:
+        def __init__(self) -> None:
+            self.now = 10.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    encoded = json.dumps(_success("too late")).encode()
+
+    class TrickleStream(httpx.SyncByteStream):
+        def __iter__(self):
+            for offset in range(0, len(encoded), 8):
+                clock.now += 0.4
+                yield encoded[offset : offset + 8]
+
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, stream=TrickleStream())
+    )
+
+    def factory(**kwargs):
+        return httpx.Client(transport=transport, **kwargs)
+
+    client = OpsProviderClient(
+        SecretBox(SECRET_KEY),
+        endpoint_resolver=_endpoint,
+        http_client_factory=factory,
+        _monotonic=clock,
+    )
+
+    with pytest.raises(OpsProviderError, match="deadline exceeded"):
+        client.complete(_provider(), _messages(), timeout_seconds=1.0)
+
+
 @pytest.mark.parametrize(
     "content",
     [

@@ -336,8 +336,9 @@ class OpsProviderClient:
         )
         return headers
 
-    @staticmethod
-    def _read_response(response: httpx.Response) -> bytes:
+    def _read_response(
+        self, response: httpx.Response, *, deadline: float | None = None
+    ) -> bytes:
         content_encoding = (
             response.headers.get("Content-Encoding", "").strip().casefold()
         )
@@ -345,6 +346,8 @@ class OpsProviderClient:
             raise OpsProviderError("Compressed Provider responses are not accepted")
         body = bytearray()
         for chunk in response.iter_bytes():
+            if deadline is not None and self._monotonic() >= deadline:
+                raise OpsProviderError("Provider request deadline exceeded")
             if len(body) + len(chunk) > MAX_PROVIDER_RESPONSE_BYTES:
                 raise OpsProviderError("Provider response is too large")
             body.extend(chunk)
@@ -393,7 +396,7 @@ class OpsProviderClient:
                     if request_payload is not None:
                         request_kwargs["json"] = request_payload
                     with client.stream(method, endpoint.url, **request_kwargs) as response:
-                        body = self._read_response(response)
+                        body = self._read_response(response, deadline=deadline)
                         status_code = response.status_code
 
                 if 200 <= status_code < 300:
