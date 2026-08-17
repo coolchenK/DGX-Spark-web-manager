@@ -1,6 +1,8 @@
 import socket
 
 import pytest
+from app.models import Provider
+from app.services.ops_provider import AssistantTurn, OpsProviderError
 from app.services.providers import (
     normalize_openai_base_url,
     resolve_provider_endpoint,
@@ -154,3 +156,76 @@ def test_provider_rejects_unsafe_custom_headers(authenticated_client, monkeypatc
     )
 
     assert response.status_code == 422
+
+
+def test_provider_test_api_persists_connection_and_default_model_probe(
+    authenticated_client, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": "Probe provider",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "sk-provider-secret-123456",
+            "default_model": "ops-model",
+        },
+    )
+    assert created.status_code == 201
+
+    class ProbeClient:
+        def list_models(self, _provider: Provider) -> list[str]:
+            return ["ops-model", "other-model"]
+
+        def complete(self, provider: Provider, messages) -> AssistantTurn:
+            assert provider.default_model == "ops-model"
+            assert messages[-1]["content"] == "Confirm this model can respond."
+            return AssistantTurn(action="answer", summary="ok")
+
+    authenticated_client.app.state.provider_service.ops_provider_client = ProbeClient()
+    response = authenticated_client.post(f"/api/providers/{created.json()['id']}/test")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "healthy",
+        "connection": {"status": "healthy", "models_seen": 2},
+        "default_model": {"status": "healthy", "model": "ops-model"},
+    }
+    listed = authenticated_client.get("/api/providers").json()[0]
+    assert listed["last_test_result"] == response.json()
+    assert listed["last_tested_at"] is not None
+    assert "encrypted_api_key" not in listed
+
+
+def test_provider_test_api_reports_chat_failure_without_losing_connection_status(
+    authenticated_client, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.providers.validate_provider_url", lambda value: value)
+    created = authenticated_client.post(
+        "/api/providers",
+        json={
+            "name": "Failed model probe",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "sk-provider-secret-123456",
+            "default_model": "missing-model",
+        },
+    )
+
+    class ProbeClient:
+        def list_models(self, _provider: Provider) -> list[str]:
+            return ["other-model"]
+
+        def complete(self, _provider: Provider, _messages) -> AssistantTurn:
+            raise OpsProviderError("configured model was rejected")
+
+    authenticated_client.app.state.provider_service.ops_provider_client = ProbeClient()
+    response = authenticated_client.post(f"/api/providers/{created.json()['id']}/test")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["connection"] == {"status": "healthy", "models_seen": 1}
+    assert response.json()["default_model"] == {
+        "status": "failed",
+        "model": "missing-model",
+        "error": "configured model was rejected",
+    }

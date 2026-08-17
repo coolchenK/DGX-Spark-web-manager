@@ -6,14 +6,16 @@ import socket
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlparse, urlunparse
 
-import httpx
 from sqlalchemy.orm import Session
 
 from app.models import Provider
 from app.security import SecretBox, mask_secret
+
+if TYPE_CHECKING:
+    from app.services.ops_provider import AssistantTurn
 
 Resolver = Callable[..., list[tuple]]
 HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -25,6 +27,14 @@ FORBIDDEN_CUSTOM_HEADERS = {
     "proxy-authorization",
     "transfer-encoding",
 }
+
+
+class OpsProviderProbe(Protocol):
+    def list_models(self, provider: Provider) -> list[str]: ...
+
+    def complete(
+        self, provider: Provider, messages: list[dict[str, Any]]
+    ) -> AssistantTurn: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,8 +152,9 @@ def validate_custom_headers(headers: dict[str, str]) -> dict[str, str]:
 
 
 class ProviderService:
-    def __init__(self, secret_box: SecretBox):
+    def __init__(self, secret_box: SecretBox, ops_provider_client: OpsProviderProbe):
         self.secret_box = secret_box
+        self.ops_provider_client = ops_provider_client
 
     def create(
         self,
@@ -187,6 +198,7 @@ class ProviderService:
             "headers": provider.headers,
             "enabled": provider.enabled,
             "last_test_status": provider.last_test_status,
+            "last_test_result": provider.last_test_result,
             "last_tested_at": provider.last_tested_at,
             "created_at": provider.created_at,
             "updated_at": provider.updated_at,
@@ -199,27 +211,61 @@ class ProviderService:
         }
 
     def test(self, db: Session, provider: Provider) -> dict[str, Any]:
-        started = datetime.now(UTC)
         try:
-            response = httpx.get(
-                f"{provider.base_url}/models",
-                headers=self.authorization_headers(provider),
-                timeout=min(provider.timeout_seconds, 30),
-                follow_redirects=False,
-                trust_env=False,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            models = payload.get("data", []) if isinstance(payload, dict) else []
-            provider.last_test_status = "healthy"
+            models = self.ops_provider_client.list_models(provider)
+        except Exception as exc:
             result = {
-                "status": "healthy",
-                "latency_ms": (datetime.now(UTC) - started).total_seconds() * 1000,
-                "models": [item.get("id") for item in models[:20] if isinstance(item, dict)],
+                "status": "failed",
+                "connection": {"status": "failed", "error": self._probe_error(exc)},
+                "default_model": {
+                    "status": "not_tested",
+                    "model": provider.default_model,
+                },
             }
-        except (httpx.HTTPError, ValueError) as exc:
-            provider.last_test_status = "failed"
-            result = {"status": "failed", "error": str(exc)[:1000]}
+        else:
+            connection = {"status": "healthy", "models_seen": len(models)}
+            try:
+                self.ops_provider_client.complete(
+                    provider,
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "This is a connectivity probe. Return exactly one JSON object "
+                                'with action "answer" and a short non-empty summary.'
+                            ),
+                        },
+                        {"role": "user", "content": "Confirm this model can respond."},
+                    ],
+                )
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "connection": connection,
+                    "default_model": {
+                        "status": "failed",
+                        "model": provider.default_model,
+                        "error": self._probe_error(exc),
+                    },
+                }
+            else:
+                result = {
+                    "status": "healthy",
+                    "connection": connection,
+                    "default_model": {
+                        "status": "healthy",
+                        "model": provider.default_model,
+                    },
+                }
+        provider.last_test_status = result["status"]
+        provider.last_test_result = result
         provider.last_tested_at = datetime.now(UTC)
         db.commit()
         return result
+
+    @staticmethod
+    def _probe_error(exc: Exception) -> str:
+        detail = getattr(exc, "detail", None)
+        if not isinstance(detail, str):
+            return "Provider probe failed"
+        return " ".join(detail.replace("\x00", " ").split())[:500] or "Provider probe failed"

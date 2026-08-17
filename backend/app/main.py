@@ -38,6 +38,7 @@ from app.services.draft_models import DraftCompatibilityService
 from app.services.model_evidence import ModelEvidenceLoader
 from app.services.model_lifecycle import ModelLifecycleService
 from app.services.ops_agent import OpsAgentClient
+from app.services.ops_provider import OpsProviderClient
 from app.services.providers import ProviderService
 from app.services.resource_estimator import ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilityService
@@ -101,7 +102,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     system_service = SystemService(
         app_settings.data_dir, os_release_path=app_settings.host_os_release
     )
-    provider_service = ProviderService(SecretBox(app_settings.secret_key))
+    secret_box = SecretBox(app_settings.secret_key)
+    ops_provider_client = OpsProviderClient(secret_box)
+    provider_service = ProviderService(secret_box, ops_provider_client)
     lazy_docker_client = _LazyDockerClient()
     evidence_loader = ModelEvidenceLoader(card_max_chars=app_settings.recommendation_card_max_chars)
     resource_estimator = ResourceEstimator(
@@ -214,7 +217,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_manager = SessionManager(
         app_settings.secret_key, app_settings.session_ttl_seconds
     )
-    app.state.secret_box = SecretBox(app_settings.secret_key)
+    app.state.secret_box = secret_box
     app.state.system_service = system_service
     app.state.discovery_service = discovery_service
     app.state.model_lifecycle_service = model_lifecycle_service
@@ -222,6 +225,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.task_engine = task_engine
     app.state.deployment_service = deployment_service
     app.state.provider_service = provider_service
+    app.state.ops_provider_client = ops_provider_client
     app.state.deployment_recommendation_service = deployment_recommendation_service
     app.state.diagnostic_service = diagnostic_service
     app.state.operation_executor = operation_executor
