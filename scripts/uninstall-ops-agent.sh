@@ -39,13 +39,43 @@ confirm_exact() {
   [[ "$reply" == "$expected" ]] || fail "Confirmation did not match; no purge was performed"
 }
 
-assert_safe_path() {
+assert_trusted_path_chain() {
   local path="$1"
   local expected="$2"
+  local expected_type="$3"
   [[ "$path" == "$INSTALL_ROOT$expected" && "$path" == /* && "$path" != "/" ]] || {
     fail "Refusing unsafe removal path: $path"
   }
-  [[ ! -L "$path" ]] || fail "Refusing symlinked removal path: $path"
+  local trusted_root="${INSTALL_ROOT:-/}"
+  [[ -d "$trusted_root" && ! -L "$trusted_root" ]] || {
+    fail "Refusing unsafe trusted root: $trusted_root"
+  }
+
+  local current="${INSTALL_ROOT:-}"
+  local relative="${expected#/}"
+  local component
+  local -a components
+  IFS='/' read -r -a components <<< "$relative"
+  local last_index=$((${#components[@]} - 1))
+  local index
+  for index in "${!components[@]}"; do
+    component="${components[$index]}"
+    current="$current/$component"
+    [[ ! -L "$current" ]] || fail "Refusing symlinked removal path: $current"
+    if (( index < last_index )); then
+      if [[ -e "$current" && ! -d "$current" ]]; then
+        fail "Refusing non-directory removal ancestor: $current"
+      fi
+      [[ -e "$current" ]] || return 0
+    fi
+  done
+  if [[ -e "$path" ]]; then
+    case "$expected_type" in
+      directory) [[ -d "$path" ]] || fail "Refusing non-directory removal target: $path" ;;
+      file) [[ -f "$path" ]] || fail "Refusing non-file removal target: $path" ;;
+      *) fail "Invalid removal target type" ;;
+    esac
+  fi
 }
 
 effective_uid() {
@@ -99,7 +129,7 @@ main() {
 
   systemctl disable --now dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
   systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || true
-  assert_safe_path "$PACKAGE_DIR" /usr/local/lib/dgx-spark-ops-agent/dgx_ops_agent
+  assert_trusted_path_chain "$PACKAGE_DIR" /usr/local/lib/dgx-spark-ops-agent/dgx_ops_agent directory
   rm -rf --one-file-system -- "$PACKAGE_DIR"
   rm -f -- "$SERVICE_UNIT" "$SOCKET_UNIT"
   if [[ -S "$SOCKET_PATH" ]]; then
@@ -108,13 +138,13 @@ main() {
   systemctl daemon-reload
 
   if $purge_key; then
-    assert_safe_path "$KEY_FILE" /etc/dgx-spark-manager/ops-agent.key
+    assert_trusted_path_chain "$KEY_FILE" /etc/dgx-spark-manager/ops-agent.key file
     rm -f -- "$KEY_FILE"
   else
     echo "Preserving Agent key: $KEY_FILE"
   fi
   if $purge_jobs; then
-    assert_safe_path "$JOBS_DIR" /var/lib/dgx-spark-ops-agent/jobs
+    assert_trusted_path_chain "$JOBS_DIR" /var/lib/dgx-spark-ops-agent/jobs directory
     rm -rf --one-file-system -- "$JOBS_DIR"
   else
     echo "Preserving job logs: $JOBS_DIR"

@@ -29,6 +29,16 @@ SOCKET_PATH="$INSTALL_ROOT/run/dgx-spark-manager/ops-agent.sock"
 PACKAGE_BACKUP=""
 PACKAGE_STAGING=""
 PACKAGE_UPDATE_ACTIVE=false
+PACKAGE_WAS_PRESENT=false
+TRANSACTION_DIR=""
+SOCKET_UNIT_EXISTED=false
+SERVICE_UNIT_EXISTED=false
+SOCKET_WAS_ENABLED=false
+SOCKET_WAS_ACTIVE=false
+SERVICE_WAS_ENABLED=false
+SERVICE_WAS_ACTIVE=false
+ROLLBACK_IN_PROGRESS=false
+TRANSACTION_READY=false
 
 usage() {
   cat <<'EOF'
@@ -42,7 +52,7 @@ EOF
 
 fail() {
   echo "$*" >&2
-  exit 1
+  return 1
 }
 
 assert_exact_path() {
@@ -166,6 +176,58 @@ install_package() {
   PACKAGE_STAGING=""
 }
 
+snapshot_unit() {
+  local path="$1"
+  local name="$2"
+  local state_variable="$3"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -f "$path" && ! -L "$path" ]] || fail "Existing systemd unit path is unsafe: $path"
+    cp -a -- "$path" "$TRANSACTION_DIR/$name"
+    printf -v "$state_variable" '%s' true
+  else
+    printf -v "$state_variable" '%s' false
+  fi
+}
+
+snapshot_install_transaction() {
+  assert_exact_path "$PACKAGE_DIR" /usr/local/lib/dgx-spark-ops-agent/dgx_ops_agent
+  assert_no_symlink_chain "$PACKAGE_PARENT"
+  assert_no_symlink_chain "$UNIT_DIR"
+  install -d -o root -g root -m 0755 -- "$PACKAGE_PARENT"
+  TRANSACTION_DIR="$(mktemp -d "$PACKAGE_PARENT/.transaction.XXXXXX")"
+
+  if [[ -e "$PACKAGE_DIR" || -L "$PACKAGE_DIR" ]]; then
+    [[ -d "$PACKAGE_DIR" && ! -L "$PACKAGE_DIR" ]] || fail "Existing Agent package path is unsafe"
+    PACKAGE_WAS_PRESENT=true
+  else
+    PACKAGE_WAS_PRESENT=false
+  fi
+  snapshot_unit "$UNIT_DIR/dgx-spark-ops-agent.socket" socket.unit SOCKET_UNIT_EXISTED
+  snapshot_unit "$UNIT_DIR/dgx-spark-ops-agent.service" service.unit SERVICE_UNIT_EXISTED
+
+  if systemctl is-enabled --quiet dgx-spark-ops-agent.socket; then
+    SOCKET_WAS_ENABLED=true
+  else
+    SOCKET_WAS_ENABLED=false
+  fi
+  if systemctl is-active --quiet dgx-spark-ops-agent.socket; then
+    SOCKET_WAS_ACTIVE=true
+  else
+    SOCKET_WAS_ACTIVE=false
+  fi
+  if systemctl is-enabled --quiet dgx-spark-ops-agent.service; then
+    SERVICE_WAS_ENABLED=true
+  else
+    SERVICE_WAS_ENABLED=false
+  fi
+  if systemctl is-active --quiet dgx-spark-ops-agent.service; then
+    SERVICE_WAS_ACTIVE=true
+  else
+    SERVICE_WAS_ACTIVE=false
+  fi
+  TRANSACTION_READY=true
+}
+
 install_unit() {
   local name="$1"
   local destination="$UNIT_DIR/$name"
@@ -248,45 +310,146 @@ print("Agent health check passed")
 PY
 }
 
-rollback_package_update() {
+restore_package_snapshot() {
+  local restored=true
+  if [[ -n "$PACKAGE_BACKUP" && -d "$PACKAGE_BACKUP" && ! -L "$PACKAGE_BACKUP" ]]; then
+    if [[ -e "$PACKAGE_DIR" || -L "$PACKAGE_DIR" ]]; then
+      rm -rf --one-file-system -- "$PACKAGE_DIR" || restored=false
+    fi
+    if $restored; then
+      mv -- "$PACKAGE_BACKUP" "$PACKAGE_DIR" || restored=false
+    fi
+  elif $PACKAGE_WAS_PRESENT; then
+    [[ -d "$PACKAGE_DIR" && ! -L "$PACKAGE_DIR" ]] || restored=false
+  elif [[ -e "$PACKAGE_DIR" || -L "$PACKAGE_DIR" ]]; then
+    rm -rf --one-file-system -- "$PACKAGE_DIR" || restored=false
+  fi
+  PACKAGE_UPDATE_ACTIVE=false
+  $restored
+}
+
+restore_unit_snapshot() {
+  local destination="$1"
+  local name="$2"
+  local existed="$3"
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    [[ ! -d "$destination" || -L "$destination" ]] || return 1
+    rm -f -- "$destination" || return 1
+  fi
+  if $existed; then
+    cp -a -- "$TRANSACTION_DIR/$name" "$destination" || return 1
+  fi
+}
+
+restore_systemd_state() {
+  local restored=true
+  if $SOCKET_WAS_ENABLED; then
+    systemctl enable dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false
+  else
+    systemctl disable dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
+  fi
+  if $SERVICE_WAS_ENABLED; then
+    systemctl enable dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false
+  else
+    systemctl disable dgx-spark-ops-agent.service >/dev/null 2>&1 || true
+  fi
+
+  if $SOCKET_WAS_ACTIVE; then
+    systemctl start dgx-spark-ops-agent.socket >/dev/null 2>&1 || restored=false
+  else
+    systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
+  fi
+  if $SERVICE_WAS_ACTIVE; then
+    systemctl start dgx-spark-ops-agent.service >/dev/null 2>&1 || restored=false
+  else
+    systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || true
+  fi
+
+  if $SOCKET_WAS_ACTIVE || $SERVICE_WAS_ACTIVE; then
+    probe_health || restored=false
+    if ! $SERVICE_WAS_ACTIVE; then
+      systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || true
+    fi
+    if ! $SOCKET_WAS_ACTIVE; then
+      systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
+    fi
+  fi
+  $restored
+}
+
+rollback_install_transaction() {
   local prior_errexit=false
+  local restored=true
   [[ "$-" == *e* ]] && prior_errexit=true
   set +e
-  systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1
-  systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1
-  if [[ "$PACKAGE_UPDATE_ACTIVE" == true && ( -e "$PACKAGE_DIR" || -L "$PACKAGE_DIR" ) ]]; then
-    rm -rf --one-file-system -- "$PACKAGE_DIR"
-  fi
-  if [[ -n "$PACKAGE_BACKUP" && -d "$PACKAGE_BACKUP" && ! -L "$PACKAGE_BACKUP" ]]; then
-    mv -- "$PACKAGE_BACKUP" "$PACKAGE_DIR"
+  ROLLBACK_IN_PROGRESS=true
+  if $TRANSACTION_READY; then
+    systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1
+    systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1
+    restore_package_snapshot || restored=false
+    restore_unit_snapshot "$UNIT_DIR/dgx-spark-ops-agent.socket" socket.unit "$SOCKET_UNIT_EXISTED" || restored=false
+    restore_unit_snapshot "$UNIT_DIR/dgx-spark-ops-agent.service" service.unit "$SERVICE_UNIT_EXISTED" || restored=false
+    systemctl daemon-reload || restored=false
+    restore_systemd_state || restored=false
   fi
   if [[ -n "$PACKAGE_STAGING" && "$PACKAGE_STAGING" == "$PACKAGE_PARENT"/.install.* ]]; then
     rm -rf --one-file-system -- "$PACKAGE_STAGING"
   fi
-  PACKAGE_BACKUP=""
+  if [[ -n "$PACKAGE_BACKUP" && -e "$PACKAGE_BACKUP" ]]; then
+    restored=false
+  else
+    PACKAGE_BACKUP=""
+  fi
+  if [[ -n "$TRANSACTION_DIR" && "$TRANSACTION_DIR" == "$PACKAGE_PARENT"/.transaction.* ]]; then
+    rm -rf --one-file-system -- "$TRANSACTION_DIR" || restored=false
+  fi
+  TRANSACTION_DIR=""
   PACKAGE_STAGING=""
   PACKAGE_UPDATE_ACTIVE=false
+  TRANSACTION_READY=false
+  ROLLBACK_IN_PROGRESS=false
   if $prior_errexit; then
     set -e
   fi
+  if $restored; then
+    return 0
+  fi
+  return 1
 }
 
 rollback_failed_install() {
-  local status="$?"
+  local original_status="$?"
+  if $ROLLBACK_IN_PROGRESS; then
+    trap - ERR
+    exit "$original_status"
+  fi
   trap - ERR
-  rollback_package_update
-  echo "Agent installation failed; the previous package was restored where possible." >&2
-  echo "Inspect systemctl status, correct the error, and rerun the installer." >&2
-  exit "$status"
+  if rollback_install_transaction; then
+    echo "Agent installation failed; the previous installation was restored." >&2
+  else
+    echo "Agent installation failed and automatic rollback was incomplete." >&2
+    echo "Inspect systemctl status and the protected Agent install paths before retrying." >&2
+  fi
+  exit "$original_status"
 }
 
-commit_package_update() {
+commit_install_transaction() {
+  trap - ERR
   if [[ -n "$PACKAGE_BACKUP" ]]; then
     assert_exact_path "$PACKAGE_BACKUP" "/usr/local/lib/dgx-spark-ops-agent/.previous.$$"
-    rm -rf --one-file-system -- "$PACKAGE_BACKUP"
+    rm -rf --one-file-system -- "$PACKAGE_BACKUP" || {
+      echo "Warning: could not remove previous Agent package backup: $PACKAGE_BACKUP" >&2
+    }
+  fi
+  if [[ -n "$TRANSACTION_DIR" && "$TRANSACTION_DIR" == "$PACKAGE_PARENT"/.transaction.* ]]; then
+    rm -rf --one-file-system -- "$TRANSACTION_DIR" || {
+      echo "Warning: could not remove Agent transaction snapshot: $TRANSACTION_DIR" >&2
+    }
   fi
   PACKAGE_BACKUP=""
+  TRANSACTION_DIR=""
   PACKAGE_UPDATE_ACTIVE=false
+  TRANSACTION_READY=false
 }
 
 apply_installation() {
@@ -297,7 +460,7 @@ apply_installation() {
   }
 
   local dependency
-  for dependency in basename chown chmod dirname getent groupadd id install ln mktemp mv openssl python3 rm rmdir stat systemctl uname; do
+  for dependency in basename chown chmod cp dirname getent groupadd id install ln mktemp mv openssl python3 rm rmdir stat systemctl uname; do
     require_command "$dependency"
   done
   [[ -d "$SOURCE_PACKAGE" ]] || fail "Agent package source is missing"
@@ -316,6 +479,7 @@ apply_installation() {
 
   create_key_if_missing
   trap rollback_failed_install ERR
+  snapshot_install_transaction
   systemctl stop dgx-spark-ops-agent.socket >/dev/null 2>&1 || true
   systemctl stop dgx-spark-ops-agent.service >/dev/null 2>&1 || true
   install_package
@@ -324,15 +488,8 @@ apply_installation() {
   systemctl daemon-reload
   systemctl enable --now dgx-spark-ops-agent.socket
   systemctl try-restart dgx-spark-ops-agent.service >/dev/null 2>&1 || true
-  if ! probe_health; then
-    rollback_package_update
-    trap - ERR
-    echo "Agent health check failed; the previous package was restored where possible." >&2
-    echo "Rollback units if required, then run systemctl daemon-reload and retry." >&2
-    exit 1
-  fi
-  commit_package_update
-  trap - ERR
+  probe_health
+  commit_install_transaction
   echo "DGX Spark host operations agent installed"
 }
 
