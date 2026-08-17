@@ -1075,7 +1075,10 @@ class OpsOrchestrator:
 
     @staticmethod
     def _serialize_step(step: ChangeStep) -> dict[str, Any]:
-        value = step.model_dump(mode="json")
+        value = step.model_dump(mode="json", exclude_none=True)
+        value["id"] = new_id()
+        if step.operation == "shell":
+            value["cwd"] = step.cwd or "/"
         value["executable"] = step.operation != "explain_only"
         return value
 

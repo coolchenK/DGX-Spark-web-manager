@@ -17,7 +17,7 @@ from app.models import (
     Provider,
     TaskRecord,
 )
-from app.services.diagnostics import ProviderReadinessError
+from app.services.diagnostics import ProviderReadinessError, operation_plan_digest
 
 router = APIRouter(prefix="/api/diagnostics", tags=["diagnostics"])
 
@@ -391,16 +391,24 @@ def approve_plan(
         raise HTTPException(status_code=404, detail="Operation plan not found")
     if plan.status != "pending":
         raise HTTPException(status_code=409, detail=f"Plan is already {plan.status}")
+    try:
+        approval_digest = operation_plan_digest(plan.steps)
+    except ValueError:
+        raise HTTPException(status_code=409, detail="Operation plan steps are invalid") from None
     plan.status = "approved"
     plan.approved_by = str(admin["username"])
     plan.approved_at = datetime.now(UTC)
-    db.commit()
+    plan.result_json = {
+        **(plan.result_json or {}),
+        "approval_digest": approval_digest,
+    }
     task = request.app.state.task_engine.create_task(
         db,
         task_type="operation.execute",
         title=f"执行诊断方案：{plan.summary[:80]}",
         input_json={"plan_id": plan.id},
         idempotency_key=f"operation-plan:{plan.id}",
+        commit=False,
     )
     record_audit(
         db,
@@ -410,6 +418,8 @@ def approve_plan(
         resource_id=plan.id,
     )
     db.commit()
+    db.refresh(task)
+    request.app.state.task_engine.notify()
     return serialize_task(task)
 
 
@@ -421,6 +431,13 @@ def reject_plan(plan_id: str, db: DbSession, admin: CsrfAdmin) -> dict[str, Any]
     if plan.status != "pending":
         raise HTTPException(status_code=409, detail=f"Plan is already {plan.status}")
     plan.status = "rejected"
+    session_ids = db.scalars(
+        select(OpsMessage.session_id).where(OpsMessage.operation_plan_id == plan.id)
+    )
+    for session_id in set(session_ids):
+        session = db.get(OpsSession, session_id)
+        if session is not None and session.status == "approval_required":
+            session.status = "active"
     record_audit(
         db,
         actor=str(admin["username"]),

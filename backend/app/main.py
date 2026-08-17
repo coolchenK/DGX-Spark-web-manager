@@ -158,17 +158,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         system_service,
         deployment_service,
     )
-    operation_executor = OperationExecutor(
-        session_factory=database.session_factory,
-        deployment_service=deployment_service,
-        discovery_service=discovery_service,
-    )
     ops_agent_client = OpsAgentClient(
         app_settings.ops_agent_socket,
         app_settings.ops_agent_key_file,
         connect_timeout_seconds=app_settings.ops_agent_connect_timeout_seconds,
         read_timeout_seconds=app_settings.ops_agent_read_timeout_seconds,
         output_limit_bytes=app_settings.ops_agent_output_limit_bytes,
+    )
+    operation_executor = OperationExecutor(
+        session_factory=database.session_factory,
+        deployment_service=deployment_service,
+        discovery_service=discovery_service,
+        agent_client=ops_agent_client,
+        secret_box=secret_box,
     )
     ops_tool_registry = OpsToolRegistry(
         ops_agent_client,

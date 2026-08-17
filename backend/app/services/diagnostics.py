@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from hashlib import sha256
 from typing import Any
 
 import httpx
@@ -22,6 +23,22 @@ ALLOWED_OPERATIONS = {
 
 class ProviderReadinessError(ValueError):
     pass
+
+
+def operation_plan_digest(steps: Any) -> str:
+    if not isinstance(steps, list):
+        raise ValueError("Operation plan steps are invalid")
+    try:
+        canonical = json.dumps(
+            steps,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        raise ValueError("Operation plan steps are invalid") from None
+    return sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def build_diagnostic_request(

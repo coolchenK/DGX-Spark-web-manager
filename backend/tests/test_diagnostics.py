@@ -38,20 +38,26 @@ class NoopDiscoveryService:
 
 
 def add_executor_plan(database, *, operation, deployment_id):
+    from app.services.diagnostics import operation_plan_digest
+
+    steps = [
+        {
+            "operation": operation,
+            "deployment_id": deployment_id,
+            "reason": "Test lifecycle action",
+            "executable": True,
+        }
+    ]
     with database.session_factory() as db:
         plan = OperationPlan(
             summary="Lifecycle action",
             diagnosis="Exercise the deployment",
             risk="low",
             status="approved",
-            steps=[
-                {
-                    "operation": operation,
-                    "deployment_id": deployment_id,
-                    "reason": "Test lifecycle action",
-                    "executable": True,
-                }
-            ],
+            steps=steps,
+            approved_by="admin",
+            approved_at=datetime.now(UTC),
+            result_json={"approval_digest": operation_plan_digest(steps)},
         )
         db.add(plan)
         db.commit()
@@ -266,6 +272,7 @@ def test_plan_must_be_approved_before_execution(authenticated_client):
         approved = db.get(OperationPlan, plan_id)
         assert approved.status in {"approved", "executing", "completed"}
         assert approved.approved_by == "admin"
+        assert len(approved.result_json["approval_digest"]) == 64
 
 
 def _add_ops_provider(
@@ -556,3 +563,378 @@ def test_list_sessions_is_newest_first(authenticated_client):
 
     assert response.status_code == 200
     assert [item["title"] for item in response.json()[:2]] == ["Second", "First"]
+
+
+def test_reject_plan_releases_linked_operations_session(authenticated_client):
+    provider_id = _add_ops_provider(authenticated_client)
+    with authenticated_client.app.state.database.session_factory() as db:
+        session = OpsSession(
+            title="Reject repair",
+            provider_id=provider_id,
+            status="approval_required",
+        )
+        plan = OperationPlan(
+            summary="Risky repair",
+            diagnosis="Needs approval",
+            risk="high",
+            steps=[],
+            status="pending",
+        )
+        db.add_all([session, plan])
+        db.flush()
+        db.add(
+            OpsMessage(
+                session_id=session.id,
+                role="assistant",
+                content="Approval required",
+                operation_plan_id=plan.id,
+            )
+        )
+        db.commit()
+        session_id, plan_id = session.id, plan.id
+
+    response = authenticated_client.post(f"/api/diagnostics/{plan_id}/reject")
+
+    assert response.status_code == 200
+    with authenticated_client.app.state.database.session_factory() as db:
+        assert db.get(OpsSession, session_id).status == "active"
+
+
+def _job(
+    *,
+    status,
+    output="",
+    output_offset=0,
+    truncated_before=0,
+    exit_code=None,
+    error=None,
+):
+    return {
+        "job_id": "agent-job-1",
+        "status": status,
+        "output": output,
+        "output_offset": output_offset,
+        "truncated_before": truncated_before,
+        "exit_code": exit_code,
+        "started": 1.0,
+        "finished": 2.0 if status not in {"queued", "running"} else None,
+        "error": error,
+    }
+
+
+class ScriptedAgent:
+    def __init__(self, polls):
+        self.polls = list(polls)
+        self.calls = []
+
+    def call(self, action, parameters, *, approval=None, timeout_seconds=None):
+        self.calls.append((action, parameters, approval, timeout_seconds))
+        if action == "shell.execute":
+            return _job(status="queued")
+        if action == "job.get":
+            return self.polls.pop(0)
+        if action == "job.cancel":
+            return _job(status="cancelled")
+        raise AssertionError(f"unexpected Agent action: {action}")
+
+
+def _add_shell_plan(database, *, status="approved", commands=None):
+    from app.services.diagnostics import operation_plan_digest
+
+    commands = commands or ["systemctl restart demo"]
+    steps = [
+        {
+            "id": f"step-{index}",
+            "operation": "shell",
+            "command": command,
+            "cwd": "/",
+            "timeout": 60,
+            "reason": "Recover service",
+            "impact": "Brief outage",
+            "rollback": "systemctl restart demo",
+            "executable": True,
+        }
+        for index, command in enumerate(commands, start=1)
+    ]
+    with database.session_factory() as db:
+        plan = OperationPlan(
+            summary="Repair service",
+            diagnosis="Service is unhealthy",
+            risk="high",
+            status=status,
+            steps=steps,
+            approved_by="admin" if status == "approved" else None,
+            approved_at=datetime.now(UTC) if status == "approved" else None,
+            result_json=(
+                {"approval_digest": operation_plan_digest(steps)}
+                if status == "approved"
+                else {}
+            ),
+        )
+        db.add(plan)
+        db.commit()
+        return plan.id
+
+
+def _shell_executor(database, agent, *, secret_box=None):
+    return OperationExecutor(
+        session_factory=database.session_factory,
+        deployment_service=None,
+        discovery_service=None,
+        agent_client=agent,
+        secret_box=secret_box,
+        poll_interval_seconds=0,
+    )
+
+
+def test_shell_step_is_never_executed_before_approval(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'pending-shell.db'}")
+    database.create_schema()
+    plan_id = _add_shell_plan(database, status="pending")
+    agent = ScriptedAgent([])
+
+    with pytest.raises(ValueError, match="not approved"):
+        _shell_executor(database, agent).handler(
+            ExecutorContext(),
+            {"plan_id": plan_id},
+        )
+
+    assert agent.calls == []
+
+
+def test_approved_shell_step_polls_agent_and_records_result(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'approved-shell.db'}")
+    database.create_schema()
+    plan_id = _add_shell_plan(database)
+    with database.session_factory() as db:
+        session = OpsSession(title="Approved shell", status="approval_required")
+        db.add(session)
+        db.flush()
+        db.add(
+            OpsMessage(
+                session_id=session.id,
+                role="assistant",
+                content="Approval required",
+                operation_plan_id=plan_id,
+            )
+        )
+        db.commit()
+        session_id = session.id
+    output = "fixed\n"
+    agent = ScriptedAgent(
+        [
+            _job(
+                status="succeeded",
+                output=output,
+                output_offset=len(output.encode()),
+                exit_code=0,
+            )
+        ]
+    )
+    context = ExecutorContext()
+
+    result = _shell_executor(database, agent).handler(
+        context,
+        {"plan_id": plan_id},
+    )
+
+    assert result["steps"][0]["status"] == "succeeded"
+    assert result["steps"][0]["output"] == output
+    action, parameters, approval, _timeout = agent.calls[0]
+    assert action == "shell.execute"
+    assert parameters == {
+        "command": "systemctl restart demo",
+        "cwd": "/",
+        "timeout": 60,
+    }
+    assert approval["plan_id"] == plan_id
+    assert approval["step_id"] == "step-1"
+    assert approval["approved_by"] == "admin"
+    assert output.strip() in str(context.updates)
+    with database.session_factory() as db:
+        plan = db.get(OperationPlan, plan_id)
+        assert plan.status == "completed"
+        assert db.get(OpsSession, session_id).status == "active"
+        events = list(
+            db.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.resource_id == plan_id)
+                .order_by(AuditEvent.created_at)
+            )
+        )
+        assert [event.action for event in events] == [
+            "ops.shell.start",
+            "ops.shell.succeed",
+        ]
+        assert "systemctl restart demo" not in str([event.details for event in events])
+        assert output.strip() not in str([event.details for event in events])
+
+
+def test_approved_shell_plan_rejects_step_mutation_before_agent_call(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'mutated-shell.db'}")
+    database.create_schema()
+    plan_id = _add_shell_plan(database)
+    with database.session_factory() as db:
+        plan = db.get(OperationPlan, plan_id)
+        changed = list(plan.steps)
+        changed[0] = {**changed[0], "command": "systemctl stop demo"}
+        plan.steps = changed
+        db.commit()
+    agent = ScriptedAgent([])
+
+    with pytest.raises(ValueError, match="changed after approval"):
+        _shell_executor(database, agent).handler(
+            ExecutorContext(),
+            {"plan_id": plan_id},
+        )
+
+    assert agent.calls == []
+    with database.session_factory() as db:
+        assert db.get(OperationPlan, plan_id).status == "failed"
+
+
+def test_failed_shell_step_stops_later_steps(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'failed-shell.db'}")
+    database.create_schema()
+    plan_id = _add_shell_plan(
+        database,
+        commands=["false", "systemctl restart should-not-run"],
+    )
+    agent = ScriptedAgent(
+        [
+            _job(
+                status="failed",
+                output="failed\n",
+                output_offset=len(b"failed\n"),
+                exit_code=1,
+                error="command failed",
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="Shell step failed"):
+        _shell_executor(database, agent).handler(
+            ExecutorContext(),
+            {"plan_id": plan_id},
+        )
+
+    assert [call[0] for call in agent.calls].count("shell.execute") == 1
+    with database.session_factory() as db:
+        plan = db.get(OperationPlan, plan_id)
+        assert plan.status == "failed"
+        assert len(plan.result_json["steps"]) == 1
+        assert plan.result_json["steps"][0]["status"] == "failed"
+
+
+def test_shell_task_cancellation_cancels_agent_job(tmp_path):
+    from app.tasks.engine import TaskCancelled
+
+    database = Database(f"sqlite:///{tmp_path / 'cancel-shell.db'}")
+    database.create_schema()
+    plan_id = _add_shell_plan(database)
+    agent = ScriptedAgent([_job(status="running")])
+
+    class CancellingContext(ExecutorContext):
+        def __init__(self):
+            super().__init__()
+            self.checks = 0
+
+        def check_control(self):
+            self.checks += 1
+            if self.checks >= 2:
+                raise TaskCancelled()
+
+    with pytest.raises(TaskCancelled):
+        _shell_executor(database, agent).handler(
+            CancellingContext(),
+            {"plan_id": plan_id},
+        )
+
+    assert [call[0] for call in agent.calls] == ["shell.execute", "job.cancel"]
+    with database.session_factory() as db:
+        plan = db.get(OperationPlan, plan_id)
+        assert plan.status == "failed"
+        event = db.scalar(
+            select(AuditEvent).where(
+                AuditEvent.resource_id == plan_id,
+                AuditEvent.action == "ops.shell.cancel",
+            )
+        )
+        assert event is not None
+
+
+def test_shell_polling_uses_offsets_and_redacts_secrets_split_across_chunks(tmp_path):
+    from app.security import SecretBox
+
+    database = Database(f"sqlite:///{tmp_path / 'stream-shell.db'}")
+    database.create_schema()
+    plan_id = _add_shell_plan(database)
+    secret_box = SecretBox("test-secret-key-with-at-least-32-characters")
+    with database.session_factory() as db:
+        db.add(
+            Provider(
+                name="secret-provider",
+                base_url="https://provider.example/v1",
+                default_model="ops-model",
+                encrypted_api_key=secret_box.encrypt("provider-key"),
+            )
+        )
+        db.commit()
+    first = "prefix provider-"
+    second = "key suffix\n"
+    agent = ScriptedAgent(
+        [
+            _job(
+                status="running",
+                output=first,
+                output_offset=len(first.encode()),
+            ),
+            _job(
+                status="succeeded",
+                output=second,
+                truncated_before=len(first.encode()),
+                output_offset=len((first + second).encode()),
+                exit_code=0,
+            ),
+        ]
+    )
+    context = ExecutorContext()
+
+    result = _shell_executor(
+        database,
+        agent,
+        secret_box=secret_box,
+    ).handler(context, {"plan_id": plan_id})
+
+    rendered = result["steps"][0]["output"] + str(context.updates)
+    assert "provider-key" not in rendered
+    assert "[REDACTED]" in rendered
+    get_calls = [call for call in agent.calls if call[0] == "job.get"]
+    assert [call[1]["offset"] for call in get_calls] == [0, len(first.encode())]
+
+
+def test_shell_polling_marks_agent_output_retention_gaps(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'truncated-shell.db'}")
+    database.create_schema()
+    plan_id = _add_shell_plan(database)
+    agent = ScriptedAgent(
+        [
+            _job(status="running", output="abc", output_offset=3),
+            _job(
+                status="succeeded",
+                output="fg",
+                truncated_before=5,
+                output_offset=7,
+                exit_code=0,
+            ),
+        ]
+    )
+
+    result = _shell_executor(database, agent).handler(
+        ExecutorContext(),
+        {"plan_id": plan_id},
+    )
+
+    output = result["steps"][0]["output"]
+    assert output.startswith("abc[Earlier Agent output was truncated]")
+    assert output.endswith("fg")

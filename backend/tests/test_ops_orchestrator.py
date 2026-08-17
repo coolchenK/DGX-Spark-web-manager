@@ -745,7 +745,6 @@ def test_runtime_orchestrator_creates_pending_plan_without_agent_execution(tmp_p
                     {
                         "operation": "shell",
                         "command": "systemctl restart demo",
-                        "cwd": "/",
                         "timeout": 60,
                         "reason": "Recover",
                         "impact": "Brief outage",
@@ -768,6 +767,8 @@ def test_runtime_orchestrator_creates_pending_plan_without_agent_execution(tmp_p
         assert plan.risk == "high"
         assert plan.steps[0]["operation"] == "shell"
         assert plan.steps[0]["executable"] is True
+        assert plan.steps[0]["cwd"] == "/"
+        assert len(plan.steps[0]["id"]) == 36
         message = db.scalar(
             select(OpsMessage).where(OpsMessage.operation_plan_id == result.plan_id)
         )
