@@ -412,6 +412,54 @@ def test_known_secrets_are_removed_before_assignment_parsing(
     assert result.error == "[REDACTED]"
 
 
+@pytest.mark.parametrize(
+    ("assignment", "forbidden"),
+    [
+        ("api_key=prefixabcSuffix", "Suffix"),
+        ("token=abcSuffix", "Suffix"),
+        ("password=prefixabc", "prefix"),
+        ("api_key=[REDACTED]actual-secret", "actual-secret"),
+    ],
+)
+def test_unquoted_credentials_consume_marker_and_adjacent_value_fragments(
+    database: Database,
+    secret_box: SecretBox,
+    assignment: str,
+    forbidden: str,
+) -> None:
+    with database.session_factory() as db:
+        db.add(
+            Provider(
+                name="known-secret",
+                base_url="https://known.example/v1",
+                default_model="model",
+                encrypted_api_key=secret_box.encrypt("abc"),
+            )
+        )
+        db.commit()
+    registry = OpsToolRegistry(
+        FakeAgent(
+            {
+                "status": "failed",
+                "output": assignment,
+                "nested": {"assignment": assignment},
+                "error": assignment,
+            }
+        ),
+        database.session_factory,
+        secret_box,
+    )
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = result.model_dump_json()
+
+    assert forbidden not in dumped
+    assert result.output["output"] == "[REDACTED]"
+    assert result.output["nested"]["assignment"] == "[REDACTED]"
+    assert result.error == "[REDACTED]"
+    assert "]]" not in dumped
+
+
 def test_sensitive_key_matching_preserves_public_token_metrics(
     database: Database, secret_box: SecretBox
 ) -> None:

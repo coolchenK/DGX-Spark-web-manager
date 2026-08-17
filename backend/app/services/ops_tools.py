@@ -85,7 +85,7 @@ _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])(?P<quote>[\"']?)"
     r"(?P<label>[A-Za-z0-9][A-Za-z0-9_-]{0,127})(?P=quote)\s*[:=]\s*"
     r"(?:(?:bearer|basic)\s+)?"
-    r'''(?:\[REDACTED\]|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)''',
+    r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:\[REDACTED\]|[^\s,;&}\[\]]+)+)''',
     re.IGNORECASE,
 )
 
