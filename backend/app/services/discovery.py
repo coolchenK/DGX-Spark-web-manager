@@ -274,7 +274,13 @@ class DiscoveryService:
             candidate = container_candidate(container.attrs)
             if not candidate:
                 continue
-            probe = self._probe(candidate)
+            # A stopped host-network container retains its old endpoint. Probing that
+            # address can hit a different live server now using the same port.
+            probe = (
+                self._probe(candidate)
+                if candidate["status"] == "running"
+                else {"health": "unhealthy"}
+            )
             candidate.update(probe)
             existing = db.scalar(
                 select(Deployment).where(

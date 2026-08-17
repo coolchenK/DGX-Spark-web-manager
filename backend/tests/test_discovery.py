@@ -3,7 +3,7 @@ import os
 
 import pytest
 from app.db import Database
-from app.models import ModelAsset
+from app.models import Deployment, ModelAsset
 from app.services import discovery
 from app.services.discovery import (
     DiscoveryService,
@@ -295,6 +295,80 @@ def test_container_candidate_extracts_openai_endpoint_and_model():
     assert candidate["endpoint_url"] == "http://127.0.0.1:8001"
     assert candidate["api_model_name"] == "qwen3.8-27b"
     assert candidate["managed"] is False
+
+
+def test_scan_does_not_probe_stopped_container_endpoint_reused_by_live_service(
+    settings, monkeypatch
+):
+    class Container:
+        attrs = {
+            "Id": "stopped-container-id",
+            "Name": "/nemotron-dspark",
+            "Config": {
+                "Image": "vllm/vllm-openai:v0.27.1",
+                "Cmd": [
+                    "serve",
+                    "/model",
+                    "--served-model-name",
+                    "nemotron-3.5-lightning",
+                    "--port",
+                    "8000",
+                ],
+                "Labels": {},
+            },
+            "State": {"Status": "exited"},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        def reload(self):
+            return None
+
+    class Containers:
+        @staticmethod
+        def list(*, all):
+            assert all is True
+            return [Container()]
+
+    class DockerClient:
+        containers = Containers()
+
+    service = DiscoveryService(settings.model_root_paths)
+    monkeypatch.setattr(service, "_docker_client", lambda: DockerClient())
+
+    def unexpected_probe(_candidate):
+        pytest.fail("a stopped container endpoint must not be probed")
+
+    monkeypatch.setattr(service, "_probe", unexpected_probe)
+    database = Database(settings.database_url)
+    database.create_schema()
+
+    with database.session_factory() as db:
+        stopped = Deployment(
+            name="nemotron-dspark",
+            runtime="vllm",
+            container_id="stopped-container-id",
+            container_name="nemotron-dspark",
+            endpoint_url="http://127.0.0.1:8000",
+            api_model_name="nemotron-3.5-lightning",
+        )
+        live = Deployment(
+            name="qwen36-final",
+            runtime="vllm",
+            container_id="live-container-id",
+            container_name="qwen36-final",
+            endpoint_url="http://127.0.0.1:8000",
+            api_model_name="qwen36-35b-heretic",
+        )
+        db.add_all([stopped, live])
+        db.commit()
+
+        discovered = service.scan_containers(db)
+        db.refresh(stopped)
+
+    assert discovered == [stopped]
+    assert stopped.api_model_name == "nemotron-3.5-lightning"
+    assert stopped.status == "exited"
+    assert stopped.health == "unhealthy"
 
 
 def test_model_metadata_is_derived_from_snapshot_and_config(tmp_path):
