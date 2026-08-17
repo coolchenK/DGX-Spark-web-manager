@@ -13,6 +13,3 @@ UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true
 KillMode=control-group
-
-[Install]
-WantedBy=multi-user.target

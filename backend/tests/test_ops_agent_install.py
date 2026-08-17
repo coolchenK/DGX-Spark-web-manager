@@ -215,6 +215,11 @@ def _fake_agent_system(
                 "    fi",
                 "    for unit in \"$@\"; do",
                 "      case \"$unit\" in *.socket) kind=socket ;; *) kind=service ;; esac",
+                "      if [ \"$command\" = disable ] && [ \"$kind\" = service ] &&",
+                "         grep -q 'ExecStart=/usr/bin/python3 -m dgx_ops_agent.server' \\",
+                "           \"$UNIT_DIR/$unit\"; then",
+                "        value=static",
+                "      fi",
                 "      printf '%s' \"$value\" > \"$STATE/$kind.enabled\"",
                 "      if $now; then",
                 "        active=inactive; [ \"$command\" = enable ] && active=active",
@@ -301,6 +306,7 @@ def test_systemd_service_contract_and_recovery_fallback() -> None:
     assert service["PrivateTmp"] == "true"
     assert service["KillMode"] == "control-group"
     assert "ProtectSystem" not in service
+    assert "Install" not in unit
 
 
 def test_compose_connects_manager_to_agent_with_supplementary_group() -> None:
@@ -397,7 +403,7 @@ def test_apply_is_idempotent_and_preserves_key_and_jobs_with_fake_system(
     _bash()
     if os.name == "nt":
         pytest.skip("requires native POSIX ownership semantics")
-    fake_bin, _, log, _ = _fake_agent_system(
+    fake_bin, state, log, _ = _fake_agent_system(
         tmp_path,
         enabled=False,
         active=False,
@@ -424,7 +430,8 @@ def test_apply_is_idempotent_and_preserves_key_and_jobs_with_fake_system(
     assert (install_root / "usr/local/lib/dgx-spark-ops-agent/dgx_ops_agent/server.py").is_file()
     systemctl_calls = log.read_text(encoding="utf-8")
     assert "daemon-reload" in systemctl_calls
-    assert "enable --now dgx-spark-ops-agent.socket" in systemctl_calls
+    assert "enable dgx-spark-ops-agent.socket" in systemctl_calls
+    assert (state / "service.enabled").read_text() == "static"
 
 
 def test_upgrade_health_failure_restores_old_agent_units_and_systemd_state(
@@ -491,8 +498,9 @@ def test_first_install_health_failure_removes_new_artifacts_and_disables_units(
     assert not (install_root / "usr/local/lib/dgx-spark-ops-agent/dgx_ops_agent").exists()
     assert not (install_root / "etc/systemd/system/dgx-spark-ops-agent.service").exists()
     assert not (install_root / "etc/systemd/system/dgx-spark-ops-agent.socket").exists()
+    assert (state / "socket.enabled").read_text() == "disabled"
+    assert (state / "service.enabled").read_text() == "static"
     for kind in ("socket", "service"):
-        assert (state / f"{kind}.enabled").read_text() == "disabled"
         assert (state / f"{kind}.active").read_text() == "inactive"
     assert health.read_text(encoding="utf-8") == "pass\n"
 
@@ -759,6 +767,10 @@ def test_installer_fails_closed_on_systemd_state_and_quiesces_before_writes() ->
     key = script.index("create_key_if_missing", artifact_snapshot)
     assert apply < capture < quiesce < artifact_snapshot < key
     assert "verify_systemd_state" in script
+    assert (
+        "verify_systemd_state is-enabled dgx-spark-ops-agent.service service static"
+        in script
+    )
     assert "enable --now dgx-spark-ops-agent.socket" not in script
     assert "try-restart" not in script
 
@@ -849,7 +861,136 @@ def test_uninstaller_prevalidates_every_target_before_strict_systemd_shutdown() 
         assert script.count(f'"${name}"') >= 2
     assert "query_systemd_state" in script
     assert "verify_systemd_state" in script
+    assert (
+        "query_systemd_state is-enabled dgx-spark-ops-agent.service service_enabled"
+        in script
+    )
+    assert "enabled-runtime" in script
+    assert "is-enabled:service:static:0" in script
+    assert "is-enabled:socket:static:0" not in script
     assert "|| true" not in script
+
+
+def _fake_uninstall_service_state(
+    tmp_path: Path,
+    service_enabled: str,
+) -> tuple[Path, Path, Path]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    state = tmp_path / "service.enabled"
+    state.write_text(service_enabled, encoding="ascii")
+    log = tmp_path / "systemctl.log"
+    _write_executable(
+        fake_bin / "systemctl",
+        "\n".join(
+            (
+                "#!/bin/sh",
+                f'STATE="{_shell_path(state)}"',
+                f'LOG="{_shell_path(log)}"',
+                'printf "%s\\n" "$*" >> "$LOG"',
+                "operation=$1",
+                "shift",
+                'runtime=""',
+                '[ "${1:-}" = --runtime ] && { runtime=--runtime; shift; }',
+                'unit="${1:-}"',
+                'if [ "$operation" = is-enabled ]; then',
+                '  if [ "$unit" = dgx-spark-ops-agent.service ]; then',
+                '    [ -e "${STATE}.transport" ] && exit 55',
+                '    if [ -e "${STATE}.unknown" ]; then printf "masked\\n"; exit 0; fi',
+                '    value=$(cat "$STATE")',
+                '    printf "%s\\n" "$value"',
+                '    case "$value" in',
+                "      enabled|enabled-runtime|static) exit 0 ;;",
+                "      disabled) exit 1 ;;",
+                "    esac",
+                "    exit 23",
+                "  fi",
+                '  printf "disabled\\n"',
+                "  exit 1",
+                "fi",
+                'if [ "$operation" = is-active ]; then printf "inactive\\n"; exit 3; fi',
+                'if [ "$operation" = disable ] && [ "$unit" = dgx-spark-ops-agent.service ]; then',
+                '  printf "disabled" > "$STATE"',
+                "fi",
+                "exit 0",
+                "",
+            )
+        ),
+    )
+    return fake_bin, state, log
+
+
+def _seed_uninstall_artifacts(install_root: Path) -> tuple[Path, ...]:
+    paths = (
+        install_root / "usr/local/lib/dgx-spark-ops-agent/dgx_ops_agent/server.py",
+        install_root / "etc/dgx-spark-manager/ops-agent.key",
+        install_root / "var/lib/dgx-spark-ops-agent/jobs/job.json",
+        install_root / "etc/systemd/system/dgx-spark-ops-agent.service",
+        install_root / "etc/systemd/system/dgx-spark-ops-agent.socket",
+    )
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("keep", encoding="utf-8")
+    return paths
+
+
+@pytest.mark.parametrize(
+    ("service_state", "disable_call"),
+    [
+        ("enabled", "disable dgx-spark-ops-agent.service"),
+        ("enabled-runtime", "disable --runtime dgx-spark-ops-agent.service"),
+    ],
+)
+def test_uninstall_disables_legacy_service_enablement_before_removal(
+    tmp_path: Path,
+    service_state: str,
+    disable_call: str,
+) -> None:
+    fake_bin, state, log = _fake_uninstall_service_state(tmp_path, service_state)
+    install_root = tmp_path / "root"
+    _seed_uninstall_artifacts(install_root)
+
+    result = _run_bash(
+        UNINSTALLER,
+        "--apply",
+        env={
+            "PATH": _fake_path(fake_bin),
+            "DGX_OPS_AGENT_TESTING": "1",
+            "DGX_OPS_AGENT_TEST_EUID": "0",
+            "DGX_OPS_AGENT_INSTALL_ROOT": _shell_path(install_root),
+        },
+    )
+
+    calls = log.read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stderr
+    assert state.read_text(encoding="ascii") == "disabled"
+    assert disable_call in calls
+    assert calls.count("is-enabled dgx-spark-ops-agent.service") == 2
+
+
+@pytest.mark.parametrize("failure", ["transport", "unknown"])
+def test_uninstall_service_enablement_query_failure_deletes_nothing(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    fake_bin, state, _ = _fake_uninstall_service_state(tmp_path, "enabled")
+    Path(f"{state}.{failure}").touch()
+    install_root = tmp_path / "root"
+    artifacts = _seed_uninstall_artifacts(install_root)
+
+    result = _run_bash(
+        UNINSTALLER,
+        "--apply",
+        env={
+            "PATH": _fake_path(fake_bin),
+            "DGX_OPS_AGENT_TESTING": "1",
+            "DGX_OPS_AGENT_TEST_EUID": "0",
+            "DGX_OPS_AGENT_INSTALL_ROOT": _shell_path(install_root),
+        },
+    )
+
+    assert result.returncode != 0
+    assert all(path.exists() for path in artifacts)
 
 
 def test_uninstall_apply_preserves_key_and_jobs_with_fake_system(tmp_path: Path) -> None:

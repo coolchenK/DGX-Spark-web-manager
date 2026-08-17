@@ -98,17 +98,24 @@ validate_all_removal_targets() {
 
 validate_systemd_state() {
   local operation="$1"
-  local value="$2"
-  local status="$3"
-  case "$operation:$value:$status" in
-    is-enabled:enabled:0|is-enabled:enabled-runtime:0|\
-    is-enabled:disabled:1|is-enabled:not-found:1|is-enabled:not-found:4|\
-    is-active:active:0|is-active:inactive:3|\
-    is-active:not-found:3|is-active:not-found:4)
+  local unit_type="$2"
+  local value="$3"
+  local status="$4"
+  case "$operation:$unit_type:$value:$status" in
+    is-enabled:socket:enabled:0|is-enabled:socket:enabled-runtime:0|\
+    is-enabled:socket:disabled:1|is-enabled:socket:not-found:1|\
+    is-enabled:socket:not-found:4|\
+    is-enabled:service:enabled:0|is-enabled:service:enabled-runtime:0|\
+    is-enabled:service:disabled:1|is-enabled:service:static:0|\
+    is-enabled:service:not-found:1|is-enabled:service:not-found:4|\
+    is-active:socket:active:0|is-active:socket:inactive:3|\
+    is-active:socket:not-found:3|is-active:socket:not-found:4|\
+    is-active:service:active:0|is-active:service:inactive:3|\
+    is-active:service:not-found:3|is-active:service:not-found:4)
       return 0
       ;;
     *)
-      echo "Unsafe systemd state response: operation=$operation value='$value' status=$status" >&2
+      echo "Unsafe systemd state response: operation=$operation unit_type=$unit_type value='$value' status=$status" >&2
       return 1
       ;;
   esac
@@ -118,6 +125,7 @@ query_systemd_state() {
   local operation="$1"
   local unit="$2"
   local result_variable="$3"
+  local unit_type="${unit##*.}"
   local value
   local status
   if value="$(systemctl "$operation" "$unit" 2>/dev/null)"; then
@@ -129,7 +137,7 @@ query_systemd_state() {
     echo "Invalid systemd state output for $unit" >&2
     return 1
   }
-  validate_systemd_state "$operation" "$value" "$status" || return 1
+  validate_systemd_state "$operation" "$unit_type" "$value" "$status" || return 1
   printf -v "$result_variable" '%s' "$value"
 }
 
@@ -145,12 +153,27 @@ verify_systemd_state() {
   }
 }
 
+verify_systemd_disabled_or_static() {
+  local unit="$1"
+  local actual=""
+  query_systemd_state is-enabled "$unit" actual || return 1
+  case "$actual" in
+    disabled|static) ;;
+    *)
+      echo "Systemd enablement verification failed for $unit: found $actual" >&2
+      return 1
+      ;;
+  esac
+}
+
 strict_shutdown() {
   local socket_enabled=""
   local socket_active=""
+  local service_enabled=""
   local service_active=""
   query_systemd_state is-enabled dgx-spark-ops-agent.socket socket_enabled
   query_systemd_state is-active dgx-spark-ops-agent.socket socket_active
+  query_systemd_state is-enabled dgx-spark-ops-agent.service service_enabled
   query_systemd_state is-active dgx-spark-ops-agent.service service_active
 
   if [[ "$service_active" == active ]]; then
@@ -171,6 +194,17 @@ strict_shutdown() {
       verify_systemd_state is-enabled dgx-spark-ops-agent.socket disabled
       ;;
     disabled|not-found) ;;
+  esac
+  case "$service_enabled" in
+    enabled)
+      systemctl disable dgx-spark-ops-agent.service
+      verify_systemd_disabled_or_static dgx-spark-ops-agent.service
+      ;;
+    enabled-runtime)
+      systemctl disable --runtime dgx-spark-ops-agent.service
+      verify_systemd_disabled_or_static dgx-spark-ops-agent.service
+      ;;
+    disabled|static|not-found) ;;
   esac
 }
 

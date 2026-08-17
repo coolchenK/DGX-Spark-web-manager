@@ -556,7 +556,7 @@ quiesce_existing_agent() {
 activate_new_agent() {
   systemctl daemon-reload
   systemctl disable dgx-spark-ops-agent.service
-  verify_systemd_state is-enabled dgx-spark-ops-agent.service service disabled
+  verify_systemd_state is-enabled dgx-spark-ops-agent.service service static
   systemctl enable dgx-spark-ops-agent.socket
   verify_systemd_state is-enabled dgx-spark-ops-agent.socket socket enabled
   systemctl start dgx-spark-ops-agent.socket
