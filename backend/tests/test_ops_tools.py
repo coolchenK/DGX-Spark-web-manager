@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -260,6 +260,155 @@ def test_agent_result_is_recursively_redacted_and_bounded(
     assert "api-key" not in dumped
     for secret in secrets.values():
         assert secret not in dumped
+
+
+@pytest.mark.parametrize(
+    ("credential", "opaque"),
+    [
+        ("Authorization: Bearer opaque-auth-value", "opaque-auth-value"),
+        ("authorization = Basic opaque-basic-value", "opaque-basic-value"),
+        ("api_key=opaque-api-value", "opaque-api-value"),
+        ("api-key: opaque-hyphen-value", "opaque-hyphen-value"),
+        ('"apikey": "opaque-json-value"', "opaque-json-value"),
+        ('"token": "opaque-token-value"', "opaque-token-value"),
+        ("access_token='opaque access value'", "opaque access value"),
+        ("password: 'opaque password value'", "opaque password value"),
+        ("secret=opaque-secret-value", "opaque-secret-value"),
+    ],
+)
+def test_unknown_credential_assignments_redact_the_entire_value(
+    database: Database,
+    secret_box: SecretBox,
+    credential: str,
+    opaque: str,
+) -> None:
+    agent = FakeAgent(
+        {
+            "status": "failed",
+            "output": f"prefix {credential} suffix",
+            "error": credential,
+            "normal": "token count is 8 and password rotation is scheduled",
+        }
+    )
+    registry = OpsToolRegistry(agent, database.session_factory, secret_box)
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = result.model_dump_json()
+
+    assert opaque not in dumped
+    assert "[REDACTED]" in dumped
+    assert result.output["normal"] == "token count is 8 and password rotation is scheduled"
+    assert result.error is not None
+    assert opaque not in result.error
+
+
+def test_sensitive_key_matching_preserves_public_token_metrics(
+    database: Database, secret_box: SecretBox
+) -> None:
+    agent = FakeAgent(
+        {
+            "status": "succeeded",
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "token": "opaque-token",
+            "access_token": "opaque-access-token",
+            "nested": {"client_secret": "opaque-client-secret"},
+        }
+    )
+    registry = OpsToolRegistry(agent, database.session_factory, secret_box)
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = result.model_dump_json()
+
+    assert result.output["prompt_tokens"] == 11
+    assert result.output["completion_tokens"] == 7
+    assert "opaque-token" not in dumped
+    assert "opaque-access-token" not in dumped
+    assert "opaque-client-secret" not in dumped
+
+
+def test_credential_redaction_preserves_following_non_secret_query_parameters(
+    database: Database, secret_box: SecretBox
+) -> None:
+    agent = FakeAgent(
+        {"status": "succeeded", "output": "token=opaque-query&mode=read"}
+    )
+    registry = OpsToolRegistry(agent, database.session_factory, secret_box)
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+
+    assert "opaque-query" not in result.output["output"]
+    assert "mode=read" in result.output["output"]
+
+
+def test_gateway_aggregates_use_the_requested_time_window(
+    database: Database, secret_box: SecretBox
+) -> None:
+    now = datetime.now(UTC)
+    with database.session_factory() as db:
+        db.add_all(
+            [
+                RequestMetric(
+                    model="old",
+                    endpoint="chat",
+                    status_code=500,
+                    latency_ms=1000,
+                    created_at=now - timedelta(hours=2),
+                ),
+                RequestMetric(
+                    model="recent",
+                    endpoint="chat",
+                    status_code=200,
+                    latency_ms=100,
+                    prompt_tokens=12,
+                    completion_tokens=5,
+                    created_at=now - timedelta(minutes=5),
+                ),
+            ]
+        )
+        db.commit()
+    registry = OpsToolRegistry(FakeAgent(), database.session_factory, secret_box)
+
+    result = registry.execute(
+        ReadOnlyToolRequest(
+            name="manager.gateway", arguments={"minutes": 60, "limit": 10}
+        )
+    )
+
+    assert result.output["total_requests"] == 1
+    assert result.output["failed_requests"] == 0
+    assert result.output["error_rate"] == 0
+    assert result.output["average_latency_ms"] == 100
+    assert result.output["recent"][0]["prompt_tokens"] == 12
+    assert result.output["recent"][0]["completion_tokens"] == 5
+
+
+@pytest.mark.parametrize("agent_status", ["succeeded", "failed"])
+def test_final_tool_result_including_wrapper_stays_within_30000_characters(
+    database: Database,
+    secret_box: SecretBox,
+    agent_status: str,
+) -> None:
+    agent = FakeAgent(
+        {
+            "status": agent_status,
+            "output": ('quote=" slash=\\ 中文' * 5000)
+            + " api_key=opaque-boundary-secret",
+            "error": (
+                "password=opaque-error-secret " + ("错误" * 1000)
+                if agent_status == "failed"
+                else None
+            ),
+        }
+    )
+    registry = OpsToolRegistry(agent, database.session_factory, secret_box)
+
+    result = registry.execute(ReadOnlyToolRequest(name="host.memory", arguments={}))
+    dumped = result.model_dump_json()
+
+    assert len(dumped) <= 30_000
+    assert "opaque-boundary-secret" not in dumped
+    assert "opaque-error-secret" not in dumped
 
 
 def test_expected_agent_unavailability_is_a_persistable_failure(

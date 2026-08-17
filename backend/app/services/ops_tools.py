@@ -47,23 +47,50 @@ MANAGER_READ_TOOLS = frozenset({"manager.summary", "manager.tasks", "manager.gat
 AUTOMATIC_READ_TOOLS = AGENT_READ_TOOLS | MANAGER_READ_TOOLS
 
 MAX_TOOL_OUTPUT_CHARS = 30_000
+MAX_TOOL_RESULT_CHARS = 30_000
 MAX_STRUCTURE_DEPTH = 8
 MAX_COLLECTION_ITEMS = 100
 MAX_STRING_CHARS = 12_000
 _TRUNCATED = "[truncated]"
 _REDACTED = "[REDACTED]"
-_SENSITIVE_KEY_PARTS = (
-    "authorization",
-    "api_key",
-    "apikey",
-    "encrypted_api_key",
-    "encrypted_value",
-    "password",
-    "secret",
-    "token",
+_SENSITIVE_KEY_NAMES = frozenset(
+    {
+        "authorization",
+        "api_key",
+        "apikey",
+        "encrypted_api_key",
+        "encrypted_value",
+        "token",
+        "access_token",
+        "api_token",
+        "auth_token",
+        "bearer_token",
+        "password",
+        "passwd",
+        "secret",
+        "client_secret",
+        "secret_key",
+    }
 )
-_SENSITIVE_LABEL_PATTERN = re.compile(
-    r"authorization|(?:encrypted[_-]?)?api[_ -]?key", re.IGNORECASE
+_SENSITIVE_KEY_SUFFIXES = (
+    "_api_key",
+    "_apikey",
+    "_token",
+    "_password",
+    "_passwd",
+    "_secret",
+    "_secret_key",
+)
+_CREDENTIAL_LABEL = (
+    r"(?:authorization|(?:[a-z0-9]+[_-])?api[_-]?key|apikey|"
+    r"(?:[a-z0-9]+[_-])?token|password|passwd|"
+    r"(?:[a-z0-9]+[_-])?secret(?:[_-]key)?)"
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?<![A-Za-z0-9_])\"?{_CREDENTIAL_LABEL}\"?\s*[:=]\s*"
+    r"(?:(?:bearer|basic)\s+)?"
+    r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)''',
+    re.IGNORECASE,
 )
 
 
@@ -111,11 +138,13 @@ class OpsToolRegistry:
             try:
                 output = self.agent.call(name, request.argument_dict())
             except OpsAgentError as exc:
-                return ToolResult(
-                    name=name,
-                    status="failed",
-                    output={},
-                    error=_sanitize_string(str(exc), secrets, 1000),
+                return _fit_tool_result(
+                    ToolResult(
+                        name=name,
+                        status="failed",
+                        output={},
+                        error=_sanitize_string(str(exc), secrets, 1000),
+                    )
                 )
             except Exception as exc:
                 raise ToolExecutionError("unexpected Agent failure") from exc
@@ -134,16 +163,20 @@ class OpsToolRegistry:
                 if isinstance(raw_error, str) and raw_error
                 else "Host read-only operation did not succeed"
             )
-            return ToolResult(
-                name=name,
-                status="failed",
-                output=sanitized_output,
-                error=error,
+            return _fit_tool_result(
+                ToolResult(
+                    name=name,
+                    status="failed",
+                    output=sanitized_output,
+                    error=error,
+                )
             )
-        return ToolResult(
-            name=name,
-            status="succeeded",
-            output=sanitized_output,
+        return _fit_tool_result(
+            ToolResult(
+                name=name,
+                status="succeeded",
+                output=sanitized_output,
+            )
         )
 
     def _load_known_secrets(self) -> tuple[str, ...]:
@@ -289,12 +322,31 @@ class OpsToolRegistry:
     @staticmethod
     def _manager_gateway(db: Session, minutes: int, limit: int) -> dict[str, Any]:
         cutoff = datetime.now(UTC) - timedelta(minutes=minutes)
-        total = db.scalar(select(func.count(RequestMetric.id))) or 0
-        failed = (
-            db.scalar(select(func.count(RequestMetric.id)).where(RequestMetric.status_code >= 400))
+        total = (
+            db.scalar(
+                select(func.count(RequestMetric.id)).where(
+                    RequestMetric.created_at >= cutoff
+                )
+            )
             or 0
         )
-        average_latency = db.scalar(select(func.avg(RequestMetric.latency_ms))) or 0
+        failed = (
+            db.scalar(
+                select(func.count(RequestMetric.id)).where(
+                    RequestMetric.created_at >= cutoff,
+                    RequestMetric.status_code >= 400,
+                )
+            )
+            or 0
+        )
+        average_latency = (
+            db.scalar(
+                select(func.avg(RequestMetric.latency_ms)).where(
+                    RequestMetric.created_at >= cutoff
+                )
+            )
+            or 0
+        )
         recent_rows = db.execute(
             select(
                 RequestMetric.model,
@@ -331,15 +383,16 @@ class OpsToolRegistry:
 
 
 def _is_sensitive_key(value: str) -> bool:
-    normalized = value.casefold().replace("-", "_")
-    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+    normalized = re.sub(r"[-\s]+", "_", value.casefold()).strip("_")
+    return normalized in _SENSITIVE_KEY_NAMES or normalized.endswith(
+        _SENSITIVE_KEY_SUFFIXES
+    )
 
 
 def _sanitize_string(value: str, secrets: tuple[str, ...], limit: int) -> str:
-    sanitized = value
+    sanitized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(_REDACTED, value)
     for secret in secrets:
         sanitized = sanitized.replace(secret, _REDACTED)
-    sanitized = _SENSITIVE_LABEL_PATTERN.sub("redacted", sanitized)
     if len(sanitized) <= limit:
         return sanitized
     marker = f"\n{_TRUNCATED}\n"
@@ -398,6 +451,27 @@ def _bound_serialized(value: dict[str, Any], limit: int) -> dict[str, Any]:
     return {"truncated": True}
 
 
+def _fit_tool_result(result: ToolResult) -> ToolResult:
+    if len(result.model_dump_json()) <= MAX_TOOL_RESULT_CHARS:
+        return result
+
+    empty = result.model_copy(update={"output": {}})
+    output_budget = max(
+        2,
+        MAX_TOOL_RESULT_CHARS - len(empty.model_dump_json()) + 2,
+    )
+    fitted = result.model_copy(
+        update={"output": _bound_serialized(result.output, output_budget)}
+    )
+    if len(fitted.model_dump_json()) <= MAX_TOOL_RESULT_CHARS:
+        return fitted
+
+    fail_safe = result.model_copy(update={"output": {"truncated": True}})
+    if len(fail_safe.model_dump_json()) <= MAX_TOOL_RESULT_CHARS:
+        return fail_safe
+    raise ToolExecutionError("tool result could not be bounded safely")
+
+
 def sanitize_and_bound(
     output: Mapping[str, Any],
     *,
@@ -417,6 +491,7 @@ __all__ = [
     "AUTOMATIC_READ_TOOLS",
     "MANAGER_READ_TOOLS",
     "MAX_TOOL_OUTPUT_CHARS",
+    "MAX_TOOL_RESULT_CHARS",
     "OpsToolRegistry",
     "ToolExecutionError",
     "ToolResult",
