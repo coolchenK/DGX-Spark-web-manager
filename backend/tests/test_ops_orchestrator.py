@@ -24,6 +24,17 @@ from sqlalchemy import delete, inspect, select, text
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_system_prompt_defines_json_protocol_for_non_native_tool_models():
+    from app.services.ops_orchestrator import _SYSTEM_PROMPT
+
+    assert "do not have native tool calling" in _SYSTEM_PROMPT
+    assert '"action":"tool"' in _SYSTEM_PROMPT
+    assert '"name":"host.memory"' in _SYSTEM_PROMPT
+    assert '"action":"plan"' in _SYSTEM_PROMPT
+    assert '"operation":"shell"' in _SYSTEM_PROMPT
+    assert "Never emit tool_calls" in _SYSTEM_PROMPT
+
+
 def _database(path) -> Database:
     return Database(f"sqlite:///{path}")
 
