@@ -5,6 +5,7 @@ import json
 import math
 import os
 import signal
+import socket
 import stat
 import struct
 import subprocess
@@ -20,6 +21,7 @@ import pytest
 
 from host_agent.dgx_ops_agent import protocol as protocol_module
 from host_agent.dgx_ops_agent import runner as runner_module
+from host_agent.dgx_ops_agent import server as server_module
 from host_agent.dgx_ops_agent.policy import (
     READ_ONLY_ACTIONS,
     PolicyError,
@@ -42,6 +44,7 @@ from host_agent.dgx_ops_agent.protocol import (
 )
 from host_agent.dgx_ops_agent.redaction import StreamingRedactor
 from host_agent.dgx_ops_agent.runner import SAFE_PATH, JobRunner
+from host_agent.dgx_ops_agent.server import AgentServer, UnixSocketAgentServer
 
 SECRET = b"x" * 32
 REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -67,6 +70,638 @@ def _wait_for_terminal(runner, job_id, timeout=5):
             return job
         time.sleep(0.01)
     raise AssertionError("job did not reach a terminal state")
+
+
+class _FakeRunner:
+    def __init__(self):
+        self.started = []
+        self.jobs = {}
+
+    def start(self, action):
+        self.started.append(action)
+        job = {
+            "job_id": "00000000-0000-4000-8000-000000000001",
+            "status": "queued",
+            "output": "",
+            "output_offset": 0,
+            "truncated_before": 0,
+            "exit_code": None,
+            "started": None,
+            "finished": None,
+            "error": None,
+        }
+        self.jobs[job["job_id"]] = job
+        return type("FakeJob", (), {"as_dict": lambda self: dict(job)})()
+
+    def get(self, job_id, *, offset=None):
+        job = dict(self.jobs[job_id])
+        if offset is not None:
+            if offset > job["output_offset"]:
+                raise ValueError("invalid offset")
+            job["output"] = job["output"][offset:]
+            job["truncated_before"] = offset
+        return type("FakeJob", (), {"as_dict": lambda self: dict(job)})()
+
+    def cancel(self, job_id):
+        job = self.jobs[job_id]
+        job["status"] = "cancelled"
+        return type("FakeJob", (), {"as_dict": lambda self: dict(job)})()
+
+
+def _server_request(action, parameters, *, nonce, approval=None, now=1000):
+    return sign_message(
+        new_request(
+            action,
+            parameters,
+            approval=approval,
+            now=now,
+            nonce=nonce,
+            request_id=f"request-{nonce}",
+        ),
+        SECRET,
+    )
+
+
+def _assert_signed_response(response, *, request_id, ok=True):
+    assert set(response) == {
+        "protocol_version",
+        "request_id",
+        "ok",
+        "result",
+        "error",
+        "timestamp",
+        "signature",
+    }
+    assert response["protocol_version"] == PROTOCOL_VERSION
+    assert response["request_id"] == request_id
+    assert response["ok"] is ok
+    expected = hmac.new(SECRET, canonical_bytes(response), hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(response["signature"], expected)
+
+
+def _call_over_socket(server, request, *, timeout=2):
+    client, agent = socket.socketpair()
+    worker = threading.Thread(
+        target=server.serve_connection,
+        args=(agent,),
+        kwargs={"read_timeout": timeout},
+        daemon=True,
+    )
+    worker.start()
+    try:
+        write_frame(client, request)
+        response = read_frame(client)
+    finally:
+        client.close()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    return response
+
+
+def test_server_dispatches_health_read_and_shell_as_signed_jobs():
+    runner = _FakeRunner()
+    server = AgentServer(SECRET, runner, clock=lambda: 1000)
+
+    health = server.handle(
+        _server_request("agent.health", {}, nonce="health")
+    )
+    _assert_signed_response(health, request_id="request-health")
+    assert health["result"] == {"status": "ok", "protocol_version": 1}
+    assert runner.started == []
+
+    read = server.handle(
+        _server_request("host.memory", {}, nonce="read")
+    )
+    _assert_signed_response(read, request_id="request-read")
+    assert read["result"]["status"] == "queued"
+    assert runner.started[-1].action == "host.memory"
+
+    shell = server.handle(
+        _server_request(
+            "shell.execute",
+            {"command": "printf ok", "cwd": "/", "timeout": 10},
+            approval={
+                **VALID_APPROVAL,
+                "approved_at": "1970-01-01T00:16:40Z",
+            },
+            nonce="shell",
+        )
+    )
+    _assert_signed_response(shell, request_id="request-shell")
+    assert shell["result"]["job_id"]
+    assert runner.started[-1].argv == (
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        "printf ok",
+    )
+
+
+def test_server_dispatches_every_policy_read_action():
+    runner = _FakeRunner()
+    server = AgentServer(SECRET, runner, clock=lambda: 1000)
+
+    for index, action in enumerate(sorted(READ_ONLY_ACTIONS)):
+        response = server.handle(
+            _server_request(
+                action,
+                READ_ACTION_CASES[action][0],
+                nonce=f"read-{index}",
+            )
+        )
+        assert response["ok"] is True
+        assert runner.started[-1].action == action
+
+    assert len(runner.started) == len(READ_ONLY_ACTIONS) == 11
+
+
+def test_server_rejects_invalid_secret_and_listener_at_startup():
+    with pytest.raises(ProtocolError, match="secret"):
+        AgentServer(b"short", _FakeRunner())
+
+    with pytest.raises(ValueError, match="listener"):
+        UnixSocketAgentServer(
+            AgentServer(SECRET, _FakeRunner()),
+            listener=object(),
+        )
+
+    closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    closed.close()
+    with pytest.raises(ValueError, match="listener"):
+        UnixSocketAgentServer(
+            AgentServer(SECRET, _FakeRunner()),
+            listener=closed,
+        )
+
+
+def test_server_forwards_request_timestamp_to_shell_policy(monkeypatch):
+    runner = _FakeRunner()
+    captured = {}
+    original = validate_action
+
+    def capture(action, parameters, approval, *, request_timestamp=None):
+        captured["request_timestamp"] = request_timestamp
+        return original(
+            action,
+            parameters,
+            approval,
+            request_timestamp=request_timestamp,
+        )
+
+    monkeypatch.setattr(server_module, "validate_action", capture)
+    server = AgentServer(SECRET, runner, clock=lambda: 1000)
+    response = server.handle(
+        _server_request(
+            "shell.execute",
+            {"command": "true", "cwd": "/"},
+            approval={**VALID_APPROVAL, "approved_at": "1970-01-01T00:16:40Z"},
+            nonce="timestamp",
+            now=1000,
+        )
+    )
+
+    assert response["ok"] is True
+    assert captured == {"request_timestamp": 1000}
+
+
+def test_server_gets_output_and_cancels_jobs_idempotently():
+    runner = _FakeRunner()
+    server = AgentServer(SECRET, runner, clock=lambda: 1000)
+    created = server.handle(_server_request("host.memory", {}, nonce="create"))
+    job_id = created["result"]["job_id"]
+    runner.jobs[job_id].update(
+        status="running", output="abcdef", output_offset=6
+    )
+
+    fetched = server.handle(
+        _server_request(
+            "job.get", {"job_id": job_id, "offset": 2}, nonce="get"
+        )
+    )
+    _assert_signed_response(fetched, request_id="request-get")
+    assert fetched["result"]["output"] == "cdef"
+    assert fetched["result"]["truncated_before"] == 2
+
+    first = server.handle(
+        _server_request("job.cancel", {"job_id": job_id}, nonce="cancel-1")
+    )
+    second = server.handle(
+        _server_request("job.cancel", {"job_id": job_id}, nonce="cancel-2")
+    )
+    assert first["result"]["status"] == "cancelled"
+    assert second["result"] == first["result"]
+
+    beyond = server.handle(
+        _server_request(
+            "job.get", {"job_id": job_id, "offset": 7}, nonce="beyond"
+        )
+    )
+    assert beyond["error"] == {
+        "code": "invalid_parameters",
+        "message": "invalid parameters",
+    }
+
+
+@pytest.mark.parametrize(
+    ("action", "parameters", "code"),
+    [
+        ("job.get", {}, "invalid_parameters"),
+        ("job.get", {"job_id": "bad", "extra": True}, "invalid_parameters"),
+        ("job.get", {"job_id": "bad"}, "invalid_parameters"),
+        ("job.get", {"job_id": "bad", "offset": True}, "invalid_parameters"),
+        ("job.get", {"job_id": "bad", "offset": -1}, "invalid_parameters"),
+        ("job.cancel", {"job_id": 1}, "invalid_parameters"),
+        ("job.cancel", {"job_id": "bad"}, "invalid_parameters"),
+        ("job.cancel", {"job_id": "bad", "offset": 0}, "invalid_parameters"),
+        ("unknown.action", {}, "unknown_action"),
+    ],
+)
+def test_server_returns_stable_errors_for_invalid_actions(action, parameters, code):
+    server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    response = server.handle(
+        _server_request(action, parameters, nonce=f"invalid-{code}-{action}")
+    )
+
+    _assert_signed_response(
+        response,
+        request_id=f"request-invalid-{code}-{action}",
+        ok=False,
+    )
+    assert response["result"] is None
+    assert response["error"]["code"] == code
+    assert set(response["error"]) == {"code", "message"}
+    assert "Traceback" not in json.dumps(response)
+
+
+def test_server_maps_missing_jobs_and_runner_failures_without_internal_details():
+    class BrokenRunner(_FakeRunner):
+        def start(self, action):
+            raise RuntimeError("secret at C:\\private\\agent.py")
+
+    missing_server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    missing = missing_server.handle(
+        _server_request(
+            "job.get",
+            {"job_id": "00000000-0000-4000-8000-000000000099"},
+            nonce="missing",
+        )
+    )
+    assert missing["error"] == {"code": "job_not_found", "message": "job not found"}
+
+    broken_server = AgentServer(SECRET, BrokenRunner(), clock=lambda: 1000)
+    broken = broken_server.handle(
+        _server_request("host.memory", {}, nonce="broken")
+    )
+    assert broken["error"] == {
+        "code": "operation_failed",
+        "message": "operation failed",
+    }
+    assert "private" not in json.dumps(broken)
+    assert "secret" not in json.dumps(broken)
+
+
+def test_server_authentication_errors_are_signed_and_do_not_consume_valid_nonce():
+    runner = _FakeRunner()
+    server = AgentServer(SECRET, runner, clock=lambda: 1000)
+    valid = _server_request("host.memory", {}, nonce="auth")
+    tampered = dict(valid)
+    tampered["parameters"] = {"changed": True}
+
+    rejected = server.handle(tampered)
+    _assert_signed_response(rejected, request_id=None, ok=False)
+    assert rejected["error"] == {
+        "code": "authentication_failed",
+        "message": "request authentication failed",
+    }
+    assert runner.started == []
+
+    accepted = server.handle(valid)
+    assert accepted["ok"] is True
+    assert len(runner.started) == 1
+    replayed = server.handle(valid)
+    assert replayed["error"]["code"] == "replay_detected"
+    assert replayed["request_id"] is None
+    assert len(runner.started) == 1
+
+
+def test_server_rejects_invalid_health_and_shell_policy_parameters():
+    server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    health = server.handle(
+        _server_request("agent.health", {"extra": True}, nonce="bad-health")
+    )
+    assert health["error"]["code"] == "invalid_parameters"
+
+    shell = server.handle(
+        _server_request(
+            "shell.execute",
+            {"command": "true", "cwd": "/"},
+            nonce="bad-shell",
+        )
+    )
+    assert shell["error"] == {
+        "code": "policy_rejected",
+        "message": "request rejected by policy",
+    }
+
+
+def test_server_maps_expired_and_malformed_signed_requests_to_stable_errors():
+    server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    expired = server.handle(
+        _server_request("agent.health", {}, nonce="expired", now=900)
+    )
+    assert expired["error"]["code"] == "expired_request"
+    assert expired["request_id"] is None
+
+    malformed = sign_message(
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": "malformed",
+            "action": "agent.health",
+            "parameters": {},
+            "timestamp": 1000,
+            "nonce": "malformed",
+            "unexpected": True,
+        },
+        SECRET,
+    )
+    rejected = server.handle(malformed)
+    assert rejected["error"] == {
+        "code": "invalid_request",
+        "message": "invalid request",
+    }
+    assert rejected["request_id"] is None
+
+
+def test_server_processes_exactly_one_framed_request_per_connection():
+    server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    response = _call_over_socket(
+        server,
+        _server_request("agent.health", {}, nonce="socket"),
+    )
+
+    _assert_signed_response(response, request_id="request-socket")
+    assert response["result"]["status"] == "ok"
+
+
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        (struct.pack(">I", MAX_FRAME_SIZE + 1), "frame_too_large"),
+        (struct.pack(">I", 2) + b"{]", "invalid_frame"),
+    ],
+)
+def test_server_signs_transport_frame_errors(payload, code):
+    server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    client, agent = socket.socketpair()
+    worker = threading.Thread(
+        target=server.serve_connection,
+        args=(agent,),
+        kwargs={"read_timeout": 1},
+        daemon=True,
+    )
+    worker.start()
+    client.sendall(payload)
+    response = read_frame(client)
+    client.close()
+    worker.join(timeout=2)
+
+    _assert_signed_response(response, request_id=None, ok=False)
+    assert response["error"]["code"] == code
+
+
+def test_server_times_out_partial_slow_frames_with_signed_error():
+    server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    client, agent = socket.socketpair()
+    worker = threading.Thread(
+        target=server.serve_connection,
+        args=(agent,),
+        kwargs={"read_timeout": 0.05},
+        daemon=True,
+    )
+    worker.start()
+    client.sendall(struct.pack(">I", 100) + b"{")
+    response = read_frame(client)
+    client.close()
+    worker.join(timeout=2)
+
+    _assert_signed_response(response, request_id=None, ok=False)
+    assert response["error"] == {
+        "code": "read_timeout",
+        "message": "request read timed out",
+    }
+
+
+def test_server_read_timeout_is_an_absolute_deadline_for_trickle_clients():
+    server = AgentServer(SECRET, _FakeRunner(), clock=lambda: 1000)
+    client, agent = socket.socketpair()
+    worker = threading.Thread(
+        target=server.serve_connection,
+        args=(agent,),
+        kwargs={"read_timeout": 0.1},
+        daemon=True,
+    )
+    worker.start()
+    client.sendall(struct.pack(">I", 100) + b"{")
+
+    def trickle():
+        for _ in range(6):
+            time.sleep(0.04)
+            try:
+                client.sendall(b"x")
+            except OSError:
+                return
+
+    sender = threading.Thread(target=trickle, daemon=True)
+    started = time.monotonic()
+    sender.start()
+    response = read_frame(client)
+    elapsed = time.monotonic() - started
+    client.close()
+    sender.join(timeout=1)
+    worker.join(timeout=1)
+
+    assert response["error"]["code"] == "read_timeout"
+    assert elapsed < 0.2
+    assert not worker.is_alive()
+
+
+def test_unix_socket_server_uses_injected_listener_and_bounds_concurrency():
+    class BlockingAgent:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.release = threading.Event()
+            self.two_active = threading.Event()
+            self.active = 0
+            self.maximum = 0
+
+        def serve_connection(self, connection, *, read_timeout):
+            with connection:
+                with self.lock:
+                    self.active += 1
+                    self.maximum = max(self.maximum, self.active)
+                    if self.active == 2:
+                        self.two_active.set()
+                self.release.wait(2)
+                with self.lock:
+                    self.active -= 1
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    agent = BlockingAgent()
+    stop = threading.Event()
+    transport = UnixSocketAgentServer(
+        agent,
+        listener=listener,
+        max_connections=2,
+        read_timeout=0.1,
+    )
+    worker = threading.Thread(
+        target=transport.serve_forever,
+        kwargs={"stop_event": stop},
+        daemon=True,
+    )
+    worker.start()
+    clients = [
+        socket.create_connection(listener.getsockname(), timeout=1)
+        for _ in range(3)
+    ]
+    try:
+        assert agent.two_active.wait(1)
+        time.sleep(0.05)
+        assert agent.maximum == 2
+    finally:
+        agent.release.set()
+        for client in clients:
+            client.close()
+        stop.set()
+        transport.close()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert agent.maximum == 2
+
+
+def test_systemd_socket_activation_rejects_untrusted_environment():
+    agent = AgentServer(SECRET, _FakeRunner())
+    with pytest.raises(ValueError, match="systemd socket activation"):
+        UnixSocketAgentServer.from_systemd(
+            agent,
+            descriptor=-1,
+            environment={"LISTEN_PID": str(os.getpid()), "LISTEN_FDS": "1"},
+        )
+    with pytest.raises(ValueError, match="systemd socket activation"):
+        UnixSocketAgentServer.from_systemd(
+            agent,
+            descriptor=3,
+            environment={"LISTEN_PID": "1", "LISTEN_FDS": "1"},
+        )
+    with pytest.raises(ValueError, match="systemd socket activation"):
+        UnixSocketAgentServer.from_systemd(
+            agent,
+            descriptor=3,
+            environment={"LISTEN_PID": str(os.getpid()), "LISTEN_FDS": "2"},
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="systemd file descriptors are POSIX")
+def test_systemd_socket_activation_adopts_unix_stream_listener(tmp_path):
+    socket_path = tmp_path / "activated.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(socket_path))
+    listener.listen(1)
+    try:
+        transport = UnixSocketAgentServer.from_systemd(
+            AgentServer(SECRET, _FakeRunner()),
+            descriptor=listener.fileno(),
+            environment={"LISTEN_PID": str(os.getpid()), "LISTEN_FDS": "1"},
+        )
+        transport.close()
+        assert listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+    finally:
+        listener.close()
+        try:
+            socket_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")
+def test_unix_socket_server_serves_real_path_and_cleans_up(tmp_path):
+    socket_path = tmp_path / "ops.sock"
+    agent = AgentServer(SECRET, _FakeRunner())
+    transport = UnixSocketAgentServer(
+        agent,
+        socket_path=socket_path,
+        read_timeout=1,
+    )
+    stop = threading.Event()
+    worker = threading.Thread(
+        target=transport.serve_forever,
+        kwargs={"stop_event": stop},
+        daemon=True,
+    )
+    worker.start()
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect(os.fspath(socket_path))
+        request = _server_request(
+            "agent.health",
+            {},
+            nonce="real-unix",
+            now=int(time.time()),
+        )
+        write_frame(client, request)
+        response = read_frame(client)
+        _assert_signed_response(response, request_id="request-real-unix")
+    finally:
+        client.close()
+        stop.set()
+        transport.close()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert not socket_path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")
+def test_unix_socket_server_refuses_to_replace_active_listener(tmp_path):
+    socket_path = tmp_path / "active.sock"
+    existing = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    existing.bind(os.fspath(socket_path))
+    existing.listen(1)
+    try:
+        with pytest.raises(ValueError, match="active socket"):
+            UnixSocketAgentServer(
+                AgentServer(SECRET, _FakeRunner()),
+                socket_path=socket_path,
+            )
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(os.fspath(socket_path))
+        finally:
+            probe.close()
+    finally:
+        existing.close()
+        try:
+            socket_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inode ownership only")
+def test_unix_socket_server_close_preserves_replaced_path(tmp_path):
+    socket_path = tmp_path / "replace.sock"
+    transport = UnixSocketAgentServer(
+        AgentServer(SECRET, _FakeRunner()),
+        socket_path=socket_path,
+    )
+    socket_path.unlink()
+    socket_path.write_text("replacement", encoding="utf-8")
+
+    transport.close()
+
+    assert socket_path.read_text(encoding="utf-8") == "replacement"
 
 
 def _test_action(tmp_path, code, *, timeout=5, environment=()):
