@@ -38,7 +38,9 @@ from app.services.draft_models import DraftCompatibilityService
 from app.services.model_evidence import ModelEvidenceLoader
 from app.services.model_lifecycle import ModelLifecycleService
 from app.services.ops_agent import OpsAgentClient
+from app.services.ops_orchestrator import OpsOrchestrator
 from app.services.ops_provider import OpsProviderClient
+from app.services.ops_tools import OpsToolRegistry
 from app.services.providers import ProviderService
 from app.services.resource_estimator import ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilityService
@@ -168,6 +170,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         read_timeout_seconds=app_settings.ops_agent_read_timeout_seconds,
         output_limit_bytes=app_settings.ops_agent_output_limit_bytes,
     )
+    ops_tool_registry = OpsToolRegistry(
+        ops_agent_client,
+        database.session_factory,
+        secret_box,
+    )
+    ops_orchestrator = OpsOrchestrator(
+        session_factory=database.session_factory,
+        provider_client=ops_provider_client,
+        tools=ops_tool_registry,
+        secret_box=secret_box,
+    )
 
     def download_and_discover(context, payload):
         result = huggingface_service.download_handler(context, payload)
@@ -181,12 +194,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     task_engine.register("deployment.update", deployment_service.update_handler)
     task_engine.register("deployment.action", deployment_service.action_handler)
     task_engine.register("operation.execute", operation_executor.handler)
+    task_engine.register("ops.respond", ops_orchestrator.handler)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         task_engine_started = False
         try:
             database.create_schema()
+            ops_orchestrator.recover_interrupted()
             app.state.settings = app_settings
             app.state.database = database
             with database.session_factory() as db:
@@ -230,6 +245,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.diagnostic_service = diagnostic_service
     app.state.operation_executor = operation_executor
     app.state.ops_agent_client = ops_agent_client
+    app.state.ops_tool_registry = ops_tool_registry
+    app.state.ops_orchestrator = ops_orchestrator
     app.state.gateway_activity = GatewayActivity()
     app.add_middleware(
         CORSMiddleware,
