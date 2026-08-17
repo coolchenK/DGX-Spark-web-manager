@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -68,6 +68,11 @@ class Deployment(TimestampMixin, Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     model: Mapped[ModelAsset | None] = relationship(back_populates="deployments")
+    ops_sessions: Mapped[list[OpsSession]] = relationship(
+        back_populates="deployment",
+        passive_deletes=True,
+        order_by=lambda: (OpsSession.created_at, OpsSession.id),
+    )
 
 
 class TaskRecord(TimestampMixin, Base):
@@ -102,7 +107,16 @@ class Provider(TimestampMixin, Base):
     headers: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     last_test_status: Mapped[str | None] = mapped_column(String(32))
+    last_test_result: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default="{}"
+    )
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    ops_sessions: Mapped[list[OpsSession]] = relationship(
+        back_populates="provider",
+        passive_deletes=True,
+        order_by=lambda: (OpsSession.created_at, OpsSession.id),
+    )
 
 
 class SecretSetting(Base):
@@ -130,6 +144,94 @@ class OperationPlan(TimestampMixin, Base):
     approved_by: Mapped[str | None] = mapped_column(String(255))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    messages: Mapped[list[OpsMessage]] = relationship(
+        back_populates="operation_plan",
+        passive_deletes=True,
+        order_by=lambda: (OpsMessage.created_at, OpsMessage.id),
+    )
+
+
+class OpsSession(TimestampMixin, Base):
+    __tablename__ = "ops_sessions"
+    __table_args__ = (
+        Index("ix_ops_sessions_status_updated_at", "status", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    title: Mapped[str] = mapped_column(String(255))
+    provider_id: Mapped[str | None] = mapped_column(
+        ForeignKey("providers.id", ondelete="SET NULL"), index=True
+    )
+    deployment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("deployments.id", ondelete="SET NULL"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    requested_by: Mapped[str] = mapped_column(String(255), default="admin")
+
+    provider: Mapped[Provider | None] = relationship(back_populates="ops_sessions")
+    deployment: Mapped[Deployment | None] = relationship(back_populates="ops_sessions")
+    messages: Mapped[list[OpsMessage]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by=lambda: (OpsMessage.created_at, OpsMessage.id),
+    )
+    tool_runs: Mapped[list[OpsToolRun]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by=lambda: (OpsToolRun.created_at, OpsToolRun.id),
+    )
+
+
+class OpsMessage(TimestampMixin, Base):
+    __tablename__ = "ops_messages"
+    __table_args__ = (
+        Index("ix_ops_messages_session_created_at", "session_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("ops_sessions.id", ondelete="CASCADE")
+    )
+    role: Mapped[str] = mapped_column(String(32))
+    content: Mapped[str] = mapped_column(Text)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    operation_plan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("operation_plans.id", ondelete="SET NULL"), index=True
+    )
+
+    session: Mapped[OpsSession] = relationship(back_populates="messages")
+    operation_plan: Mapped[OperationPlan | None] = relationship(back_populates="messages")
+
+
+class OpsToolRun(TimestampMixin, Base):
+    __tablename__ = "ops_tool_runs"
+    __table_args__ = (
+        Index(
+            "ix_ops_tool_runs_session_status_created_at",
+            "session_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("ops_sessions.id", ondelete="CASCADE")
+    )
+    tool_name: Mapped[str] = mapped_column(String(128))
+    risk: Mapped[str] = mapped_column(String(32), default="read_only")
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    arguments_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    agent_job_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    session: Mapped[OpsSession] = relationship(back_populates="tool_runs")
 
 
 class ApiKey(Base):
