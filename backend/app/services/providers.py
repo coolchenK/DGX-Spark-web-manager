@@ -216,7 +216,10 @@ class ProviderService:
         except Exception as exc:
             result = {
                 "status": "failed",
-                "connection": {"status": "failed", "error": self._probe_error(exc)},
+                "connection": {
+                    "status": "failed",
+                    "error": self._probe_error(provider, exc),
+                },
                 "default_model": {
                     "status": "not_tested",
                     "model": provider.default_model,
@@ -245,7 +248,7 @@ class ProviderService:
                     "default_model": {
                         "status": "failed",
                         "model": provider.default_model,
-                        "error": self._probe_error(exc),
+                        "error": self._probe_error(provider, exc),
                     },
                 }
             else:
@@ -263,9 +266,14 @@ class ProviderService:
         db.commit()
         return result
 
-    @staticmethod
-    def _probe_error(exc: Exception) -> str:
+    def _probe_error(self, provider: Provider, exc: Exception) -> str:
         detail = getattr(exc, "detail", None)
         if not isinstance(detail, str):
             return "Provider probe failed"
+        try:
+            known_secret = self.secret_box.decrypt(provider.encrypted_api_key)
+        except ValueError:
+            known_secret = None
+        if known_secret:
+            detail = detail.replace(known_secret, "[REDACTED]")
         return " ".join(detail.replace("\x00", " ").split())[:500] or "Provider probe failed"

@@ -8,6 +8,9 @@ import pytest
 from app.models import Provider
 from app.security import SecretBox
 from app.services.ops_provider import (
+    MAX_REPAIR_MESSAGE_CHARS,
+    MAX_REPAIR_MESSAGES,
+    MAX_REPAIR_TOTAL_CHARS,
     AssistantTurn,
     OpsProviderClient,
     OpsProviderError,
@@ -281,6 +284,59 @@ def test_provider_errors_are_redacted_bounded_and_never_include_credentials() ->
     assert len(captured.value.detail) <= 500
 
 
+@pytest.mark.parametrize("error_type", ["connect", "os"])
+def test_opaque_provider_key_is_removed_from_transport_error_and_persisted_probe(
+    settings, error_type: str
+) -> None:
+    from app.db import Database
+
+    opaque_key = "credential.with.an-opaque-format.987654321"
+    box = SecretBox(SECRET_KEY)
+    provider = _provider()
+    provider.encrypted_api_key = box.encrypt(opaque_key)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        message = f"socket rejected Authorization credential {opaque_key}"
+        if error_type == "connect":
+            raise httpx.ConnectError(message, request=request)
+        raise OSError(message)
+
+    client = _client(handler)
+    with pytest.raises(OpsProviderError) as captured:
+        client.list_models(provider)
+    assert opaque_key not in str(captured.value)
+    assert opaque_key not in captured.value.detail
+
+    database = Database(settings.database_url)
+    database.create_schema()
+    with database.session_factory() as db:
+        db.add(provider)
+        db.commit()
+        provider_id = provider.id
+    service = ProviderService(box, client)
+    with database.session_factory() as db:
+        result = service.test(db, db.get(Provider, provider_id))
+        serialized = service.serialize(db.get(Provider, provider_id))
+
+    assert opaque_key not in json.dumps(result)
+    assert opaque_key not in json.dumps(serialized, default=str)
+    assert result["connection"]["error"] == serialized["last_test_result"]["connection"][
+        "error"
+    ]
+
+    class LeakyProbe:
+        def list_models(self, _provider: Provider) -> list[str]:
+            raise OpsProviderError(f"probe wrapper retained {opaque_key}")
+
+    service.ops_provider_client = LeakyProbe()
+    with database.session_factory() as db:
+        second_result = service.test(db, db.get(Provider, provider_id))
+        second_serialized = service.serialize(db.get(Provider, provider_id))
+    assert opaque_key not in json.dumps(second_result)
+    assert opaque_key not in json.dumps(second_serialized, default=str)
+    database.dispose()
+
+
 def test_chat_request_uses_pinned_endpoint_safe_headers_and_authentication() -> None:
     seen: list[httpx.Request] = []
 
@@ -311,6 +367,76 @@ def test_models_request_has_no_json_body_and_legacy_trailing_slash_is_normalized
     assert _client(handler).list_models(provider) == ["reasoning-model"]
     assert seen[0].url.path == "/v1/models"
     assert seen[0].content == b""
+
+
+def test_repair_context_is_compact_bounded_and_drops_non_content_reasoning_fields() -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": "",
+                                "reasoning_content": "provider-private-reasoning",
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json=_success("bounded repair"))
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": "CORE-SYSTEM-CONSTRAINT " + "s" * 30_000,
+            "reasoning_content": "SYSTEM-REASONING-MUST-NOT-COPY",
+        }
+    ]
+    for index in range(20):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": f"old-assistant-{index} " + "a" * 20_000,
+                    "reasoning_content": f"assistant-reasoning-{index}",
+                },
+                {
+                    "role": "tool",
+                    "content": f"old-tool-{index} " + "t" * 20_000,
+                    "reasoning_content": f"tool-reasoning-{index}",
+                },
+                {"role": "user", "content": f"old-user-{index} " + "u" * 20_000},
+            ]
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": "CURRENT-USER-REQUEST diagnose the gateway " + "c" * 40_000,
+            "reasoning_content": "USER-REASONING-MUST-NOT-COPY",
+        }
+    )
+
+    assert _client(handler).complete(_provider(), messages).summary == "bounded repair"
+    repair_messages = requests[1]["messages"]
+    repair_dump = json.dumps(repair_messages)
+
+    assert len(repair_messages) <= MAX_REPAIR_MESSAGES
+    assert sum(len(message["content"]) for message in repair_messages) <= (
+        MAX_REPAIR_TOTAL_CHARS
+    )
+    assert all(len(message["content"]) <= MAX_REPAIR_MESSAGE_CHARS for message in repair_messages)
+    assert "CORE-SYSTEM-CONSTRAINT" in repair_dump
+    assert "CURRENT-USER-REQUEST" in repair_dump
+    assert "old-tool-0" not in repair_dump
+    assert "reasoning_content" not in repair_dump
+    assert "MUST-NOT-COPY" not in repair_dump
+    assert "provider-private-reasoning" not in repair_dump
 
 
 def test_assistant_summary_must_contain_non_whitespace_text() -> None:

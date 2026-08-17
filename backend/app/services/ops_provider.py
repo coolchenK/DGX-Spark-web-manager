@@ -21,6 +21,9 @@ from app.services.providers import PinnedProviderEndpoint, resolve_provider_endp
 
 MAX_PROVIDER_RESPONSE_BYTES = 256 * 1024
 MAX_PROVIDER_ERROR_CHARS = 500
+MAX_REPAIR_MESSAGES = 8
+MAX_REPAIR_MESSAGE_CHARS = 2400
+MAX_REPAIR_TOTAL_CHARS = 16_000
 
 ReadOnlyToolName = Literal[
     "host.memory",
@@ -144,6 +147,71 @@ def _sanitize_error(value: object, *, known_secret: str | None = None) -> str:
     return text[:MAX_PROVIDER_ERROR_CHARS] or "Provider request failed"
 
 
+def _bounded_repair_content(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    marker = "\n...[truncated]...\n"
+    available = max(0, limit - len(marker))
+    head = (available + 1) // 2
+    tail = available - head
+    return f"{value[:head]}{marker}{value[-tail:] if tail else ''}"
+
+
+def _compact_repair_messages(
+    messages: list[dict[str, Any]], reason: str
+) -> list[dict[str, str]]:
+    usable = [
+        (index, message["role"], message["content"])
+        for index, message in enumerate(messages)
+        if message.get("role") in {"system", "user", "assistant", "tool"}
+        and isinstance(message.get("content"), str)
+        and message["content"].strip()
+    ]
+    selected_indexes: set[int] = set()
+    first_system = next((item for item in usable if item[1] == "system"), None)
+    if first_system is not None:
+        selected_indexes.add(first_system[0])
+    latest_user = next((item for item in reversed(usable) if item[1] == "user"), None)
+    if latest_user is not None:
+        selected_indexes.add(latest_user[0])
+    recent_support = [
+        item for item in reversed(usable) if item[1] in {"assistant", "tool"}
+    ][:3]
+    selected_indexes.update(item[0] for item in recent_support)
+
+    repair_system = {
+        "role": "system",
+        "content": (
+            "Return one complete JSON object matching the requested assistant schema. "
+            "Do not include reasoning, markdown, or commentary."
+        ),
+    }
+    retry_instruction = {
+        "role": "user",
+        "content": _bounded_repair_content(
+            f"Repair the prior response: {reason}", MAX_REPAIR_MESSAGE_CHARS
+        ),
+    }
+    result = [repair_system]
+    remaining_chars = MAX_REPAIR_TOTAL_CHARS - sum(
+        len(item["content"]) for item in (repair_system, retry_instruction)
+    )
+    context_slots = MAX_REPAIR_MESSAGES - 2
+    for index, role, content in usable:
+        if index not in selected_indexes or context_slots <= 0 or remaining_chars <= 0:
+            continue
+        bounded = _bounded_repair_content(
+            content, min(MAX_REPAIR_MESSAGE_CHARS, remaining_chars)
+        )
+        if not bounded:
+            continue
+        result.append({"role": role, "content": bounded})
+        remaining_chars -= len(bounded)
+        context_slots -= 1
+    result.append(retry_instruction)
+    return result
+
+
 class OpsProviderClient:
     def __init__(
         self,
@@ -156,7 +224,10 @@ class OpsProviderClient:
         self.endpoint_resolver = endpoint_resolver or resolve_provider_endpoint
         self.http_client_factory = http_client_factory or httpx.Client
 
-    def _headers(self, provider: Provider, endpoint: PinnedProviderEndpoint) -> dict[str, str]:
+    @staticmethod
+    def _headers(
+        provider: Provider, endpoint: PinnedProviderEndpoint, api_key: str
+    ) -> dict[str, str]:
         forbidden = {
             "accept-encoding",
             "authorization",
@@ -174,7 +245,7 @@ class OpsProviderClient:
         headers.update(
             {
                 "Accept-Encoding": "identity",
-                "Authorization": f"Bearer {self.secret_box.decrypt(provider.encrypted_api_key)}",
+                "Authorization": f"Bearer {api_key}",
                 "Host": endpoint.host_header,
             }
         )
@@ -203,17 +274,21 @@ class OpsProviderClient:
         payload: dict[str, Any] | None = None,
         allow_response_format_fallback: bool = False,
     ) -> Any:
-        endpoint = self.endpoint_resolver(f"{provider.base_url.rstrip('/')}{path}")
-        headers = self._headers(provider, endpoint)
-        extensions = (
-            {"sni_hostname": endpoint.sni_hostname}
-            if endpoint.sni_hostname is not None
-            else {}
-        )
-        request_payload = payload
-        response_format_fallback_used = False
-        while True:
-            try:
+        try:
+            api_key = self.secret_box.decrypt(provider.encrypted_api_key)
+        except ValueError:
+            raise OpsProviderError("Provider credentials are unavailable") from None
+        try:
+            endpoint = self.endpoint_resolver(f"{provider.base_url.rstrip('/')}{path}")
+            headers = self._headers(provider, endpoint, api_key)
+            extensions = (
+                {"sni_hostname": endpoint.sni_hostname}
+                if endpoint.sni_hostname is not None
+                else {}
+            )
+            request_payload = payload
+            response_format_fallback_used = False
+            while True:
                 with self.http_client_factory(
                     timeout=provider.timeout_seconds,
                     follow_redirects=False,
@@ -228,40 +303,41 @@ class OpsProviderClient:
                     with client.stream(method, endpoint.url, **request_kwargs) as response:
                         body = self._read_response(response)
                         status_code = response.status_code
-            except OpsProviderError:
-                raise
-            except (httpx.HTTPError, OSError, ValueError) as exc:
-                raise OpsProviderError(
-                    f"Provider request failed: {_sanitize_error(exc)}"
-                ) from None
 
-            if 200 <= status_code < 300:
-                try:
-                    return json.loads(body)
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    raise OpsProviderError("Provider returned invalid JSON") from None
+                if 200 <= status_code < 300:
+                    try:
+                        return json.loads(body)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        raise OpsProviderError("Provider returned invalid JSON") from None
 
-            detail = _sanitize_error(
-                body.decode("utf-8", errors="replace"),
-                known_secret=self.secret_box.decrypt(provider.encrypted_api_key),
-            )
-            can_fallback = (
-                allow_response_format_fallback
-                and not response_format_fallback_used
-                and 400 <= status_code < 500
-                and "response_format" in detail.casefold()
-                and isinstance(request_payload, dict)
-                and "response_format" in request_payload
-            )
-            if can_fallback:
-                request_payload = {
-                    key: value
-                    for key, value in request_payload.items()
-                    if key != "response_format"
-                }
-                response_format_fallback_used = True
-                continue
-            raise OpsProviderError(f"Provider returned HTTP {status_code}: {detail}")
+                detail = _sanitize_error(
+                    body.decode("utf-8", errors="replace"), known_secret=api_key
+                )
+                can_fallback = (
+                    allow_response_format_fallback
+                    and not response_format_fallback_used
+                    and 400 <= status_code < 500
+                    and "response_format" in detail.casefold()
+                    and isinstance(request_payload, dict)
+                    and "response_format" in request_payload
+                )
+                if can_fallback:
+                    request_payload = {
+                        key: value
+                        for key, value in request_payload.items()
+                        if key != "response_format"
+                    }
+                    response_format_fallback_used = True
+                    continue
+                raise OpsProviderError(f"Provider returned HTTP {status_code}: {detail}")
+        except OpsProviderError as exc:
+            raise OpsProviderError(
+                _sanitize_error(exc.detail, known_secret=api_key)
+            ) from None
+        except Exception as exc:
+            # This is the Provider transport boundary; every surfaced error must be redacted.
+            detail = _sanitize_error(exc, known_secret=api_key)
+            raise OpsProviderError(f"Provider request failed: {detail}") from None
 
     @staticmethod
     def _chat_payload(
@@ -318,20 +394,7 @@ class OpsProviderClient:
         try:
             return self._parse_turn(response)
         except _IncompleteProviderResponse as initial_error:
-            repair_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Return one complete JSON object matching the requested assistant schema. "
-                        "Do not include reasoning, markdown, or commentary."
-                    ),
-                },
-                *messages,
-                {
-                    "role": "user",
-                    "content": f"Repair the prior response: {initial_error}",
-                },
-            ]
+            repair_messages = _compact_repair_messages(messages, str(initial_error))
             repair_payload = self._chat_payload(
                 provider, repair_messages, max_tokens=4096
             )
