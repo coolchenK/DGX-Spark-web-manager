@@ -343,11 +343,14 @@ class UnixSocketAgentServer:
         self._serve_lock = threading.Lock()
         self._socket_path: Path | None = None
         self._socket_identity: tuple[int, int] | None = None
+        self._parent_identity: tuple[int, int] | None = None
         if listener is None:
-            self._listener = self._bind(Path(socket_path))
+            (
+                self._listener,
+                self._parent_identity,
+                self._socket_identity,
+            ) = self._bind(Path(socket_path))
             self._socket_path = Path(socket_path)
-            metadata = self._socket_path.lstat()
-            self._socket_identity = (metadata.st_dev, metadata.st_ino)
         else:
             self._listener = listener
 
@@ -434,19 +437,16 @@ class UnixSocketAgentServer:
         try:
             self._listener.close()
         finally:
-            if self._socket_path is not None and self._socket_identity is not None:
-                try:
-                    self._validate_socket_parent(
-                        self._socket_path.parent,
-                        create=False,
-                    )
-                except ValueError:
-                    pass
-                else:
-                    self._unlink_if_same_socket(
-                        self._socket_path,
-                        self._socket_identity,
-                    )
+            if (
+                self._socket_path is not None
+                and self._socket_identity is not None
+                and self._parent_identity is not None
+            ):
+                self._unlink_if_same_socket(
+                    self._socket_path,
+                    self._socket_identity,
+                    parent_identity=self._parent_identity,
+                )
 
     @staticmethod
     def _socket_matches(path: Path, identity: tuple[int, int]) -> bool:
@@ -460,7 +460,17 @@ class UnixSocketAgentServer:
         ) == identity
 
     @staticmethod
-    def _unlink_if_same_socket(path: Path, identity: tuple[int, int]) -> bool:
+    def _unlink_if_same_socket(
+        path: Path,
+        identity: tuple[int, int],
+        *,
+        parent_identity: tuple[int, int] | None = None,
+    ) -> bool:
+        if parent_identity is not None and not UnixSocketAgentServer._path_chain_matches(
+            path,
+            parent_identity,
+        ):
+            return False
         if not UnixSocketAgentServer._socket_matches(path, identity):
             return False
         try:
@@ -474,7 +484,14 @@ class UnixSocketAgentServer:
         path: Path,
         identity: tuple[int, int],
         mode: int,
+        *,
+        parent_identity: tuple[int, int] | None = None,
     ) -> bool:
+        if parent_identity is not None and not UnixSocketAgentServer._path_chain_matches(
+            path,
+            parent_identity,
+        ):
+            return False
         if not UnixSocketAgentServer._socket_matches(path, identity):
             return False
         try:
@@ -492,13 +509,97 @@ class UnixSocketAgentServer:
         )
 
     @staticmethod
+    def _path_chain_metadata_is_secure(
+        chain: list[Any],
+        *,
+        expected_uid: int,
+    ) -> bool:
+        if not chain:
+            return False
+        trusted_owners = {0, expected_uid}
+        for metadata in chain:
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid not in trusted_owners
+            ):
+                return False
+
+        direct_parent = chain[-1]
+        if (
+            direct_parent.st_uid != expected_uid
+            or direct_parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            return False
+
+        for index, metadata in enumerate(chain[:-1]):
+            if not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                continue
+            if (
+                not metadata.st_mode & stat.S_ISVTX
+                or chain[index + 1].st_uid not in trusted_owners
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _validate_socket_path_chain(path: Path) -> tuple[int, int]:
+        if not path.is_absolute():
+            raise ValueError("invalid socket path chain")
+        parent = path.parent
+        if not _IS_POSIX:
+            UnixSocketAgentServer._validate_socket_parent(parent, create=False)
+            metadata = parent.lstat()
+            return metadata.st_dev, metadata.st_ino
+
+        root = Path(parent.anchor)
+        current = root
+        chain: list[Any] = []
+        try:
+            for index, component in enumerate(parent.parts):
+                if index > 0:
+                    current = current / component
+                metadata = current.lstat()
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ValueError("invalid socket path chain")
+                chain.append(metadata)
+        except OSError:
+            raise ValueError("invalid socket path chain") from None
+
+        if not UnixSocketAgentServer._path_chain_metadata_is_secure(
+            chain,
+            expected_uid=_effective_uid(),
+        ):
+            raise ValueError("invalid socket path chain")
+        direct_parent = chain[-1]
+        return direct_parent.st_dev, direct_parent.st_ino
+
+    @staticmethod
+    def _path_chain_matches(path: Path, identity: tuple[int, int]) -> bool:
+        try:
+            return UnixSocketAgentServer._validate_socket_path_chain(path) == identity
+        except ValueError:
+            return False
+
+    @staticmethod
     def _validate_socket_parent(parent: Path, *, create: bool) -> None:
         try:
             created = not os.path.lexists(parent)
             if created:
                 if not create:
                     raise ValueError("invalid socket parent")
-                parent.mkdir(parents=True, mode=0o700)
+                ancestor = parent.parent
+                if not os.path.lexists(ancestor):
+                    raise ValueError("invalid socket path chain")
+                if _IS_POSIX:
+                    UnixSocketAgentServer._validate_socket_path_chain(
+                        ancestor / ".dgx-ops-parent-check"
+                    )
+                else:
+                    UnixSocketAgentServer._validate_socket_parent(
+                        ancestor,
+                        create=False,
+                    )
+                parent.mkdir(parents=False, mode=0o700)
                 before = parent.lstat()
                 if not stat.S_ISDIR(before.st_mode):
                     raise ValueError("invalid socket parent")
@@ -517,16 +618,17 @@ class UnixSocketAgentServer:
                 expected_uid=expected_uid,
             ):
                 raise ValueError("invalid socket parent")
-            if _IS_POSIX and parent.resolve(strict=True) != parent:
-                raise ValueError("invalid socket parent")
         except (OSError, RuntimeError):
             raise ValueError("invalid socket parent") from None
 
     @staticmethod
-    def _bind(path: Path) -> socket.socket:
+    def _bind(
+        path: Path,
+    ) -> tuple[socket.socket, tuple[int, int], tuple[int, int]]:
         if not path.is_absolute():
             raise ValueError("socket_path must be absolute")
         UnixSocketAgentServer._validate_socket_parent(path.parent, create=True)
+        parent_identity = UnixSocketAgentServer._validate_socket_path_chain(path)
         if os.path.lexists(path):
             metadata = path.lstat()
             if not stat.S_ISSOCK(metadata.st_mode):
@@ -548,6 +650,7 @@ class UnixSocketAgentServer:
             if not UnixSocketAgentServer._unlink_if_same_socket(
                 path,
                 stale_identity,
+                parent_identity=parent_identity,
             ):
                 raise ValueError("socket_path changed while being verified")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -562,6 +665,7 @@ class UnixSocketAgentServer:
                 path,
                 bound_identity,
                 0o660,
+                parent_identity=parent_identity,
             ):
                 raise ValueError("socket_path changed while binding")
             listener.listen(16)
@@ -570,9 +674,13 @@ class UnixSocketAgentServer:
         except Exception:
             listener.close()
             if bound_identity is not None:
-                UnixSocketAgentServer._unlink_if_same_socket(path, bound_identity)
+                UnixSocketAgentServer._unlink_if_same_socket(
+                    path,
+                    bound_identity,
+                    parent_identity=parent_identity,
+                )
             raise
-        return listener
+        return listener, parent_identity, bound_identity
 
 
 def main(argv: list[str] | None = None) -> int:

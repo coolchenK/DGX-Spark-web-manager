@@ -1175,6 +1175,77 @@ def test_unix_socket_parent_metadata_policy(mode, uid, expected):
     )
 
 
+def _directory_metadata(mode, uid, *, device=1, inode=1):
+    return SimpleNamespace(
+        st_mode=stat.S_IFDIR | mode,
+        st_uid=uid,
+        st_dev=device,
+        st_ino=inode,
+    )
+
+
+@pytest.mark.parametrize(
+    ("chain", "expected"),
+    [
+        (
+            [
+                _directory_metadata(0o755, 0),
+                _directory_metadata(0o755, 0),
+                _directory_metadata(0o700, 1000),
+            ],
+            True,
+        ),
+        (
+            [
+                _directory_metadata(0o755, 0),
+                _directory_metadata(0o777, 0),
+                _directory_metadata(0o700, 1000),
+            ],
+            False,
+        ),
+        (
+            [
+                _directory_metadata(0o755, 0),
+                SimpleNamespace(
+                    st_mode=stat.S_IFLNK | 0o777,
+                    st_uid=0,
+                    st_dev=1,
+                    st_ino=2,
+                ),
+                _directory_metadata(0o700, 1000),
+            ],
+            False,
+        ),
+        (
+            [
+                _directory_metadata(0o755, 0),
+                _directory_metadata(0o1777, 0),
+                _directory_metadata(0o700, 1000),
+                _directory_metadata(0o700, 1000),
+            ],
+            True,
+        ),
+        (
+            [
+                _directory_metadata(0o755, 0),
+                _directory_metadata(0o1777, 0),
+                _directory_metadata(0o700, 2000),
+                _directory_metadata(0o700, 1000),
+            ],
+            False,
+        ),
+    ],
+)
+def test_unix_socket_full_ancestor_chain_policy(chain, expected):
+    assert (
+        UnixSocketAgentServer._path_chain_metadata_is_secure(
+            chain,
+            expected_uid=1000,
+        )
+        is expected
+    )
+
+
 @pytest.mark.parametrize("replacement_type", [stat.S_IFREG, stat.S_IFLNK])
 def test_unix_socket_chmod_refuses_replacement_paths(
     tmp_path, monkeypatch, replacement_type
@@ -1191,11 +1262,80 @@ def test_unix_socket_chmod_refuses_replacement_paths(
         "chmod",
         lambda *_args, **_kwargs: pytest.fail("replacement must not be chmodded"),
     )
-
     assert (
         UnixSocketAgentServer._chmod_if_same_socket(path, (10, 22), 0o660)
         is False
     )
+
+
+def test_unix_socket_operations_fail_closed_after_ancestor_replacement(
+    tmp_path, monkeypatch
+):
+    class SocketMetadata:
+        st_mode = stat.S_IFSOCK | 0o660
+        st_dev = 10
+        st_ino = 22
+
+    path = tmp_path / "ancestor-race" / "ops.sock"
+    changed_parent_identity = (30, 41)
+    monkeypatch.setattr(Path, "lstat", lambda self: SocketMetadata())
+    monkeypatch.setattr(
+        UnixSocketAgentServer,
+        "_validate_socket_path_chain",
+        lambda _path: changed_parent_identity,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server_module.os,
+        "chmod",
+        lambda *_args, **_kwargs: pytest.fail("changed chain must not be chmodded"),
+    )
+    monkeypatch.setattr(
+        Path,
+        "unlink",
+        lambda self: pytest.fail("changed chain must not be unlinked"),
+    )
+
+    assert (
+        UnixSocketAgentServer._chmod_if_same_socket(
+            path,
+            (10, 22),
+            0o660,
+            parent_identity=(30, 40),
+        )
+        is False
+    )
+    assert (
+        UnixSocketAgentServer._unlink_if_same_socket(
+            path,
+            (10, 22),
+            parent_identity=(30, 40),
+        )
+        is False
+    )
+
+
+def test_unix_socket_validates_existing_chain_before_creating_parent(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "linked-ancestor" / "new-parent"
+    monkeypatch.setattr(server_module.os.path, "lexists", lambda _path: False)
+    monkeypatch.setattr(server_module, "_IS_POSIX", True)
+    monkeypatch.setattr(
+        UnixSocketAgentServer,
+        "_validate_socket_path_chain",
+        lambda _path: (_ for _ in ()).throw(ValueError("invalid socket path chain")),
+    )
+    monkeypatch.setattr(
+        Path,
+        "mkdir",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unsafe ancestor must be rejected before mkdir"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="socket path"):
+        UnixSocketAgentServer._validate_socket_parent(parent, create=True)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory modes only")
@@ -1215,6 +1355,24 @@ def test_unix_socket_server_rejects_unsafe_parent_without_modifying_target(tmp_p
     assert stat.S_IMODE(unsafe_parent.stat().st_mode) == 0o777
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory modes only")
+def test_unix_socket_server_rejects_safe_parent_below_writable_ancestor(tmp_path):
+    writable_ancestor = tmp_path / "shared"
+    writable_ancestor.mkdir(mode=0o777)
+    writable_ancestor.chmod(0o777)
+    safe_parent = writable_ancestor / "secure"
+    safe_parent.mkdir(mode=0o700)
+    socket_path = safe_parent / "ops.sock"
+
+    with pytest.raises(ValueError, match="socket path"):
+        UnixSocketAgentServer(
+            AgentServer(SECRET, _FakeRunner()),
+            socket_path=socket_path,
+        )
+
+    assert not socket_path.exists()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX symlink behavior only")
 def test_unix_socket_server_rejects_symlink_parent_without_touching_target(tmp_path):
     real_parent = tmp_path / "real"
@@ -1229,6 +1387,24 @@ def test_unix_socket_server_rejects_symlink_parent_without_touching_target(tmp_p
         )
 
     assert list(real_parent.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink behavior only")
+def test_unix_socket_server_rejects_intermediate_symlink(tmp_path):
+    real_ancestor = tmp_path / "real-ancestor"
+    real_ancestor.mkdir(mode=0o700)
+    safe_parent = real_ancestor / "secure"
+    safe_parent.mkdir(mode=0o700)
+    linked_ancestor = tmp_path / "linked-ancestor"
+    linked_ancestor.symlink_to(real_ancestor, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="socket path"):
+        UnixSocketAgentServer(
+            AgentServer(SECRET, _FakeRunner()),
+            socket_path=linked_ancestor / "secure" / "ops.sock",
+        )
+
+    assert list(safe_parent.iterdir()) == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX inode ownership only")
