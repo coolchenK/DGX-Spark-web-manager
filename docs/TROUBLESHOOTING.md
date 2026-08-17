@@ -29,9 +29,10 @@ curl -fsS http://127.0.0.1:3000/api/health
 curl -fsS -b ./admin.cookies http://127.0.0.1:3000/api/ops-agent/health
 ```
 
-The second response is intentionally limited to a safe status and protocol version. A normal shell
-request without an approved Operation Plan returns `approval_required`; this is policy enforcement,
-not an Agent outage.
+The second response is intentionally limited to a safe schema: `ok` includes `protocol_version`,
+while `unavailable` and `error` include a fixed redacted `detail`. A normal shell request without an
+approved Operation Plan returns `approval_required`; this is policy enforcement, not an Agent
+outage.
 
 Check socket activation and bounded service logs on the host:
 
@@ -40,7 +41,6 @@ sudo systemctl status dgx-spark-ops-agent.socket dgx-spark-ops-agent.service --n
 sudo journalctl -u dgx-spark-ops-agent.socket -u dgx-spark-ops-agent.service -n 200 --no-pager
 sudo stat -c '%U:%G %a %n' \
   /run/dgx-spark-manager/ops-agent.sock \
-  /etc/dgx-spark-manager/ops-agent.key \
   /var/lib/dgx-spark-ops-agent/jobs
 ```
 
@@ -69,13 +69,41 @@ docker compose exec manager id
 docker compose exec manager stat -c '%g %a %n' /run/dgx-spark-manager/ops-agent.sock
 ```
 
-If the values differ, use the main installer. Its preview is read-only; apply resolves the numeric
-host GID and atomically upserts `OPS_AGENT_GID` without printing or replacing existing secret
-values, then recreates the manager with the correct supplementary group:
+If the values differ, atomically upsert only `OPS_AGENT_GID`. This snippet rejects a missing or
+non-numeric group result, keeps every non-target `.env` line in order, writes the temporary file in
+the same directory, preserves the existing mode, and does not print `.env` contents:
 
 ```bash
-./scripts/install.sh
-./scripts/install.sh --apply
+set -eu
+[ -f .env ] && [ ! -L .env ] || { printf '%s\n' '.env must be a regular file' >&2; exit 1; }
+ops_gid="$(getent group dgx-spark-ops | cut -d: -f3)"
+case "$ops_gid" in
+  ''|*[!0-9]*) printf '%s\n' 'dgx-spark-ops GID is not numeric' >&2; exit 1 ;;
+esac
+umask 077
+tmp="$(mktemp ./.env.ops-agent.XXXXXX)"
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+{
+  found=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      OPS_AGENT_GID=*)
+        if [ "$found" -eq 0 ]; then
+          printf 'OPS_AGENT_GID=%s\n' "$ops_gid"
+          found=1
+        fi
+        ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < .env
+  if [ "$found" -eq 0 ]; then
+    printf 'OPS_AGENT_GID=%s\n' "$ops_gid"
+  fi
+} > "$tmp"
+chmod --reference=.env -- "$tmp"
+mv -f -- "$tmp" .env
+trap - EXIT HUP INT TERM
+docker compose up -d --force-recreate manager
 ```
 
 If the group and GID match but the socket mode or owner does not, do not loosen its permissions.
@@ -89,26 +117,11 @@ sudo systemctl restart dgx-spark-ops-agent.service
 
 ### Key mismatch or invalid signed response
 
-Do not inspect the key with `cat`, shell tracing, or an environment variable. Verify metadata only:
-
-```bash
-sudo stat -c '%U:%G %a %s %n' /etc/dgx-spark-manager/ops-agent.key
-docker compose exec manager stat -c '%G %a %s %n' /run/secrets/ops-agent.key
-```
-
-The host key must be a regular, non-symlink file owned by `root:dgx-spark-ops` with mode `0640`.
-
-If only its owner or mode is wrong, repair that metadata exactly before reapplying the installer:
-
-```bash
-sudo chown root:dgx-spark-ops /etc/dgx-spark-manager/ops-agent.key
-sudo chmod 0640 /etc/dgx-spark-manager/ops-agent.key
-sudo ./scripts/install-ops-agent.sh --apply
-```
-
-If the host key is valid but the container has a stale file mount or the manager cached an earlier
-key, reapplying the installer is idempotent and preserves the key and existing jobs. Recreate the
-manager so its bind mount and client both read the current key inode:
+Do not inspect or modify the key with `cat`, `stat`, `chown`, `chmod`, shell tracing, environment
+variables, or ad hoc replacement files. Run the installer, which validates the exact path chain,
+regular-file type, absence of symlinks, owner, group, mode, size, and content before using the key.
+If it succeeds, its signed probe proves the host Agent and key agree. Recreate the manager to clear
+a stale bind mount or cached key:
 
 ```bash
 sudo ./scripts/install-ops-agent.sh --apply
@@ -116,12 +129,11 @@ docker compose up -d --force-recreate manager
 curl -fsS -b ./admin.cookies http://127.0.0.1:3000/api/ops-agent/health
 ```
 
-The installer performs its own signed `agent.health` probe before it succeeds, independently of the
-manager container.
-
-If the installer reports invalid key content, it fails closed and does not overwrite that file.
-Before rotating it, confirm there are no active Agent jobs, accept a brief Agent outage, and create a
-current manager database and `.env` backup:
+If any key path, type, symlink, owner, group, mode, size, or content check fails, the installer fails
+closed and does not repair or overwrite the key. Do not change the key inode manually. Before
+rotating it, confirm there are no active Agent jobs, accept a brief Agent outage, and create a
+current manager database and `.env` backup. Then use the confirmation-gated purge contract,
+reinstall, and recreate the manager:
 
 ```bash
 ./scripts/backup.sh
@@ -134,7 +146,9 @@ curl -fsS -b ./admin.cookies http://127.0.0.1:3000/api/ops-agent/health
 
 This uninstaller contract removes the Agent package and units as well as the invalid key, but
 preserves the job directory because `--purge-jobs` was not supplied. Reinstallation generates a new
-key, and manager recreation is required before authenticated Agent requests can resume.
+key, and manager recreation is required before authenticated Agent requests can resume. The
+uninstaller also fails closed if the key path itself is unsafe; if it refuses the purge, stop rather
+than bypassing its path checks with manual file operations.
 
 ### Agent jobs, timeouts, and restart recovery
 
