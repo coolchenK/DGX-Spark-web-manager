@@ -1191,7 +1191,7 @@ def test_runtime_orchestrator_task_handler_validates_payload_and_returns_result(
         "message_id": result["message_id"],
         "plan_id": None,
     }
-    assert context.control_checks == 3
+    assert context.control_checks >= 3
     with pytest.raises(ValueError, match="payload"):
         orchestrator.handler(context, {"session_id": session_id, "prompt": "again"})
 
@@ -1472,13 +1472,11 @@ def test_runtime_orchestrator_finishes_running_tool_when_cancelled_before_call(t
     database, orchestrator, _provider, tools, session_id, *_ = runtime
 
     class Context:
-        def __init__(self):
-            self.calls = 0
-
         def check_control(self):
-            self.calls += 1
-            if self.calls == 3:
-                raise TaskCancelled()
+            with database.session_factory() as db:
+                tool_run = db.scalar(select(OpsToolRun))
+                if tool_run is not None and tool_run.status == "running":
+                    raise TaskCancelled()
 
     with pytest.raises(TaskCancelled):
         orchestrator.handler(
@@ -1493,3 +1491,417 @@ def test_runtime_orchestrator_finishes_running_tool_when_cancelled_before_call(t
         assert tool_run.started_at is not None
         assert tool_run.finished_at is not None
         assert db.get(OpsSession, session_id).status == "active"
+
+
+def test_ops_secret_sanitizer_preserves_marker_semantics(tmp_path):
+    from app.security import SecretBox
+    from app.services.ops_secrets import load_known_secrets
+
+    database = _database(tmp_path / "shared-secrets.db")
+    database.create_schema()
+    secret_box = SecretBox("test-secret-key-with-at-least-32-characters")
+    with database.session_factory() as db:
+        db.add_all(
+            [
+                Provider(
+                    name="short-boundary",
+                    base_url="https://short.example/v1",
+                    default_model="model",
+                    encrypted_api_key=secret_box.encrypt("RED"),
+                ),
+                Provider(
+                    name="marker",
+                    base_url="https://marker.example/v1",
+                    default_model="model",
+                    encrypted_api_key=secret_box.encrypt("abc[REDACTED]xyz"),
+                ),
+            ]
+        )
+        db.commit()
+
+    secrets = load_known_secrets(database.session_factory, secret_box)
+
+    assert secrets.contains("before abc[REDACTED]xyz after")
+    assert not secrets.contains("before [REDACTED] after")
+    assert secrets.redact("RED [REDACTED] RED") == "[REDACTED] [REDACTED] [REDACTED]"
+    assert secrets.redact("before abc[REDACTED]xyz after") == "before [REDACTED] after"
+
+
+def test_runtime_orchestrator_enforces_wall_clock_deadline_during_provider(tmp_path):
+    import time
+
+    from app.services.ops_provider import AssistantTurn
+
+    runtime = _ops_runtime(tmp_path, [])
+    database, orchestrator, _provider, _tools, session_id, *_ = runtime
+
+    class SlowProvider:
+        def complete(self, provider, messages, **kwargs):
+            time.sleep(0.25)
+            return AssistantTurn(action="answer", summary="late answer")
+
+    orchestrator.provider_client = SlowProvider()
+    orchestrator.max_total_seconds = 0.04
+    started = time.monotonic()
+    result = orchestrator.respond(session_id=session_id, prompt="inspect", actor="admin")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.12
+    assert result.status == "failed"
+    time.sleep(0.25)
+    with database.session_factory() as db:
+        session = db.get(OpsSession, session_id)
+        assert session.status == "failed"
+        assert all(message.content != "late answer" for message in session.messages)
+
+
+def test_runtime_orchestrator_enforces_wall_clock_deadline_during_tool(tmp_path):
+    import time
+
+    from app.services.ops_provider import AssistantTurn
+    from app.services.ops_tools import ToolResult
+
+    runtime = _ops_runtime(
+        tmp_path,
+        [
+            AssistantTurn(
+                action="tool",
+                summary="Inspect",
+                tool={"name": "host.memory", "arguments": {}},
+            )
+        ],
+    )
+    database, orchestrator, _provider, _tools, session_id, *_ = runtime
+
+    class SlowTools:
+        def execute(self, request, **kwargs):
+            time.sleep(0.25)
+            return ToolResult(
+                name="host.memory", status="succeeded", output={"late": True}
+            )
+
+    orchestrator.tools = SlowTools()
+    orchestrator.max_total_seconds = 0.04
+    started = time.monotonic()
+    result = orchestrator.respond(session_id=session_id, prompt="inspect", actor="admin")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.12
+    assert result.status == "failed"
+    time.sleep(0.25)
+    with database.session_factory() as db:
+        session = db.get(OpsSession, session_id)
+        tool_run = db.scalar(select(OpsToolRun))
+        assert session.status == "failed"
+        assert tool_run.status == "failed"
+        assert tool_run.finished_at is not None
+        assert tool_run.result_json.get("output") != {"late": True}
+
+
+def test_runtime_orchestrator_cancels_while_provider_is_blocked(tmp_path):
+    import threading
+    import time
+
+    from app.services.ops_provider import AssistantTurn
+    from app.tasks.engine import TaskCancelled
+
+    runtime = _ops_runtime(tmp_path, [])
+    database, orchestrator, _provider, _tools, session_id, *_ = runtime
+    cancelled = threading.Event()
+
+    class SlowProvider:
+        def complete(self, provider, messages, **kwargs):
+            time.sleep(0.25)
+            return AssistantTurn(action="answer", summary="late answer")
+
+    class Context:
+        task_id = "provider-cancel-task"
+
+        def check_control(self):
+            if cancelled.is_set():
+                raise TaskCancelled()
+
+    orchestrator.provider_client = SlowProvider()
+    timer = threading.Timer(0.03, cancelled.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TaskCancelled):
+            orchestrator.handler(
+                Context(),
+                {"session_id": session_id, "prompt": "inspect", "actor": "admin"},
+            )
+    finally:
+        timer.cancel()
+    assert time.monotonic() - started < 0.12
+    time.sleep(0.25)
+    with database.session_factory() as db:
+        session = db.get(OpsSession, session_id)
+        assert session.status == "active"
+        assert all(message.content != "late answer" for message in session.messages)
+        assert db.scalars(select(AuditEvent).where(AuditEvent.action == "ops.limit")).all() == []
+
+
+def test_runtime_orchestrator_cancellation_beats_late_large_tool_output(tmp_path):
+    import threading
+    import time
+
+    from app.services.ops_provider import AssistantTurn
+    from app.services.ops_tools import ToolResult
+    from app.tasks.engine import TaskCancelled
+
+    runtime = _ops_runtime(
+        tmp_path,
+        [
+            AssistantTurn(
+                action="tool",
+                summary="Inspect",
+                tool={"name": "host.memory", "arguments": {}},
+            )
+        ],
+    )
+    database, orchestrator, _provider, _tools, session_id, *_ = runtime
+    cancelled = threading.Event()
+    entered = threading.Event()
+    cancelled_at = []
+
+    class SlowTools:
+        def execute(self, request, **kwargs):
+            entered.set()
+            time.sleep(0.25)
+            return ToolResult(
+                name="host.memory",
+                status="succeeded",
+                output={"data": "x" * 200_000},
+            )
+
+    class Context:
+        task_id = "tool-cancel-task"
+
+        def check_control(self):
+            if cancelled.is_set():
+                raise TaskCancelled()
+
+    orchestrator.tools = SlowTools()
+
+    def cancel_after_tool_starts():
+        assert entered.wait(timeout=1)
+        time.sleep(0.03)
+        cancelled_at.append(time.monotonic())
+        cancelled.set()
+
+    canceller = threading.Thread(target=cancel_after_tool_starts)
+    canceller.start()
+    try:
+        with pytest.raises(TaskCancelled):
+            orchestrator.handler(
+                Context(),
+                {"session_id": session_id, "prompt": "inspect", "actor": "admin"},
+            )
+    finally:
+        canceller.join(timeout=1)
+    assert time.monotonic() - cancelled_at[0] < 0.12
+    time.sleep(0.25)
+    with database.session_factory() as db:
+        tool_run = db.scalar(select(OpsToolRun))
+        assert db.get(OpsSession, session_id).status == "active"
+        assert tool_run.status == "failed"
+        assert "x" * 100 not in str(tool_run.result_json)
+        assert db.scalars(select(AuditEvent).where(AuditEvent.action == "ops.limit")).all() == []
+
+
+def test_recover_interrupted_finishes_tools_only_for_processing_sessions(tmp_path):
+    from app.services.ops_provider import AssistantTurn
+
+    runtime = _ops_runtime(
+        tmp_path,
+        [AssistantTurn(action="answer", summary="unused")],
+    )
+    database, orchestrator, _provider, _tools, processing_id, *_ = runtime
+    with database.session_factory() as db:
+        active = OpsSession(title="Active", status="active", requested_by="admin")
+        db.add(active)
+        db.flush()
+        processing_tool = OpsToolRun(
+            session_id=processing_id,
+            tool_name="host.memory",
+            status="running",
+            started_at=datetime.now(UTC),
+        )
+        active_tool = OpsToolRun(
+            session_id=active.id,
+            tool_name="host.disk",
+            status="running",
+            started_at=datetime.now(UTC),
+        )
+        db.add_all([processing_tool, active_tool])
+        db.get(OpsSession, processing_id).status = "processing"
+        db.commit()
+        processing_tool_id, active_tool_id = processing_tool.id, active_tool.id
+
+    assert orchestrator.recover_interrupted() == 1
+
+    with database.session_factory() as db:
+        recovered = db.get(OpsToolRun, processing_tool_id)
+        unaffected = db.get(OpsToolRun, active_tool_id)
+        assert recovered.status == "failed"
+        assert recovered.finished_at is not None
+        assert recovered.error == "Interrupted by manager restart"
+        assert "output" not in recovered.result_json
+        assert unaffected.status == "running"
+        assert unaffected.finished_at is None
+
+
+def test_task_retry_does_not_duplicate_user_prompt(tmp_path):
+    from app.services.ops_provider import AssistantTurn
+
+    runtime = _ops_runtime(tmp_path, [RuntimeError("crash")])
+    database, orchestrator, provider, _tools, session_id, *_ = runtime
+
+    class Context:
+        task_id = "retry-task"
+
+        def check_control(self):
+            return None
+
+    with pytest.raises(RuntimeError):
+        orchestrator.handler(
+            Context(),
+            {"session_id": session_id, "prompt": "inspect", "actor": "admin"},
+        )
+    provider.turns = [AssistantTurn(action="answer", summary="Recovered")]
+    result = orchestrator.handler(
+        Context(),
+        {"session_id": session_id, "prompt": "inspect", "actor": "admin"},
+    )
+
+    assert result["status"] == "answered"
+    with database.session_factory() as db:
+        user_messages = list(
+            db.scalars(
+                select(OpsMessage).where(
+                    OpsMessage.session_id == session_id,
+                    OpsMessage.role == "user",
+                )
+            )
+        )
+        assert len(user_messages) == 1
+        assert user_messages[0].metadata_json["request_id"] == "retry-task"
+
+
+def test_new_task_with_same_prompt_appends_new_user_message(tmp_path):
+    from app.services.ops_provider import AssistantTurn
+
+    runtime = _ops_runtime(
+        tmp_path,
+        [
+            AssistantTurn(action="answer", summary="First"),
+            AssistantTurn(action="answer", summary="Second"),
+        ],
+    )
+    database, orchestrator, _provider, _tools, session_id, *_ = runtime
+
+    class Context:
+        def __init__(self, task_id):
+            self.task_id = task_id
+
+        def check_control(self):
+            return None
+
+    payload = {"session_id": session_id, "prompt": "inspect", "actor": "admin"}
+    orchestrator.handler(Context("task-1"), payload)
+    orchestrator.handler(Context("task-2"), payload)
+
+    with database.session_factory() as db:
+        request_ids = list(
+            db.scalars(
+                select(OpsMessage.metadata_json).where(
+                    OpsMessage.session_id == session_id,
+                    OpsMessage.role == "user",
+                )
+            )
+        )
+        assert [metadata["request_id"] for metadata in request_ids] == ["task-1", "task-2"]
+
+
+def test_recovered_task_does_not_duplicate_failed_tool_intent(tmp_path):
+    from app.services.ops_provider import AssistantTurn
+
+    turn = AssistantTurn(
+        action="tool",
+        summary="Inspect memory",
+        tool={"name": "host.memory", "arguments": {}},
+    )
+    runtime = _ops_runtime(tmp_path, [turn])
+    database, orchestrator, _provider, tools, session_id, *_ = runtime
+    request_id = "recovered-tool-task"
+    fingerprint = orchestrator._tool_fingerprint(turn)
+    with database.session_factory() as db:
+        session = db.get(OpsSession, session_id)
+        session.status = "processing"
+        db.add_all(
+            [
+                OpsMessage(
+                    session_id=session_id,
+                    role="user",
+                    content="inspect",
+                    metadata_json={"actor": "admin", "request_id": request_id},
+                ),
+                OpsMessage(
+                    session_id=session_id,
+                    role="assistant",
+                    content="Inspect memory",
+                    metadata_json={
+                        "action": "tool",
+                        "tool_name": "host.memory",
+                        "argument_keys": [],
+                        "request_id": request_id,
+                        "tool_fingerprint": fingerprint,
+                    },
+                ),
+                OpsToolRun(
+                    session_id=session_id,
+                    tool_name="host.memory",
+                    status="running",
+                    arguments_json={},
+                    result_json={
+                        "_request_id": request_id,
+                        "_tool_fingerprint": fingerprint,
+                    },
+                    started_at=datetime.now(UTC),
+                ),
+            ]
+        )
+        db.commit()
+
+    assert orchestrator.recover_interrupted() == 1
+
+    class Context:
+        task_id = request_id
+
+        def check_control(self):
+            return None
+
+    result = orchestrator.handler(
+        Context(),
+        {"session_id": session_id, "prompt": "inspect", "actor": "admin"},
+    )
+
+    assert result["status"] == "failed"
+    assert tools.calls == []
+    with database.session_factory() as db:
+        intents = list(
+            db.scalars(
+                select(OpsMessage).where(
+                    OpsMessage.session_id == session_id,
+                    OpsMessage.role == "assistant",
+                )
+            )
+        )
+        tool_intents = [
+            message
+            for message in intents
+            if (message.metadata_json or {}).get("action") == "tool"
+        ]
+        assert len(tool_intents) == 1
+        assert len(db.scalars(select(OpsToolRun)).all()) == 1

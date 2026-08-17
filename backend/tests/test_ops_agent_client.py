@@ -171,6 +171,26 @@ def test_client_signs_request_and_verifies_health_response(tmp_path):
     assert len(server.last_request["signature"]) == 64
 
 
+def test_call_override_enforces_one_short_agent_deadline(tmp_path):
+    secret = b"d" * 32
+    key_path = tmp_path / "agent.key"
+    key_path.write_bytes(secret)
+
+    with _server(
+        tmp_path,
+        lambda request: encode_frame(_response(request, secret, result={"ok": True})),
+        response_delay=0.25,
+    ) as server:
+        started = time.monotonic()
+        with pytest.raises(OpsAgentUnavailable):
+            _client(server.socket_path, key_path).call(
+                "host.memory", {}, timeout_seconds=0.04
+            )
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.12
+
+
 @pytest.mark.parametrize(
     "key_bytes,secret",
     [

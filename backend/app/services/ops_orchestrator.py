@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import json
-import re
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -20,10 +20,11 @@ from app.models import (
     OpsSession,
     OpsToolRun,
     Provider,
-    SecretSetting,
+    new_id,
 )
 from app.security import SecretBox
 from app.services.ops_provider import AssistantTurn, ChangeStep, OpsProviderClient
+from app.services.ops_secrets import KnownSecrets, load_known_secrets
 from app.services.ops_tools import OpsToolRegistry
 from app.services.provider_errors import OpsProviderError
 from app.tasks.engine import TaskCancelled, TaskContext, TaskPaused
@@ -31,12 +32,7 @@ from app.tasks.engine import TaskCancelled, TaskContext, TaskPaused
 MAX_HISTORY_MESSAGES = 100
 MAX_HISTORY_CHARS = 100_000
 MAX_PROMPT_CHARS = 10_000
-MIN_EMBEDDED_SECRET_CHARS = 3
 _PROCESSABLE_STATUSES = ("active", "answered", "needs_input", "failed")
-_SENSITIVE_HEADER = re.compile(
-    r"(?:auth|authorization|api[-_]?key|token|password|secret|credential|cookie)",
-    re.IGNORECASE,
-)
 _SYSTEM_PROMPT = (
     "You are the DGX Spark operations assistant. Return exactly one structured action. "
     "Use only the supplied read-only tools for automatic inspection. Any change, including "
@@ -65,48 +61,61 @@ class OpsSessionConflict(ValueError):
     pass
 
 
-class _KnownSecrets:
-    def __init__(self, values: set[str], *, unsafe_short: bool) -> None:
-        self.values = tuple(sorted(values, key=lambda value: (-len(value), value)))
-        self.unsafe_short = unsafe_short
+class OpsDeadlineExceeded(TimeoutError):
+    pass
 
-    def contains(self, value: Any) -> bool:
-        serialized = (
-            value
-            if isinstance(value, str)
-            else json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        )
-        for secret in self.values:
-            if serialized == secret:
-                return True
-            if len(secret) >= 8 and secret in serialized:
-                return True
-            if MIN_EMBEDDED_SECRET_CHARS <= len(secret) < 8:
-                pattern = rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])"
-                if re.search(pattern, serialized):
-                    return True
-        return False
 
-    def redact(self, value: Any) -> Any:
-        if isinstance(value, str):
-            result = value
-            for secret in self.values:
-                if result == secret:
-                    result = "[REDACTED]"
-                elif len(secret) >= 8:
-                    result = result.replace(secret, "[REDACTED]")
-                elif len(secret) >= MIN_EMBEDDED_SECRET_CHARS:
-                    result = re.sub(
-                        rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])",
-                        "[REDACTED]",
-                        result,
-                    )
-            return result
-        if isinstance(value, Mapping):
-            return {str(key): self.redact(item) for key, item in value.items()}
-        if isinstance(value, list | tuple):
-            return [self.redact(item) for item in value]
-        return value
+class _CallState:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: Any = None
+        self.error: BaseException | None = None
+
+
+class _BoundedCallRunner:
+    def __init__(self, *, max_workers: int = 4, poll_seconds: float = 0.02) -> None:
+        self._capacity = threading.BoundedSemaphore(max_workers)
+        self._poll_seconds = poll_seconds
+
+    def run(
+        self,
+        call: Callable[[], Any],
+        *,
+        deadline: float,
+        monotonic: Callable[[], float],
+        check_control: Callable[[], None],
+    ) -> Any:
+        while not self._capacity.acquire(blocking=False):
+            check_control()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise OpsDeadlineExceeded()
+            threading.Event().wait(min(self._poll_seconds, remaining))
+
+        state = _CallState()
+
+        def worker() -> None:
+            try:
+                state.result = call()
+            except BaseException as exc:
+                state.error = exc
+            finally:
+                state.done.set()
+                self._capacity.release()
+
+        threading.Thread(target=worker, name="ops-bounded-call", daemon=True).start()
+        while True:
+            check_control()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise OpsDeadlineExceeded()
+            if state.done.wait(min(self._poll_seconds, remaining)):
+                check_control()
+                if deadline - monotonic() <= 0:
+                    raise OpsDeadlineExceeded()
+                if state.error is not None:
+                    raise state.error
+                return state.result
 
 
 class OpsOrchestrator:
@@ -122,6 +131,7 @@ class OpsOrchestrator:
         max_tool_result_chars: int = 30_000,
         max_total_tool_chars: int = 120_000,
         monotonic: Callable[[], float] = time.monotonic,
+        call_runner: _BoundedCallRunner | None = None,
     ) -> None:
         if max_tool_turns < 0 or max_total_seconds <= 0:
             raise ValueError("orchestrator limits must be positive")
@@ -134,6 +144,7 @@ class OpsOrchestrator:
         self.max_tool_result_chars = max_tool_result_chars
         self.max_total_tool_chars = max_total_tool_chars
         self.monotonic = monotonic
+        self._call_runner = call_runner or _BoundedCallRunner()
         self._locks_guard = threading.Lock()
         self._session_locks: dict[str, threading.Lock] = {}
 
@@ -144,6 +155,7 @@ class OpsOrchestrator:
         prompt: str,
         actor: str,
         check_control: Callable[[], None] | None = None,
+        request_id: str | None = None,
     ) -> OpsResponseResult:
         self._validate_identifier(session_id, "session_id")
         self._validate_identifier(actor, "actor")
@@ -152,6 +164,9 @@ class OpsOrchestrator:
         secrets = self._load_known_secrets()
         if secrets.contains(prompt) or secrets.contains(actor):
             raise ValueError("request contains secret material")
+        request_id = request_id or new_id()
+        self._validate_identifier(request_id, "request_id")
+        control = check_control or (lambda: None)
 
         lock = self._session_lock(session_id)
         if not lock.acquire(blocking=False):
@@ -159,13 +174,14 @@ class OpsOrchestrator:
         claimed = False
         baseline_tool_count = self._tool_run_count(session_id)
         try:
-            self._claim_and_append_prompt(session_id, prompt, actor)
+            self._claim_and_append_prompt(session_id, prompt, actor, request_id, control)
             claimed = True
             return self._run_loop(
                 session_id,
                 actor,
                 secrets,
-                check_control=check_control or (lambda: None),
+                request_id=request_id,
+                check_control=control,
             )
         except (OpsSessionNotFound, OpsSessionConflict):
             raise
@@ -223,6 +239,48 @@ class OpsOrchestrator:
     def recover_interrupted(self) -> int:
         with self.session_factory() as db:
             sessions = list(db.scalars(select(OpsSession).where(OpsSession.status == "processing")))
+            session_ids = [session.id for session in sessions]
+            interrupted_at = datetime.now(UTC)
+            if session_ids:
+                tools = list(
+                    db.scalars(
+                        select(OpsToolRun).where(
+                            OpsToolRun.session_id.in_(session_ids),
+                            OpsToolRun.status.in_(("queued", "running")),
+                        )
+                    )
+                )
+                for tool_run in tools:
+                    internal = {
+                        key: value
+                        for key, value in (tool_run.result_json or {}).items()
+                        if key in {"_request_id", "_tool_fingerprint"}
+                    }
+                    tool_run.status = "failed"
+                    tool_run.result_json = {
+                        "status": "failed",
+                        "reason": "manager_restart",
+                    }
+                    tool_run.error = "Interrupted by manager restart"
+                    tool_run.finished_at = interrupted_at
+                    db.add(
+                        OpsMessage(
+                            session_id=tool_run.session_id,
+                            role="tool",
+                            content=json.dumps(
+                                tool_run.result_json,
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                            ),
+                            metadata_json={
+                                "tool_name": tool_run.tool_name,
+                                "tool_run_id": tool_run.id,
+                                "status": "failed",
+                                "request_id": internal.get("_request_id"),
+                                "tool_fingerprint": internal.get("_tool_fingerprint"),
+                            },
+                        )
+                    )
             for session in sessions:
                 session.status = "active"
                 record_audit(
@@ -249,8 +307,8 @@ class OpsOrchestrator:
             prompt=prompt,
             actor=actor,
             check_control=context.check_control,
+            request_id=getattr(context, "task_id", None),
         )
-        context.check_control()
         return {
             "session_id": result.session_id,
             "status": result.status,
@@ -263,39 +321,102 @@ class OpsOrchestrator:
         self,
         session_id: str,
         actor: str,
-        secrets: _KnownSecrets,
+        secrets: KnownSecrets,
         *,
+        request_id: str,
         check_control: Callable[[], None],
     ) -> OpsResponseResult:
-        started = self.monotonic()
+        deadline = self.monotonic() + self.max_total_seconds
+        wall_deadline = time.monotonic() + self.max_total_seconds
         tool_count = 0
         total_tool_chars = 0
-        failed_calls: set[str] = set()
+        failed_calls = self._load_failed_calls(session_id, request_id)
+
+        def stop_with_limit(reason: str) -> OpsResponseResult:
+            check_control()
+            return self._save_limit(
+                session_id,
+                actor,
+                reason,
+                tool_count,
+                check_control=check_control,
+            )
+
         while True:
             check_control()
-            if self.monotonic() - started > self.max_total_seconds:
-                return self._save_limit(session_id, actor, "time_limit", tool_count)
+            if self.monotonic() >= deadline:
+                return stop_with_limit("time_limit")
 
             provider, messages = self._load_provider_context(session_id, secrets)
-            turn = self.provider_client.complete(provider, messages)
-            if self.monotonic() - started > self.max_total_seconds:
-                return self._save_limit(session_id, actor, "time_limit", tool_count)
+            try:
+                turn = self._call_runner.run(
+                    lambda provider=provider, messages=messages: self._complete_provider(
+                        provider,
+                        messages,
+                        max(0.001, wall_deadline - time.monotonic()),
+                    ),
+                    deadline=wall_deadline,
+                    monotonic=time.monotonic,
+                    check_control=check_control,
+                )
+            except OpsDeadlineExceeded:
+                return stop_with_limit("time_limit")
+            if self.monotonic() >= deadline:
+                return stop_with_limit("time_limit")
             if secrets.contains(turn.model_dump(mode="json")):
                 raise ValueError("provider response contains secret material")
 
             if turn.action == "tool":
                 assert turn.tool is not None
-                self._save_tool_intent(session_id, turn)
                 if tool_count >= self.max_tool_turns:
-                    return self._save_limit(session_id, actor, "tool_turn_limit", tool_count)
+                    return stop_with_limit("tool_turn_limit")
                 fingerprint = self._tool_fingerprint(turn)
                 if fingerprint in failed_calls:
-                    return self._save_limit(session_id, actor, "repeated_failed_tool", tool_count)
-                tool_run_id = self._queue_tool(session_id, turn)
-                self._mark_tool_running(tool_run_id)
+                    return stop_with_limit("repeated_failed_tool")
+                self._save_tool_intent(
+                    session_id,
+                    turn,
+                    request_id,
+                    fingerprint,
+                    check_control,
+                )
+                tool_run_id = self._queue_tool(
+                    session_id,
+                    turn,
+                    request_id,
+                    fingerprint,
+                    check_control,
+                )
                 try:
+                    self._mark_tool_running(tool_run_id, check_control)
                     check_control()
-                except (TaskCancelled, TaskPaused):
+                    result = self._call_runner.run(
+                        lambda turn=turn: self._execute_tool(
+                            turn,
+                            max(0.001, wall_deadline - time.monotonic()),
+                        ),
+                        deadline=wall_deadline,
+                        monotonic=time.monotonic,
+                        check_control=check_control,
+                    )
+                except OpsDeadlineExceeded:
+                    self._finish_tool(
+                        tool_run_id,
+                        session_id,
+                        actor,
+                        {
+                            "name": turn.tool.name,
+                            "risk": "read_only",
+                            "status": "failed",
+                            "output": {},
+                            "error": "Read-only tool exceeded the operation deadline",
+                        },
+                    )
+                    return stop_with_limit("time_limit")
+                except (TaskCancelled, TaskPaused) as exc:
+                    controlled_reason = (
+                        "cancelled" if isinstance(exc, TaskCancelled) else "paused"
+                    )
                     self._finish_tool(
                         tool_run_id,
                         session_id,
@@ -307,10 +428,9 @@ class OpsOrchestrator:
                             "output": {},
                             "error": "Read-only tool did not run because the task stopped",
                         },
+                        controlled_reason=controlled_reason,
                     )
                     raise
-                try:
-                    result = self.tools.execute(turn.tool)
                 except Exception:
                     self._finish_tool(
                         tool_run_id,
@@ -326,38 +446,128 @@ class OpsOrchestrator:
                     )
                     raise
                 tool_count += 1
-                payload = secrets.redact(result.model_dump(mode="json"))
-                payload = self._bound_payload(payload, self.max_tool_result_chars)
-                serialized_chars = len(
-                    json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-                )
-                if total_tool_chars + serialized_chars > self.max_total_tool_chars:
-                    payload = {
-                        "name": result.name,
-                        "risk": "read_only",
-                        "status": result.status,
-                        "output": {"truncated": True},
-                        "error": "Cumulative tool output limit reached",
-                    }
-                    payload = self._bound_payload(
-                        payload,
-                        max(0, self.max_total_tool_chars - total_tool_chars),
+                try:
+                    check_control()
+                    payload = secrets.redact(result.model_dump(mode="json"))
+                    payload = self._bound_payload(payload, self.max_tool_result_chars)
+                    serialized_chars = len(
+                        json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
                     )
-                    self._finish_tool(tool_run_id, session_id, actor, payload)
-                    return self._save_limit(session_id, actor, "tool_output_limit", tool_count)
-                total_tool_chars += serialized_chars
-                self._finish_tool(tool_run_id, session_id, actor, payload)
+                    if total_tool_chars + serialized_chars > self.max_total_tool_chars:
+                        payload = {
+                            "name": result.name,
+                            "risk": "read_only",
+                            "status": result.status,
+                            "output": {"truncated": True},
+                            "error": "Cumulative tool output limit reached",
+                        }
+                        payload = self._bound_payload(
+                            payload,
+                            max(0, self.max_total_tool_chars - total_tool_chars),
+                        )
+                        self._finish_tool(
+                            tool_run_id,
+                            session_id,
+                            actor,
+                            payload,
+                            check_control=check_control,
+                        )
+                        return stop_with_limit("tool_output_limit")
+                    total_tool_chars += serialized_chars
+                    self._finish_tool(
+                        tool_run_id,
+                        session_id,
+                        actor,
+                        payload,
+                        check_control=check_control,
+                    )
+                except (TaskCancelled, TaskPaused) as exc:
+                    controlled_reason = (
+                        "cancelled" if isinstance(exc, TaskCancelled) else "paused"
+                    )
+                    self._finish_tool(
+                        tool_run_id,
+                        session_id,
+                        actor,
+                        {
+                            "name": turn.tool.name,
+                            "risk": "read_only",
+                            "status": "failed",
+                            "output": {},
+                            "error": "Read-only tool stopped before its result was committed",
+                        },
+                        controlled_reason=controlled_reason,
+                    )
+                    raise
                 if result.status == "failed":
                     failed_calls.add(fingerprint)
                 continue
 
             if turn.action == "plan":
-                return self._create_plan(session_id, actor, turn, tool_count, secrets)
+                return self._create_plan(
+                    session_id,
+                    actor,
+                    turn,
+                    tool_count,
+                    secrets,
+                    check_control,
+                )
             if turn.action == "question":
-                return self._save_answer(session_id, actor, turn.summary, "needs_input", tool_count)
-            return self._save_answer(session_id, actor, turn.summary, "answered", tool_count)
+                return self._save_answer(
+                    session_id,
+                    actor,
+                    turn.summary,
+                    "needs_input",
+                    tool_count,
+                    check_control,
+                )
+            return self._save_answer(
+                session_id,
+                actor,
+                turn.summary,
+                "answered",
+                tool_count,
+                check_control,
+            )
 
-    def _claim_and_append_prompt(self, session_id: str, prompt: str, actor: str) -> None:
+    def _complete_provider(
+        self,
+        provider: Provider,
+        messages: list[dict[str, Any]],
+        timeout_seconds: float,
+    ) -> AssistantTurn:
+        complete = self.provider_client.complete
+        if self._accepts_keyword(complete, "timeout_seconds"):
+            return complete(provider, messages, timeout_seconds=timeout_seconds)
+        return complete(provider, messages)
+
+    def _execute_tool(self, turn: AssistantTurn, timeout_seconds: float) -> Any:
+        assert turn.tool is not None
+        execute = self.tools.execute
+        if self._accepts_keyword(execute, "timeout_seconds"):
+            return execute(turn.tool, timeout_seconds=timeout_seconds)
+        return execute(turn.tool)
+
+    @staticmethod
+    def _accepts_keyword(call: Callable[..., Any], keyword: str) -> bool:
+        try:
+            parameters = inspect.signature(call).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == keyword
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    def _claim_and_append_prompt(
+        self,
+        session_id: str,
+        prompt: str,
+        actor: str,
+        request_id: str,
+        check_control: Callable[[], None],
+    ) -> None:
         with self.session_factory() as db:
             session = db.get(OpsSession, session_id)
             if session is None:
@@ -377,18 +587,45 @@ class OpsOrchestrator:
             )
             if claimed.rowcount != 1:
                 raise OpsSessionConflict("operations session is already processing")
-            db.add(
-                OpsMessage(
-                    session_id=session_id,
-                    role="user",
-                    content=prompt,
-                    metadata_json={"actor": actor},
+            user_messages = db.scalars(
+                select(OpsMessage).where(
+                    OpsMessage.session_id == session_id,
+                    OpsMessage.role == "user",
                 )
             )
+            if not any(
+                (message.metadata_json or {}).get("request_id") == request_id
+                for message in user_messages
+            ):
+                db.add(
+                    OpsMessage(
+                        session_id=session_id,
+                        role="user",
+                        content=prompt,
+                        metadata_json={"actor": actor, "request_id": request_id},
+                    )
+                )
+            check_control()
             db.commit()
 
+    def _load_failed_calls(self, session_id: str, request_id: str) -> set[str]:
+        with self.session_factory() as db:
+            messages = db.scalars(
+                select(OpsMessage).where(
+                    OpsMessage.session_id == session_id,
+                    OpsMessage.role == "tool",
+                )
+            )
+            return {
+                str(metadata["tool_fingerprint"])
+                for message in messages
+                if (metadata := message.metadata_json or {}).get("request_id") == request_id
+                and metadata.get("status") == "failed"
+                and metadata.get("tool_fingerprint")
+            }
+
     def _load_provider_context(
-        self, session_id: str, secrets: _KnownSecrets
+        self, session_id: str, secrets: KnownSecrets
     ) -> tuple[Provider, list[dict[str, Any]]]:
         with self.session_factory() as db:
             session = db.get(OpsSession, session_id)
@@ -427,9 +664,29 @@ class OpsOrchestrator:
         messages.extend(reversed(selected))
         return provider, messages
 
-    def _save_tool_intent(self, session_id: str, turn: AssistantTurn) -> str:
+    def _save_tool_intent(
+        self,
+        session_id: str,
+        turn: AssistantTurn,
+        request_id: str,
+        fingerprint: str,
+        check_control: Callable[[], None],
+    ) -> str:
         assert turn.tool is not None
         with self.session_factory() as db:
+            messages = db.scalars(
+                select(OpsMessage).where(
+                    OpsMessage.session_id == session_id,
+                    OpsMessage.role == "assistant",
+                )
+            )
+            for existing in messages:
+                metadata = existing.metadata_json or {}
+                if (
+                    metadata.get("request_id") == request_id
+                    and metadata.get("tool_fingerprint") == fingerprint
+                ):
+                    return existing.id
             message = OpsMessage(
                 session_id=session_id,
                 role="assistant",
@@ -438,13 +695,23 @@ class OpsOrchestrator:
                     "action": "tool",
                     "tool_name": turn.tool.name,
                     "argument_keys": sorted(turn.tool.argument_dict()),
+                    "request_id": request_id,
+                    "tool_fingerprint": fingerprint,
                 },
             )
             db.add(message)
+            check_control()
             db.commit()
             return message.id
 
-    def _queue_tool(self, session_id: str, turn: AssistantTurn) -> str:
+    def _queue_tool(
+        self,
+        session_id: str,
+        turn: AssistantTurn,
+        request_id: str,
+        fingerprint: str,
+        check_control: Callable[[], None],
+    ) -> str:
         assert turn.tool is not None
         with self.session_factory() as db:
             tool_run = OpsToolRun(
@@ -453,18 +720,26 @@ class OpsOrchestrator:
                 risk="read_only",
                 status="queued",
                 arguments_json=turn.tool.argument_dict(),
+                result_json={
+                    "_request_id": request_id,
+                    "_tool_fingerprint": fingerprint,
+                },
             )
             db.add(tool_run)
+            check_control()
             db.commit()
             return tool_run.id
 
-    def _mark_tool_running(self, tool_run_id: str) -> None:
+    def _mark_tool_running(
+        self, tool_run_id: str, check_control: Callable[[], None]
+    ) -> None:
         with self.session_factory() as db:
             tool_run = db.get(OpsToolRun, tool_run_id)
             if tool_run is None:
                 raise RuntimeError("queued tool run disappeared")
             tool_run.status = "running"
             tool_run.started_at = datetime.now(UTC)
+            check_control()
             db.commit()
 
     def _finish_tool(
@@ -473,6 +748,9 @@ class OpsOrchestrator:
         session_id: str,
         actor: str,
         payload: dict[str, Any],
+        *,
+        check_control: Callable[[], None] | None = None,
+        controlled_reason: str | None = None,
     ) -> None:
         with self.session_factory() as db:
             tool_run = db.get(OpsToolRun, tool_run_id)
@@ -480,15 +758,28 @@ class OpsOrchestrator:
                 raise RuntimeError("running tool run disappeared")
             status = str(payload.get("status") or "failed")
             tool_run.status = status
+            internal = {
+                key: value
+                for key, value in (tool_run.result_json or {}).items()
+                if key in {"_request_id", "_tool_fingerprint"}
+            }
             tool_run.result_json = payload
             error = payload.get("error")
             tool_run.error = str(error)[:1000] if error else None
+            if tool_run.started_at is None:
+                tool_run.started_at = datetime.now(UTC)
             tool_run.finished_at = datetime.now(UTC)
             message = OpsMessage(
                 session_id=session_id,
                 role="tool",
                 content=json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
-                metadata_json={"tool_name": tool_run.tool_name, "tool_run_id": tool_run.id},
+                metadata_json={
+                    "tool_name": tool_run.tool_name,
+                    "tool_run_id": tool_run.id,
+                    "status": status,
+                    "request_id": internal.get("_request_id"),
+                    "tool_fingerprint": internal.get("_tool_fingerprint"),
+                },
             )
             db.add(message)
             record_audit(
@@ -506,6 +797,21 @@ class OpsOrchestrator:
                     "argument_keys": sorted(tool_run.arguments_json),
                 },
             )
+            if controlled_reason is not None:
+                session = db.get(OpsSession, session_id)
+                if session is not None:
+                    session.status = "active"
+                    record_audit(
+                        db,
+                        actor=actor,
+                        action="ops.failure",
+                        resource_type="ops_session",
+                        resource_id=session_id,
+                        outcome="failure",
+                        details={"reason": controlled_reason},
+                    )
+            if check_control is not None:
+                check_control()
             db.commit()
 
     def _create_plan(
@@ -514,11 +820,12 @@ class OpsOrchestrator:
         actor: str,
         turn: AssistantTurn,
         tool_count: int,
-        secrets: _KnownSecrets,
+        secrets: KnownSecrets,
+        check_control: Callable[[], None],
     ) -> OpsResponseResult:
         serialized_steps = [self._serialize_step(step) for step in turn.steps]
         candidate = {"summary": turn.summary, "steps": serialized_steps}
-        if secrets.unsafe_short or secrets.contains(candidate):
+        if secrets.contains(candidate):
             raise ValueError("operation plan contains secret material")
         with self.session_factory() as db:
             session = db.get(OpsSession, session_id)
@@ -566,6 +873,7 @@ class OpsOrchestrator:
                     "step_count": len(serialized_steps),
                 },
             )
+            check_control()
             db.commit()
             return OpsResponseResult(
                 session_id=session_id,
@@ -582,6 +890,7 @@ class OpsOrchestrator:
         content: str,
         status: str,
         tool_count: int,
+        check_control: Callable[[], None],
     ) -> OpsResponseResult:
         with self.session_factory() as db:
             session = db.get(OpsSession, session_id)
@@ -604,6 +913,7 @@ class OpsOrchestrator:
                 resource_id=message.id,
                 details={"session_id": session_id, "status": status},
             )
+            check_control()
             db.commit()
             return OpsResponseResult(
                 session_id=session_id,
@@ -616,6 +926,8 @@ class OpsOrchestrator:
         with self.session_factory() as db:
             session = db.get(OpsSession, session_id)
             if session is None:
+                return
+            if session.status == "active":
                 return
             session.status = "active"
             record_audit(
@@ -630,7 +942,13 @@ class OpsOrchestrator:
             db.commit()
 
     def _save_limit(
-        self, session_id: str, actor: str, reason: str, tool_count: int
+        self,
+        session_id: str,
+        actor: str,
+        reason: str,
+        tool_count: int,
+        *,
+        check_control: Callable[[], None],
     ) -> OpsResponseResult:
         messages = {
             "time_limit": "The operation reached its time limit. Narrow the request and retry.",
@@ -655,6 +973,7 @@ class OpsOrchestrator:
             content=messages[reason],
             status="failed",
             tool_count=tool_count,
+            check_control=check_control,
         )
 
     def _save_failure(
@@ -687,6 +1006,7 @@ class OpsOrchestrator:
         content: str,
         status: str,
         tool_count: int,
+        check_control: Callable[[], None] | None = None,
     ) -> OpsResponseResult:
         with self.session_factory() as db:
             session = db.get(OpsSession, session_id)
@@ -710,6 +1030,8 @@ class OpsOrchestrator:
                 outcome="failure",
                 details={"reason": reason, "message_id": message.id},
             )
+            if check_control is not None:
+                check_control()
             db.commit()
             return OpsResponseResult(
                 session_id=session_id,
@@ -718,42 +1040,8 @@ class OpsOrchestrator:
                 message_id=message.id,
             )
 
-    def _load_known_secrets(self) -> _KnownSecrets:
-        values: set[str] = set()
-        unsafe_short = False
-        try:
-            with self.session_factory() as db:
-                providers = db.execute(select(Provider.encrypted_api_key, Provider.headers)).all()
-                settings = db.scalars(select(SecretSetting.encrypted_value)).all()
-            encrypted_values: list[str] = []
-            for encrypted_api_key, headers in providers:
-                encrypted_values.append(encrypted_api_key)
-                values.add(encrypted_api_key)
-                if isinstance(headers, Mapping):
-                    for name, value in headers.items():
-                        if not isinstance(value, str) or not value:
-                            continue
-                        scheme, separator, credential = value.partition(" ")
-                        if _SENSITIVE_HEADER.search(str(name)) or (
-                            separator and scheme.casefold() in {"bearer", "basic"}
-                        ):
-                            values.add(value)
-                            if credential:
-                                values.add(credential)
-            for encrypted_value in settings:
-                encrypted_values.append(encrypted_value)
-                values.add(encrypted_value)
-            for encrypted in encrypted_values:
-                plaintext = self.secret_box.decrypt(encrypted)
-                if not plaintext:
-                    raise ValueError("empty configured secret")
-                values.add(plaintext)
-            unsafe_short = any(len(value) < MIN_EMBEDDED_SECRET_CHARS for value in values)
-        except Exception:
-            raise RuntimeError("configured secrets could not be loaded safely") from None
-        if unsafe_short:
-            raise RuntimeError("configured secrets are too short to sanitize safely")
-        return _KnownSecrets(values, unsafe_short=False)
+    def _load_known_secrets(self) -> KnownSecrets:
+        return load_known_secrets(self.session_factory, self.secret_box)
 
     def _session_lock(self, session_id: str) -> threading.Lock:
         with self._locks_guard:

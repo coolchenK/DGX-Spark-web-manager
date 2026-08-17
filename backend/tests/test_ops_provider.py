@@ -163,6 +163,50 @@ def test_finish_reason_length_repairs_even_when_content_is_valid() -> None:
     assert calls == 2
 
 
+def test_complete_shares_one_timeout_across_fallback_and_repair() -> None:
+    requests = 0
+    configured_timeouts: list[float] = []
+    ticks = iter([10.0, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(
+                400, json={"error": {"message": "response_format unsupported"}}
+            )
+        if requests == 2:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"content": ""}}
+                    ]
+                },
+            )
+        return httpx.Response(200, json=_success("repaired in time"))
+
+    transport = httpx.MockTransport(handler)
+
+    def factory(**kwargs):
+        configured_timeouts.append(float(kwargs["timeout"]))
+        return httpx.Client(transport=transport, **kwargs)
+
+    client = OpsProviderClient(
+        SecretBox(SECRET_KEY),
+        endpoint_resolver=_endpoint,
+        http_client_factory=factory,
+        _monotonic=lambda: next(ticks),
+    )
+
+    result = client.complete(_provider(), _messages(), timeout_seconds=1.0)
+
+    assert result.summary == "repaired in time"
+    assert len(configured_timeouts) == 3
+    assert configured_timeouts == sorted(configured_timeouts, reverse=True)
+    assert configured_timeouts[0] <= 1.0
+
+
 @pytest.mark.parametrize(
     "content",
     [

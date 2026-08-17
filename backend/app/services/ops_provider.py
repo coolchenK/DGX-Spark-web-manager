@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, Protocol
 
@@ -301,10 +302,12 @@ class OpsProviderClient:
         *,
         endpoint_resolver: EndpointResolver | None = None,
         http_client_factory: HttpClientFactory | None = None,
+        _monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.secret_box = secret_box
         self.endpoint_resolver = endpoint_resolver or resolve_provider_endpoint
         self.http_client_factory = http_client_factory or httpx.Client
+        self._monotonic = _monotonic
 
     @staticmethod
     def _headers(
@@ -355,6 +358,7 @@ class OpsProviderClient:
         *,
         payload: dict[str, Any] | None = None,
         allow_response_format_fallback: bool = False,
+        deadline: float | None = None,
     ) -> Any:
         try:
             api_key = self.secret_box.decrypt(provider.encrypted_api_key)
@@ -371,8 +375,14 @@ class OpsProviderClient:
             request_payload = payload
             response_format_fallback_used = False
             while True:
+                timeout = provider.timeout_seconds
+                if deadline is not None:
+                    remaining = deadline - self._monotonic()
+                    if remaining <= 0:
+                        raise OpsProviderError("Provider request deadline exceeded")
+                    timeout = min(float(timeout), remaining)
                 with self.http_client_factory(
-                    timeout=provider.timeout_seconds,
+                    timeout=timeout,
                     follow_redirects=False,
                     trust_env=False,
                 ) as client:
@@ -462,8 +472,17 @@ class OpsProviderClient:
             raise _IncompleteProviderResponse("invalid structured response") from exc
 
     def complete(
-        self, provider: Provider, messages: list[dict[str, Any]]
+        self,
+        provider: Provider,
+        messages: list[dict[str, Any]],
+        *,
+        timeout_seconds: float | None = None,
     ) -> AssistantTurn:
+        deadline = (
+            self._monotonic() + timeout_seconds
+            if timeout_seconds is not None
+            else None
+        )
         initial_payload = self._chat_payload(provider, messages, max_tokens=2048)
         response = self._request_json(
             provider,
@@ -471,6 +490,7 @@ class OpsProviderClient:
             "/chat/completions",
             payload=initial_payload,
             allow_response_format_fallback=True,
+            deadline=deadline,
         )
         try:
             return self._parse_turn(response)
@@ -485,6 +505,7 @@ class OpsProviderClient:
                 "/chat/completions",
                 payload=repair_payload,
                 allow_response_format_fallback=True,
+                deadline=deadline,
             )
             try:
                 return self._parse_turn(repaired)

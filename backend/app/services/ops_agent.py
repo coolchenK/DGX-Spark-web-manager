@@ -110,12 +110,12 @@ class _DeadlineReader:
     def __init__(
         self,
         connection: socket.socket,
-        timeout: float,
+        deadline: float,
         *,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._connection = connection
-        self._deadline = monotonic() + timeout
+        self._deadline = deadline
         self._monotonic = monotonic
 
     def recv(self, size: int) -> bytes:
@@ -158,7 +158,10 @@ class OpsAgentClient:
         parameters: dict[str, Any],
         *,
         approval: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
+        timeout = self._read_timeout if timeout_seconds is None else timeout_seconds
+        deadline = self._monotonic() + max(0, timeout)
         secret = self._get_secret()
         try:
             unsigned = new_request(action, parameters, approval=approval)
@@ -167,10 +170,10 @@ class OpsAgentClient:
         except ProtocolError:
             raise OpsAgentProtocolError() from None
 
-        connection = self._open_connection()
+        connection = self._open_connection(deadline)
         try:
-            self._write(connection, frame)
-            response = self._read(connection)
+            self._write(connection, frame, deadline)
+            response = self._read(connection, deadline)
         finally:
             connection.close()
 
@@ -180,7 +183,7 @@ class OpsAgentClient:
             request_id=request["request_id"],
         )
 
-    def _open_connection(self) -> socket.socket:
+    def _open_connection(self, deadline: float) -> socket.socket:
         if self._connection_factory is not None:
             try:
                 return self._connection_factory()
@@ -195,7 +198,7 @@ class OpsAgentClient:
         except OSError:
             raise OpsAgentUnavailable() from None
         try:
-            self._connect(connection)
+            self._connect(connection, deadline)
         except Exception:
             connection.close()
             raise
@@ -235,15 +238,17 @@ class OpsAgentClient:
             raise ValueError("invalid Agent key")
         return bytes.fromhex(value.decode("ascii"))
 
-    def _connect(self, connection: socket.socket) -> None:
-        connection.settimeout(self._connect_timeout)
+    def _connect(self, connection: socket.socket, deadline: float) -> None:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise OpsAgentUnavailable()
+        connection.settimeout(min(self._connect_timeout, remaining))
         try:
             connection.connect(os.fspath(self.socket_path))
         except (OSError, TimeoutError):
             raise OpsAgentUnavailable() from None
 
-    def _write(self, connection: socket.socket, frame: bytes) -> None:
-        deadline = self._monotonic() + self._read_timeout
+    def _write(self, connection: socket.socket, frame: bytes, deadline: float) -> None:
         view = memoryview(frame)
         sent = 0
         try:
@@ -259,12 +264,14 @@ class OpsAgentClient:
         except (OSError, TimeoutError):
             raise OpsAgentUnavailable() from None
 
-    def _read(self, connection: socket.socket) -> dict[str, Any]:
+    def _read(self, connection: socket.socket, deadline: float) -> dict[str, Any]:
         try:
+            if deadline - self._monotonic() <= 0:
+                raise TimeoutError
             return read_frame(
                 _DeadlineReader(
                     connection,
-                    self._read_timeout,
+                    deadline,
                     monotonic=self._monotonic,
                 )
             )
