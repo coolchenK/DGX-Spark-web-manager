@@ -1,4 +1,4 @@
-import type { Deployment, ModelAsset, RecommendationProvenance } from '../api/types'
+import type { Deployment, ModelAsset, RecommendationProvenance, RuntimeName } from '../api/types'
 
 
 export interface GenerationDefaults {
@@ -36,6 +36,16 @@ export interface SpeculativeSettings {
   manual_review_acknowledged: boolean
 }
 
+export interface LlamaCppSettings {
+  model_file?: string
+  mmproj_file?: string
+  gpu_layers: number | 'all'
+  jinja: boolean
+  continuous_batching: boolean
+  mtp_enabled: boolean
+  mtp_tokens: number
+}
+
 
 export interface DeploymentFormValues {
   name: string
@@ -43,7 +53,7 @@ export interface DeploymentFormValues {
   model_path: string
   api_model_name: string
   route_alias?: string
-  runtime: 'vllm' | 'sglang'
+  runtime: RuntimeName
   image: string
   port: number
   context_length: number
@@ -54,6 +64,7 @@ export interface DeploymentFormValues {
   trust_remote_code: boolean
   generation_defaults: GenerationDefaults
   speculative?: SpeculativeSettings | null
+  llama_cpp?: LlamaCppSettings | null
   recommendation?: RecommendationProvenance | null
   resource_warning_acknowledged: boolean
 }
@@ -126,6 +137,21 @@ function normalizeSpeculativeSettings(value: unknown): SpeculativeSettings | nul
 }
 
 
+function normalizeLlamaCppSettings(value: unknown): LlamaCppSettings | null {
+  const saved = objectValue(value)
+  if (!saved) return null
+  return {
+    ...(typeof saved.model_file === 'string' ? { model_file: saved.model_file } : {}),
+    ...(typeof saved.mmproj_file === 'string' ? { mmproj_file: saved.mmproj_file } : {}),
+    gpu_layers: saved.gpu_layers === 'all' ? 'all' : finiteNumber(saved.gpu_layers, 0),
+    jinja: saved.jinja !== false,
+    continuous_batching: saved.continuous_batching !== false,
+    mtp_enabled: saved.mtp_enabled === true,
+    mtp_tokens: finiteNumber(saved.mtp_tokens, 3),
+  }
+}
+
+
 function normalizeRecommendationProvenance(value: unknown): RecommendationProvenance | null {
   const saved = objectValue(value)
   const resourceSnapshot = objectValue(saved?.resource_snapshot)
@@ -159,7 +185,9 @@ export function deploymentToFormValues(
     : []
   const contextValue = commandValue(
     command,
-    deployment.runtime === 'sglang' ? '--context-length' : '--max-model-len',
+    deployment.runtime === 'sglang'
+      ? '--context-length'
+      : deployment.runtime === 'llama_cpp' ? '--ctx-size' : '--max-model-len',
   )
   const memoryValue = commandValue(
     command,
@@ -167,7 +195,9 @@ export function deploymentToFormValues(
   )
   const concurrencyValue = commandValue(
     command,
-    deployment.runtime === 'sglang' ? '--max-running-requests' : '--max-num-seqs',
+    deployment.runtime === 'sglang'
+      ? '--max-running-requests'
+      : deployment.runtime === 'llama_cpp' ? '--parallel' : '--max-num-seqs',
   )
   const routeAlias = String(deployment.config.route_alias ?? saved.route_alias ?? '') || undefined
   const values: DeploymentFormValues = {
@@ -176,7 +206,7 @@ export function deploymentToFormValues(
     model_path: model.local_path,
     api_model_name: deployment.api_model_name,
     route_alias: routeAlias,
-    runtime: deployment.runtime as 'vllm' | 'sglang',
+    runtime: deployment.runtime as RuntimeName,
     image: deployment.image ?? '',
     port: deployment.port ?? 8100,
     context_length: finiteNumber(saved.context_length ?? contextValue, 32768),
@@ -191,6 +221,7 @@ export function deploymentToFormValues(
     trust_remote_code: saved.trust_remote_code ?? command.includes('--trust-remote-code'),
     generation_defaults: normalizeGenerationDefaults(saved.generation_defaults),
     speculative: normalizeSpeculativeSettings(saved.speculative),
+    llama_cpp: normalizeLlamaCppSettings(saved.llama_cpp),
     recommendation: normalizeRecommendationProvenance(saved.recommendation),
     resource_warning_acknowledged: saved.resource_warning_acknowledged ?? false,
   }

@@ -782,6 +782,12 @@ class DeploymentService:
                 "bind": "/draft-models",
                 "mode": "ro",
             }
+        for source, mount in adapter.extra_volumes(spec).items():
+            if source in volumes or any(
+                existing["bind"] == mount["bind"] for existing in volumes.values()
+            ):
+                raise ValueError("Runtime mount conflicts with a model mount")
+            volumes[source] = mount
         fingerprint = spec_fingerprint or deployment_spec_fingerprint(spec)
         return client.containers.run(
             spec.image,
@@ -803,7 +809,7 @@ class DeploymentService:
                 config={"max-size": "10m", "max-file": "5"},
             ),
             device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
-            environment={"HF_HUB_OFFLINE": "1"},
+            environment={"HF_HUB_OFFLINE": "1", **adapter.environment(spec)},
         )
 
     @staticmethod

@@ -27,6 +27,7 @@ from app.config import Settings
 from app.db import Database
 from app.models import SecretSetting
 from app.operations.executor import OperationExecutor
+from app.runtime.llama_cpp import LlamaCppAdapter
 from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
 from app.security import PasswordManager, SecretBox, SessionManager
@@ -129,6 +130,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "sglang": SGLangAdapter(
                 allowed_images=app_settings.sglang_images,
                 model_roots=app_settings.model_root_paths,
+            ),
+            "llama_cpp": LlamaCppAdapter(
+                allowed_images=app_settings.llama_cpp_images,
+                model_roots=app_settings.model_root_paths,
+                host_runtime_dir=app_settings.llama_cpp_host_dir,
+                manager_runtime_dir=app_settings.llama_cpp_manager_dir,
             ),
         },
         session_factory=database.session_factory,

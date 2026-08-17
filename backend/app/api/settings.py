@@ -40,6 +40,7 @@ def get_settings(request: Request, db: DbSession, _: Admin) -> dict[str, Any]:
         "runtimes": {
             "vllm": sorted(settings.vllm_images),
             "sglang": sorted(settings.sglang_images),
+            "llama_cpp": sorted(settings.llama_cpp_images),
         },
     }
 

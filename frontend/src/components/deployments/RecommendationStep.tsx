@@ -15,7 +15,7 @@ import {
 import type { FormItemProps } from 'antd'
 import type { ReactNode } from 'react'
 
-import type { DeploymentRecommendation, RecommendedValue } from '../../api/types'
+import type { DeploymentRecommendation, RecommendedValue, RuntimeName } from '../../api/types'
 import { RecommendationSourceTag } from './RecommendationSourceTag'
 
 
@@ -25,7 +25,7 @@ interface RecommendationStepProps {
   loading: boolean
   refreshing: boolean
   error?: Error | null
-  runtime: 'vllm' | 'sglang'
+  runtime: RuntimeName
   editing?: boolean
   onReapplyAll: () => void
   onRetryAI: () => void

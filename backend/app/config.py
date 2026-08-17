@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     allowed_sglang_images: str = (
         "sglang-inkling:specforge,lmsysorg/sglang:dev-cu13-inkling-dspark"
     )
+    allowed_llama_cpp_images: str = "nvidia/cuda:12.9.0-devel-ubuntu24.04"
+    llama_cpp_host_dir: Path = Path("/opt/llamacpp")
+    llama_cpp_manager_dir: Path = Path("/llamacpp-runtime")
 
     @field_validator("database_url")
     @classmethod
@@ -83,3 +86,7 @@ class Settings(BaseSettings):
     @property
     def sglang_images(self) -> set[str]:
         return self._csv_set(self.allowed_sglang_images)
+
+    @property
+    def llama_cpp_images(self) -> set[str]:
+        return self._csv_set(self.allowed_llama_cpp_images)

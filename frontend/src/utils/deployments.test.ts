@@ -193,3 +193,47 @@ describe('deploymentToFormValues', () => {
     })
   })
 })
+
+
+describe('llama.cpp deployment restoration', () => {
+  it('restores GGUF, mmproj and MTP settings', () => {
+    const llamaDeployment: Deployment = {
+      ...deployment,
+      runtime: 'llama_cpp',
+      image: 'nvidia/cuda:12.9.0-devel-ubuntu24.04',
+      config: {
+        command: [
+          '/opt/llamacpp/llama-server',
+          '--ctx-size', '262144',
+          '--parallel', '1',
+        ],
+        spec: {
+          quantization: 'gguf',
+          llama_cpp: {
+            model_file: 'model-Q8_0.gguf',
+            mmproj_file: 'mmproj-F16.gguf',
+            gpu_layers: 'all',
+            jinja: true,
+            continuous_batching: true,
+            mtp_enabled: true,
+            mtp_tokens: 3,
+          },
+        },
+      },
+    }
+
+    expect(deploymentToFormValues(llamaDeployment, model, 'edit')).toMatchObject({
+      runtime: 'llama_cpp',
+      context_length: 262144,
+      max_concurrency: 1,
+      quantization: 'gguf',
+      llama_cpp: {
+        model_file: 'model-Q8_0.gguf',
+        mmproj_file: 'mmproj-F16.gguf',
+        gpu_layers: 'all',
+        mtp_enabled: true,
+        mtp_tokens: 3,
+      },
+    })
+  })
+})

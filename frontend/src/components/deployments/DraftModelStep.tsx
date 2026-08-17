@@ -1,13 +1,13 @@
 import { Alert, Checkbox, Collapse, Form, InputNumber, Radio, Switch, Tag, Typography } from 'antd'
 
-import type { DraftCandidate, ResourceEstimate } from '../../api/types'
+import type { DraftCandidate, ResourceEstimate, RuntimeName } from '../../api/types'
 import { formatBytes } from '../../utils/format'
 
 
 interface DraftModelStepProps {
   candidates: DraftCandidate[]
   selectedId?: string
-  runtime: 'vllm' | 'sglang'
+  runtime: Exclude<RuntimeName, 'llama_cpp'>
   advanced: boolean
   resourceEstimate?: Partial<ResourceEstimate>
   resourceUnverified?: boolean

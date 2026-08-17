@@ -36,6 +36,43 @@ QuantizationMethod = Literal[
 ]
 
 
+class LlamaCppConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_file: str | None = Field(default=None, max_length=255)
+    mmproj_file: str | None = Field(default=None, max_length=255)
+    gpu_layers: int | Literal["all"] = "all"
+    jinja: bool = True
+    continuous_batching: bool = True
+    mtp_enabled: bool = False
+    mtp_tokens: int = Field(default=3, ge=1, le=64)
+
+    @field_validator("model_file", "mmproj_file")
+    @classmethod
+    def validate_gguf_filename(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            or "\x00" in value
+            or not value.lower().endswith(".gguf")
+        ):
+            raise ValueError("llama.cpp files must be GGUF basenames")
+        return value
+
+    @field_validator("gpu_layers")
+    @classmethod
+    def validate_gpu_layers(cls, value: int | str) -> int | str:
+        if value == "all":
+            return value
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10_000:
+            raise ValueError("gpu_layers must be 'all' or an integer from 0 to 10000")
+        return value
+
+
 class GenerationDefaults(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -119,6 +156,7 @@ class DeploymentSpec(BaseModel):
     trust_remote_code: bool = False
     generation_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
     speculative: SpeculativeConfig | None = None
+    llama_cpp: LlamaCppConfig | None = None
     recommendation: RecommendationProvenance | None = None
     resource_warning_acknowledged: bool = False
 
@@ -130,6 +168,19 @@ class DeploymentSpec(BaseModel):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", value):
             raise ValueError("API model name contains unsupported characters")
         return value
+
+    @model_validator(mode="after")
+    def validate_runtime_specific_settings(self):
+        if self.runtime == "llama_cpp":
+            if self.quantization not in {None, "auto", "gguf"}:
+                raise ValueError("llama.cpp deployments require GGUF quantization")
+            if self.trust_remote_code:
+                raise ValueError("llama.cpp does not support trust_remote_code")
+            if self.speculative is not None:
+                raise ValueError("llama.cpp MTP must use llama_cpp settings")
+        elif self.llama_cpp is not None:
+            raise ValueError("llama_cpp settings require the llama_cpp runtime")
+        return self
 
 
 class ResolvedDeploymentSpec(DeploymentSpec):
@@ -268,6 +319,14 @@ class RuntimeAdapter(ABC):
 
     def openai_capabilities(self) -> list[str]:
         return ["chat", "completion"]
+
+    def extra_volumes(self, spec: DeploymentSpec) -> dict[str, dict[str, str]]:
+        del spec
+        return {}
+
+    def environment(self, spec: DeploymentSpec) -> dict[str, str]:
+        del spec
+        return {}
 
     def start(self, container: Any) -> None:
         container.start()

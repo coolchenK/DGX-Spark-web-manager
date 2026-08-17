@@ -43,6 +43,7 @@ import type {
   RecommendationProvenance,
   RecommendationSource,
   ResourceEstimate,
+  RuntimeName,
   TaskRecord,
 } from '../api/types'
 import { DeploymentBasicsStep } from '../components/deployments/DeploymentBasicsStep'
@@ -51,6 +52,7 @@ import {
   type DeploymentPreview,
 } from '../components/deployments/DeploymentPreviewStep'
 import { DraftModelStep } from '../components/deployments/DraftModelStep'
+import { LlamaCppStep } from '../components/deployments/LlamaCppStep'
 import { RecommendationStep } from '../components/deployments/RecommendationStep'
 import { LogViewer } from '../components/LogViewer'
 import { PageHeader } from '../components/PageHeader'
@@ -83,6 +85,7 @@ const defaultValues: Partial<DeploymentWizardValues> = {
   trust_remote_code: false,
   generation_defaults: {},
   speculative: null,
+  llama_cpp: null,
   recommendation: null,
   resource_warning_acknowledged: false,
 }
@@ -156,7 +159,7 @@ function isAbortError(error: unknown): boolean {
 
 function recommendationTupleKey(
   modelId: string | undefined,
-  runtime: 'vllm' | 'sglang',
+  runtime: RuntimeName,
   image: string | undefined,
   providerId: string | null | undefined,
 ): string {
@@ -472,13 +475,20 @@ export function DeploymentsPage() {
       memory_fraction: 0.8,
       max_concurrency: 8,
       max_batched_tokens: undefined,
-      quantization: 'auto',
+      quantization: runtime === 'llama_cpp' ? 'gguf' : 'auto',
       generation_defaults: Object.fromEntries(
         [...recommendationFieldPaths]
           .filter((path) => path.startsWith('generation_defaults.'))
           .map((path) => [path.split('.')[1], undefined]),
       ),
       speculative: null,
+      llama_cpp: runtime === 'llama_cpp' ? {
+        gpu_layers: 'all',
+        jinja: true,
+        continuous_batching: true,
+        mtp_enabled: false,
+        mtp_tokens: 3,
+      } : null,
       resource_warning_acknowledged: false,
       recommendation: null,
     })
@@ -489,7 +499,7 @@ export function DeploymentsPage() {
     setAdvancedDrafts(false)
     setDraftValidationError(null)
     invalidatePreview(0)
-  }, [form, invalidatePreview, models.data, replaceEditedFields])
+  }, [form, invalidatePreview, models.data, replaceEditedFields, runtime])
 
   const openCreate = useCallback(() => {
     setEditingDeployment(null)
@@ -608,7 +618,16 @@ export function DeploymentsPage() {
         Object.entries(deploymentValues.generation_defaults ?? {})
           .filter(([, value]) => value !== undefined && value !== null),
       ),
-      speculative,
+      speculative: runtime === 'llama_cpp' ? null : speculative,
+      llama_cpp: runtime === 'llama_cpp' ? {
+        model_file: deploymentValues.llama_cpp?.model_file || undefined,
+        mmproj_file: deploymentValues.llama_cpp?.mmproj_file || undefined,
+        gpu_layers: deploymentValues.llama_cpp?.gpu_layers ?? 'all',
+        jinja: deploymentValues.llama_cpp?.jinja !== false,
+        continuous_batching: deploymentValues.llama_cpp?.continuous_batching !== false,
+        mtp_enabled: deploymentValues.llama_cpp?.mtp_enabled === true,
+        mtp_tokens: deploymentValues.llama_cpp?.mtp_tokens ?? 3,
+      } : null,
       recommendation: provenance,
       resource_warning_acknowledged: deploymentValues.resource_warning_acknowledged === true,
     }
@@ -750,7 +769,7 @@ export function DeploymentsPage() {
     try {
       const refreshed = await recommendation.refreshAI()
       const currentModelId = form.getFieldValue('model_id') as string | undefined
-      const currentRuntime = form.getFieldValue('runtime') as 'vllm' | 'sglang'
+      const currentRuntime = form.getFieldValue('runtime') as RuntimeName
       const currentImage = form.getFieldValue('image') as string | undefined
       const currentProviderId = form.getFieldValue('provider_id') as string | null | undefined
       const formTupleKey = recommendationTupleKey(
@@ -835,6 +854,34 @@ export function DeploymentsPage() {
       return
     }
     if (step === 2) {
+      if (runtime === 'llama_cpp') {
+        try {
+          await form.validateFields([
+            ['llama_cpp', 'model_file'],
+            ['llama_cpp', 'mmproj_file'],
+            ['llama_cpp', 'mtp_tokens'],
+          ])
+        } catch {
+          return
+        }
+        const resourceDecision = draftResources.estimate?.decision
+        if (resourceDecision === 'warning' && !form.getFieldValue('resource_warning_acknowledged')) {
+          setDraftValidationError('请确认统一内存资源警告')
+          return
+        }
+        if (resourceDecision === 'blocked') {
+          message.error('资源估算超过 DGX Spark 硬上限，无法生成部署任务')
+          return
+        }
+        const payload = payloadFromForm()
+        previewController.current?.abort()
+        const controller = new AbortController()
+        const sequence = previewSequence.current + 1
+        previewSequence.current = sequence
+        previewController.current = controller
+        previewMutation.mutate({ payload: cloneJson(payload), sequence, controller })
+        return
+      }
       if (activeRecommendation && selectedDraftId && !selectedDraft) {
         setDraftValidationError('当前 Draft Model 不在最新候选列表中')
         return
@@ -923,17 +970,26 @@ export function DeploymentsPage() {
       clearRecommendationValues(new Set([...previousPaths, ...forced]), forced)
       lastAppliedRecommendation.current = null
       restoredTupleKey.current = null
-      const nextRuntime = changed.runtime as 'vllm' | 'sglang'
+      const nextRuntime = changed.runtime as RuntimeName
       applyingRecommendation.current = true
       form.setFieldsValue({
         image: nextRuntime === 'vllm'
           ? 'vllm/vllm-openai:v0.27.1'
-          : 'sglang-inkling:specforge',
+          : nextRuntime === 'sglang'
+            ? 'sglang-inkling:specforge'
+            : 'nvidia/cuda:12.9.0-devel-ubuntu24.04',
         speculative: null,
+        llama_cpp: nextRuntime === 'llama_cpp' ? {
+          gpu_layers: 'all',
+          jinja: true,
+          continuous_batching: true,
+          mtp_enabled: false,
+          mtp_tokens: 3,
+        } : null,
         resource_warning_acknowledged: false,
         recommendation: null,
         max_batched_tokens: undefined,
-        quantization: 'auto',
+        quantization: nextRuntime === 'llama_cpp' ? 'gguf' : 'auto',
       })
       applyingRecommendation.current = false
       replaceEditedFields(new Set([...editedFieldsRef.current].filter((path) => (
@@ -956,7 +1012,7 @@ export function DeploymentsPage() {
         resource_warning_acknowledged: false,
         recommendation: null,
         max_batched_tokens: undefined,
-        quantization: 'auto',
+        quantization: runtime === 'llama_cpp' ? 'gguf' : 'auto',
       })
       applyingRecommendation.current = false
       replaceEditedFields(new Set([...editedFieldsRef.current].filter((path) => (
@@ -1092,18 +1148,20 @@ export function DeploymentsPage() {
       onReapplyAll={() => activeRecommendation && applyRecommendation(activeRecommendation, true)}
       onRetryAI={handleRetryAI}
     />,
-    <DraftModelStep
-      key="draft"
-      candidates={activeRecommendation?.draft_candidates ?? []}
-      selectedId={selectedDraftId}
-      runtime={runtime}
-      advanced={advancedDrafts}
-      resourceEstimate={draftResources.estimate}
-      resourceUnverified={draftResources.unverified}
-      validationError={draftValidationError}
-      onAdvancedChange={setAdvancedDrafts}
-      onSelect={handleDraftSelect}
-    />,
+    runtime === 'llama_cpp'
+      ? <LlamaCppStep key="llama-cpp" />
+      : <DraftModelStep
+          key="draft"
+          candidates={activeRecommendation?.draft_candidates ?? []}
+          selectedId={selectedDraftId}
+          runtime={runtime}
+          advanced={advancedDrafts}
+          resourceEstimate={draftResources.estimate}
+          resourceUnverified={draftResources.unverified}
+          validationError={draftValidationError}
+          onAdvancedChange={setAdvancedDrafts}
+          onSelect={handleDraftSelect}
+        />,
     preview
       ? <DeploymentPreviewStep
           key="preview"
@@ -1164,7 +1222,7 @@ export function DeploymentsPage() {
           items={[
             { title: '基础模型' },
             { title: '推荐配置' },
-            { title: 'Draft Model' },
+            { title: runtime === 'llama_cpp' ? 'llama.cpp' : 'Draft Model' },
             { title: '部署预览' },
           ]}
         />

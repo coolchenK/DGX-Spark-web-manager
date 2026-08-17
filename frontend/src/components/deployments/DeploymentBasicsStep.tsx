@@ -1,12 +1,12 @@
 import { Form, Input, InputNumber, Segmented, Select, Typography } from 'antd'
 
-import type { ModelAsset, Provider } from '../../api/types'
+import type { ModelAsset, Provider, RuntimeName } from '../../api/types'
 
 
 interface DeploymentBasicsStepProps {
   models: ModelAsset[]
   providers: Provider[]
-  runtime: 'vllm' | 'sglang'
+  runtime: RuntimeName
   loading: boolean
   providersLoading: boolean
   onModelChange: (modelId: string) => void
@@ -16,6 +16,7 @@ interface DeploymentBasicsStepProps {
 const runtimeImages = {
   vllm: ['vllm/vllm-openai:v0.27.1'],
   sglang: ['sglang-inkling:specforge', 'lmsysorg/sglang:dev-cu13-inkling-dspark'],
+  llama_cpp: ['nvidia/cuda:12.9.0-devel-ubuntu24.04'],
 } as const
 
 
@@ -72,7 +73,11 @@ export function DeploymentBasicsStep({
       <Form.Item name="runtime" label="推理运行时" rules={[{ required: true }]}>
         <Segmented
           block
-          options={[{ label: 'vLLM', value: 'vllm' }, { label: 'SGLang', value: 'sglang' }]}
+          options={[
+            { label: 'vLLM', value: 'vllm' },
+            { label: 'SGLang', value: 'sglang' },
+            { label: 'llama.cpp', value: 'llama_cpp' },
+          ]}
         />
       </Form.Item>
       <Form.Item name="image" label="ARM64 镜像" rules={[{ required: true, message: '请选择运行时镜像' }]}>

@@ -2,12 +2,12 @@ import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-quer
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { api } from '../api/client'
-import type { DeploymentRecommendation } from '../api/types'
+import type { DeploymentRecommendation, RuntimeName } from '../api/types'
 
 
 interface DeploymentRecommendationOptions {
   modelId?: string
-  runtime: 'vllm' | 'sglang'
+  runtime: RuntimeName
   image?: string
   providerId?: string | null
   enabled: boolean
@@ -15,7 +15,7 @@ interface DeploymentRecommendationOptions {
 
 interface RecommendationTuple {
   modelId: string
-  runtime: 'vllm' | 'sglang'
+  runtime: RuntimeName
   image: string
   providerId: string | null
 }

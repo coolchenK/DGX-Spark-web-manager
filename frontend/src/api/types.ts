@@ -263,8 +263,10 @@ export interface HuggingFaceModelInfo {
 export interface ManagerSettings {
   huggingface: { token_configured: boolean; cache_dir: string }
   models: { roots: string[] }
-  runtimes: { vllm: string[]; sglang: string[] }
+  runtimes: { vllm: string[]; sglang: string[]; llama_cpp: string[] }
 }
+
+export type RuntimeName = 'vllm' | 'sglang' | 'llama_cpp'
 
 export interface HistoryClearResult {
   status: 'cleared'
@@ -345,7 +347,7 @@ export interface DraftCandidate {
 }
 
 export interface RuntimeCapabilities {
-  runtime: 'vllm' | 'sglang'
+  runtime: RuntimeName
   image: string
   image_digest: string
   source: 'probe' | 'manifest'
@@ -362,7 +364,7 @@ export interface DeploymentRecommendation {
   status: 'complete' | 'partial' | 'unavailable'
   generated_at: string
   model_id: string
-  runtime: 'vllm' | 'sglang'
+  runtime: RuntimeName
   image_digest: string | null
   evidence_hash: string | null
   fields: Record<string, RecommendedValue>

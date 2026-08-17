@@ -12,7 +12,7 @@ import { SettingsPage } from './SettingsPage'
 const settings: ManagerSettings = {
   huggingface: { token_configured: false, cache_dir: '/models/.cache' },
   models: { roots: ['/models'] },
-  runtimes: { vllm: ['vllm:test'], sglang: ['sglang:test'] },
+  runtimes: { vllm: ['vllm:test'], sglang: ['sglang:test'], llama_cpp: ['llama:test'] },
 }
 
 const system: SystemSnapshot = {

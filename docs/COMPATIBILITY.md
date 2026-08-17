@@ -31,22 +31,25 @@ directly on the Spark. No x86 emulation is required.
 | --- | --- | --- |
 | SGLang | Local `sglang-inkling:specforge` image reports `linux/arm64`; Qwen responds through `/v1/models` and chat completions | Supported and enabled |
 | vLLM | `vllm/vllm-openai:v0.27.1` reports `linux/arm64`; Nemotron responds through `/v1/models` | Supported and enabled |
-| llama.cpp | No installed server/image was found and no GB10 minimum run was performed | Not enabled in this release |
+| llama.cpp | Native ARM64/CUDA `llama-server` under `/opt/llamacpp`; GGUF, mmproj and model-native MTP are adapter-managed | Supported and enabled |
 | TensorRT-LLM | No installed server/image was found and no minimum run was performed | Not enabled in this release |
 | Transformers server | No standalone OpenAI-compatible runtime was found | Not enabled in this release |
 
-Only the two verified adapters are offered in the deployment wizard. Upstream availability alone
+Only verified adapters are offered in the deployment wizard. Upstream availability alone
 is not treated as DGX Spark compatibility evidence.
 
-The current allowlist defaults include `vllm/vllm-openai:v0.27.1` and
-`sglang-inkling:specforge` (plus `lmsysorg/sglang:dev-cu13-inkling-dspark`). An image must be locally
+The current allowlist defaults include `vllm/vllm-openai:v0.27.1`,
+`sglang-inkling:specforge` (plus `lmsysorg/sglang:dev-cu13-inkling-dspark`), and the CUDA 12.9
+development image used with the server-managed llama.cpp runtime mount. An image must be locally
 available, ARM64/CUDA compatible, and present in the relevant configured allowlist before preview.
 
 ## Runtime Policy
 
 Managed deployments accept only the images listed in `DGX_ALLOWED_VLLM_IMAGES` and
-`DGX_ALLOWED_SGLANG_IMAGES`. This is an intentional security and compatibility boundary. Add a
-tested ARM64/CUDA image to the appropriate comma-separated setting before using it in a deployment.
+`DGX_ALLOWED_SGLANG_IMAGES` or `DGX_ALLOWED_LLAMA_CPP_IMAGES`. This is an intentional security and
+compatibility boundary. Add a tested ARM64/CUDA image to the appropriate comma-separated setting
+before using it in a deployment. The llama.cpp binary mount is controlled only by
+`DGX_LLAMA_CPP_HOST_DIR` and `DGX_LLAMA_CPP_MANAGER_DIR`; clients cannot submit host mount paths.
 
 Unmanaged inference containers are read-only imports. The manager can display, probe, and route to
 them, but removal is restricted to containers carrying the manager ownership label.
@@ -58,6 +61,7 @@ with networking disabled and no volumes:
 
 - vLLM: `vllm serve --help=speculative_config`
 - SGLang: `python3 -m sglang.launch_server --help`
+- llama.cpp: conservative manifest after validating the configured native server during preview
 
 Recognized help output determines speculative transport, supported methods, and method mappings.
 The probe has bounded logs and a timeout, and its container is removed. If the probe fails, the
@@ -82,6 +86,7 @@ selected image capability snapshot includes the method. Transport and tuning dif
 | --- | --- | --- |
 | vLLM | One JSON value passed to `--speculative-config` | Optional `num_speculative_tokens` (1-64); SGLang grouped fields are rejected |
 | SGLang | `--speculative-algorithm` and `--speculative-draft-model-path` flags | `num_steps` (1-32), `eagle_top_k` (1-32), and `num_draft_tokens` (1-256), set together or all omitted; `num_speculative_tokens` is rejected |
+| llama.cpp | Dedicated GGUF settings | Optional same-model `draft-mtp` with `mtp_tokens` (1-64); external Draft Model settings are rejected |
 
 Method mappings are resolved from the capability snapshot. The SGLang adapter maps `draft_model` to
 `STANDALONE`, `eagle` to `EAGLE`, `eagle3` to `EAGLE3`, and `mtp` to `NEXTN`; a missing or mismatched

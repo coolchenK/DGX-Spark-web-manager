@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import Settings
 
-RuntimeName = Literal["vllm", "sglang"]
+RuntimeName = Literal["vllm", "sglang", "llama_cpp"]
 
 GENERATION_DEFAULTS = (
     "temperature",
@@ -86,6 +86,14 @@ CONSERVATIVE_MANIFESTS: dict[RuntimeName, dict[str, Any]] = {
         },
         "speculative_transport": "flags",
     },
+    "llama_cpp": {
+        "generation_defaults": list(GENERATION_DEFAULTS),
+        "quantization_methods": ["auto", "gguf"],
+        "quantization_mapping": {},
+        "speculative_methods": [],
+        "method_mapping": {},
+        "speculative_transport": "none",
+    },
 }
 
 PROBE_COMMANDS: dict[RuntimeName, tuple[str, list[str]]] = {
@@ -114,6 +122,8 @@ def parse_runtime_help(
     image: str,
     image_digest: str,
 ) -> RuntimeCapabilities:
+    if runtime == "llama_cpp":
+        raise ValueError("llama.cpp capabilities use the server-side manifest")
     manifest = CONSERVATIVE_MANIFESTS[runtime]
     supported_mapping = dict(manifest["method_mapping"])
     warnings: list[str] = []
@@ -330,13 +340,22 @@ class RuntimeCapabilityService:
                 return cached.model_copy(update={"image": image}, deep=True)
 
             try:
-                help_text = self.probe_runner(runtime, image)
-                capabilities = parse_runtime_help(
-                    runtime,
-                    help_text,
-                    image=image,
-                    image_digest=image_digest,
-                )
+                if runtime == "llama_cpp":
+                    capabilities = RuntimeCapabilities(
+                        runtime=runtime,
+                        image=image,
+                        image_digest=image_digest,
+                        source="manifest",
+                        **CONSERVATIVE_MANIFESTS[runtime],
+                    )
+                else:
+                    help_text = self.probe_runner(runtime, image)
+                    capabilities = parse_runtime_help(
+                        runtime,
+                        help_text,
+                        image=image,
+                        image_digest=image_digest,
+                    )
             except Exception as exc:
                 capabilities = RuntimeCapabilities(
                     runtime=runtime,

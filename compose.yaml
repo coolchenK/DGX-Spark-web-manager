@@ -24,6 +24,8 @@ services:
       DGX_ALLOWED_ORIGINS: ${DGX_ALLOWED_ORIGINS:-http://localhost:3000}
       DGX_MODEL_ROOTS: /models,/hf-cache/hub
       DGX_MODEL_ROOT_MAPPINGS: /models=${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env};/hf-cache/hub=${HF_HOME_HOST:?Set HF_HOME_HOST in .env}/hub
+      DGX_LLAMA_CPP_HOST_DIR: ${LLAMA_CPP_HOME_HOST:-/opt/llamacpp}
+      DGX_LLAMA_CPP_MANAGER_DIR: /llamacpp-runtime
       DGX_HF_CACHE_DIR: /hf-cache/hub
       HOME: /hf-cache
       HF_HOME: /hf-cache
@@ -44,6 +46,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HF_HOME_HOST:?Set HF_HOME_HOST in .env}:/hf-cache
       - ${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env}:/models
+      - ${LLAMA_CPP_HOME_HOST:-/opt/llamacpp}:/llamacpp-runtime:ro
       - /etc/os-release:/host/etc/os-release:ro
       - /run/dgx-spark-manager:/run/dgx-spark-manager
       - /etc/dgx-spark-manager/ops-agent.key:/run/secrets/ops-agent.key:ro
