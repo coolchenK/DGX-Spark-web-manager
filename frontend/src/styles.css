@@ -242,6 +242,12 @@ button, input, textarea, select { letter-spacing: 0; }
 .settings-section p { margin: 3px 0 0; color: var(--color-muted); }
 .settings-secret > div:first-child { min-width: 280px; }
 .settings-secret .ant-form { justify-content: flex-end; }
+.settings-danger { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 0; border-block: 1px solid color-mix(in oklch, var(--color-border) 70%, oklch(0.58 0.2 25)); }
+.settings-danger h2 { margin: 3px 0; font-size: 16px; }
+.settings-danger p { margin: 0; color: var(--color-muted); overflow-wrap: anywhere; }
+.history-clear-dialog { display: grid; gap: 14px; }
+.history-clear-dialog p { margin: 0; color: var(--color-muted); }
+.history-clear-dialog label { margin-bottom: -8px; }
 .ant-tag { letter-spacing: 0; }
 .ant-table-cell { overflow-wrap: anywhere; }
 
@@ -275,6 +281,8 @@ button, input, textarea, select { letter-spacing: 0; }
   .form-grid { grid-template-columns: 1fr; }
   .hf-search { grid-template-columns: 1fr; }
   .settings-section { align-items: flex-start; flex-direction: column; }
+  .settings-danger { align-items: stretch; flex-direction: column; }
+  .settings-danger .ant-btn { width: 100%; }
   .log-toolbar { align-items: stretch; flex-direction: column; }
   .deployment-step-heading-actions { align-items: stretch; flex-direction: column; }
   .recommendation-row { grid-template-columns: 1fr; }

@@ -266,6 +266,18 @@ export interface ManagerSettings {
   runtimes: { vllm: string[]; sglang: string[] }
 }
 
+export interface HistoryClearResult {
+  status: 'cleared'
+  deleted: {
+    failed_tasks: number
+    operation_plans: number
+    ops_sessions: number
+    ops_messages: number
+    ops_tool_runs: number
+    audit_events: number
+  }
+}
+
 export type RecommendationSource =
   | 'model_card'
   | 'local_config'
