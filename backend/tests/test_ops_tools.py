@@ -17,7 +17,7 @@ from app.models import (
 from app.security import SecretBox
 from app.services.ops_agent import OpsAgentUnavailable
 from app.services.ops_provider import ReadOnlyToolRequest
-from app.services.ops_tools import OpsToolRegistry, ToolExecutionError
+from app.services.ops_tools import OpsToolRegistry, ToolExecutionError, sanitize_and_bound
 from pydantic import ValidationError
 from sqlalchemy import event
 
@@ -675,6 +675,38 @@ def test_single_pass_known_secret_replacement_does_not_mutate_redaction_marker(
     assert result.output["error"] == "[REDACTED]"
     assert result.error == "[REDACTED]"
     assert result.model_dump_json().count("[REDACTED]") == 3
+
+
+def test_single_pass_redacts_secrets_containing_the_redaction_marker() -> None:
+    marker_secret = "abc[REDACTED]xyz"
+    prefixed_marker_secret = "prefix[REDACTED]suffix"
+    overlapping_secret = "overlapping-secret"
+    longer_overlapping_secret = "overlapping-secret-value"
+
+    result = sanitize_and_bound(
+        {
+            "embedded": (f"before {marker_secret} and {prefixed_marker_secret} after"),
+            "multiple": (
+                f"{longer_overlapping_secret} {overlapping_secret} {longer_overlapping_secret}"
+            ),
+            "existing_marker": "before [REDACTED] after",
+            "exact_scalar": marker_secret,
+            "marker_stability": "RED [REDACTED] RED",
+        },
+        secrets=(
+            overlapping_secret,
+            "RED",
+            marker_secret,
+            longer_overlapping_secret,
+            prefixed_marker_secret,
+        ),
+    )
+
+    assert result["embedded"] == "before [REDACTED] and [REDACTED] after"
+    assert result["multiple"] == "[REDACTED] [REDACTED] [REDACTED]"
+    assert result["existing_marker"] == "before [REDACTED] after"
+    assert result["exact_scalar"] == "[REDACTED]"
+    assert result["marker_stability"] == "[REDACTED] [REDACTED] [REDACTED]"
 
 
 def test_non_credential_custom_header_is_not_collected_as_a_secret(

@@ -491,24 +491,45 @@ def _redact_credential_assignment(match: re.Match[str]) -> str:
 
 
 @lru_cache(maxsize=128)
-def _known_secret_pattern(secrets: tuple[str, ...]) -> re.Pattern[str] | None:
-    embedded = [re.escape(secret) for secret in secrets if len(secret) >= 8]
-    bounded = [
-        re.escape(secret) for secret in secrets if MIN_EMBEDDED_SECRET_CHARS <= len(secret) < 8
+def _known_secret_pattern(secrets: tuple[str, ...]) -> re.Pattern[str]:
+    ordered_secrets = sorted(
+        {secret for secret in secrets if secret}, key=lambda item: (-len(item), item)
+    )
+    marker_secrets = [
+        re.escape(secret) for secret in ordered_secrets if len(secret) >= 8 and _REDACTED in secret
     ]
-    alternatives = embedded
+    embedded = [
+        re.escape(secret)
+        for secret in ordered_secrets
+        if len(secret) >= 8 and _REDACTED not in secret
+    ]
+    bounded = [
+        re.escape(secret)
+        for secret in ordered_secrets
+        if MIN_EMBEDDED_SECRET_CHARS <= len(secret) < 8
+    ]
+    alternatives: list[str] = []
+    if marker_secrets:
+        alternatives.append(f"(?P<marker_secret>{'|'.join(marker_secrets)})")
+    alternatives.append(f"(?P<existing_marker>{re.escape(_REDACTED)})")
+    if embedded:
+        alternatives.append(f"(?P<embedded_secret>{'|'.join(embedded)})")
     if bounded:
-        alternatives.append(rf"(?<![A-Za-z0-9_])(?:{'|'.join(bounded)})(?![A-Za-z0-9_])")
-    return re.compile("|".join(alternatives)) if alternatives else None
+        alternatives.append(
+            rf"(?P<bounded_secret>(?<![A-Za-z0-9_])(?:{'|'.join(bounded)})(?![A-Za-z0-9_]))"
+        )
+    return re.compile("|".join(alternatives))
+
+
+def _replace_known_secret_match(match: re.Match[str]) -> str:
+    return match.group(0) if match.lastgroup == "existing_marker" else _REDACTED
 
 
 def _replace_known_secrets(value: str, secrets: tuple[str, ...]) -> str:
     if value in secrets:
         return _REDACTED
     pattern = _known_secret_pattern(secrets)
-    if pattern is None:
-        return value
-    return _REDACTED.join(pattern.sub(_REDACTED, segment) for segment in value.split(_REDACTED))
+    return pattern.sub(_replace_known_secret_match, value)
 
 
 def _sanitize_string(value: str, secrets: tuple[str, ...], limit: int) -> str:
