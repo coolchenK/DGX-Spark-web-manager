@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     ops_agent_socket: Path = Path("/run/dgx-spark-manager/ops-agent.sock")
     ops_agent_key_file: Path = Path("/run/secrets/ops-agent.key")
     ops_agent_connect_timeout_seconds: float = Field(default=3, ge=0.5, le=30)
-    ops_agent_read_timeout_seconds: float = Field(default=10, ge=0.5, le=120)
+    ops_agent_read_timeout_seconds: float = Field(default=30, ge=22, le=120)
     ops_agent_output_limit_bytes: int = Field(default=1_000_000, ge=10_000, le=10_000_000)
     recommendation_cache_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
     recommendation_card_max_chars: int = Field(default=100_000, ge=10_000, le=500_000)

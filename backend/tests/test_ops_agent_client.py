@@ -8,6 +8,7 @@ import tomllib
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from inspect import signature
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from app.services.ops_agent import (
 )
 from pydantic import ValidationError
 
+from host_agent.dgx_ops_agent.policy import READ_ONLY_TOOLS
 from host_agent.dgx_ops_agent.protocol import (
     MAX_FRAME_SIZE,
     PROTOCOL_VERSION,
@@ -416,6 +418,32 @@ def test_client_enforces_absolute_read_deadline_for_trickled_response(tmp_path):
     assert elapsed < 0.4
 
 
+def test_default_read_deadline_allows_valid_response_after_ten_seconds(tmp_path):
+    secret = b"d" * 32
+    key_path = tmp_path / "agent.key"
+    key_path.write_bytes(secret)
+    ticks = iter((0.0, 0.0, 0.0, 11.0, 11.0))
+    with _server(
+        tmp_path,
+        lambda request: encode_frame(
+            _response(
+                request,
+                secret,
+                result={"status": "ok", "protocol_version": PROTOCOL_VERSION},
+            )
+        ),
+    ) as server:
+        client = OpsAgentClient(
+            server.socket_path,
+            key_path,
+            connect_timeout_seconds=0.5,
+            output_limit_bytes=10_000,
+            _connection_factory=server.connection_factory,
+            _monotonic=lambda: next(ticks),
+        )
+        assert client.health().status == "ok"
+
+
 def test_client_rejects_recursive_output_over_configured_limit(tmp_path):
     secret = b"o" * 32
     key_path = tmp_path / "agent.key"
@@ -513,6 +541,10 @@ def test_ops_agent_settings_defaults_and_ranges(tmp_path):
     )
     assert settings.ops_agent_socket.as_posix() == "/run/dgx-spark-manager/ops-agent.sock"
     assert settings.ops_agent_key_file.as_posix() == "/run/secrets/ops-agent.key"
+    maximum_synchronous_window = max(spec.timeout for spec in READ_ONLY_TOOLS.values()) + 5 + 1
+    assert settings.ops_agent_read_timeout_seconds == 30
+    assert settings.ops_agent_read_timeout_seconds > maximum_synchronous_window
+    assert signature(OpsAgentClient).parameters["read_timeout_seconds"].default == 30
 
     common = {
         "secret_key": "test-secret-key-with-at-least-32-characters",
@@ -522,6 +554,7 @@ def test_ops_agent_settings_defaults_and_ranges(tmp_path):
         ("ops_agent_connect_timeout_seconds", 0.49),
         ("ops_agent_connect_timeout_seconds", 30.1),
         ("ops_agent_read_timeout_seconds", 0.49),
+        ("ops_agent_read_timeout_seconds", 21.9),
         ("ops_agent_read_timeout_seconds", 120.1),
         ("ops_agent_output_limit_bytes", 9_999),
         ("ops_agent_output_limit_bytes", 10_000_001),

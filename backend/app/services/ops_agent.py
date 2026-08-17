@@ -112,7 +112,7 @@ class _DeadlineReader:
         connection: socket.socket,
         timeout: float,
         *,
-        monotonic: Any = time.monotonic,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._connection = connection
         self._deadline = monotonic() + timeout
@@ -135,9 +135,10 @@ class OpsAgentClient:
         key_path: str | os.PathLike[str],
         *,
         connect_timeout_seconds: float = 3,
-        read_timeout_seconds: float = 10,
+        read_timeout_seconds: float = 30,
         output_limit_bytes: int = 1_000_000,
         _connection_factory: Callable[[], socket.socket] | None = None,
+        _monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.socket_path = Path(socket_path)
         self.key_path = Path(key_path)
@@ -145,6 +146,7 @@ class OpsAgentClient:
         self._read_timeout = read_timeout_seconds
         self._output_limit = output_limit_bytes
         self._connection_factory = _connection_factory
+        self._monotonic = _monotonic
         self._key_lock = threading.Lock()
         self._key_loaded = False
         self._key_unavailable = False
@@ -241,12 +243,12 @@ class OpsAgentClient:
             raise OpsAgentUnavailable() from None
 
     def _write(self, connection: socket.socket, frame: bytes) -> None:
-        deadline = time.monotonic() + self._read_timeout
+        deadline = self._monotonic() + self._read_timeout
         view = memoryview(frame)
         sent = 0
         try:
             while sent < len(view):
-                remaining = deadline - time.monotonic()
+                remaining = deadline - self._monotonic()
                 if remaining <= 0:
                     raise TimeoutError
                 connection.settimeout(remaining)
@@ -259,7 +261,13 @@ class OpsAgentClient:
 
     def _read(self, connection: socket.socket) -> dict[str, Any]:
         try:
-            return read_frame(_DeadlineReader(connection, self._read_timeout))
+            return read_frame(
+                _DeadlineReader(
+                    connection,
+                    self._read_timeout,
+                    monotonic=self._monotonic,
+                )
+            )
         except ProtocolError as exc:
             if isinstance(exc.__cause__, (OSError, TimeoutError)):
                 raise OpsAgentUnavailable() from None
