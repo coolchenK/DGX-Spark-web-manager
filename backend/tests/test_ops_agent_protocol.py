@@ -1200,9 +1200,10 @@ def test_streaming_redactor_bounds_direct_key_and_whitespace_decisions():
     redactor = StreamingRedactor()
     prefix = redactor.feed(b'"dgx_token"')
     released = redactor.feed(b" " * 1024)
+    assert released == b""
+    assert redactor._key_whitespace_count == 1024
     suffix = redactor.feed(b"plain") + redactor.finish()
     assert prefix + released + suffix == b'"[REDACTED]"' + b" " * 1024 + b"plain"
-    assert len(released) > 900
 
 
 def test_streaming_redactor_never_restores_configured_secret_used_as_json_key():
@@ -1221,6 +1222,66 @@ def test_streaming_redactor_never_restores_configured_secret_used_as_json_key():
         assert output == expected
         assert b"configured-secret" not in output
         assert b"value-secret" not in output
+
+
+@pytest.mark.parametrize(
+    ("key", "space_count", "secret_values", "expected_key"),
+    [
+        (b"DGX_API_KEY", 33, (), b"DGX_API_KEY"),
+        (b"API_KEY", 96, (), b"API_KEY"),
+        (b"configured-secret", 33, ("configured-secret",), b"[REDACTED]"),
+        (b"HF_ENDPOINT", 4096, (), b"HF_ENDPOINT"),
+    ],
+)
+def test_streaming_redactor_json_key_whitespace_is_unbounded_and_chunk_equivalent(
+    key,
+    space_count,
+    secret_values,
+    expected_key,
+):
+    secret = b"must-not-leak"
+    spaces = b" " * space_count
+    payload = b'{"' + key + b'"' + spaces + b': "' + secret + b'"}'
+    expected = b'{"' + expected_key + b'"' + spaces + b': "[REDACTED]"}'
+
+    def redact(chunks):
+        redactor = StreamingRedactor(secret_values=secret_values)
+        return b"".join(
+            [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
+        )
+
+    whole = redact([payload])
+    assert whole == expected
+    for split in range(len(payload) + 1):
+        split_output = redact([payload[:split], payload[split:]])
+        assert split_output == whole, f"split={split}"
+        assert secret not in split_output
+
+    bytewise = redact([bytes((byte,)) for byte in payload])
+    assert bytewise == whole
+    assert secret not in bytewise
+
+
+def test_streaming_redactor_json_key_wait_state_is_strictly_bounded():
+    redactor = StreamingRedactor()
+    prefix = b'{"HF_ENDPOINT"' + b" " * (16 * 1024)
+
+    released = redactor.feed(prefix)
+
+    string_state_size = sum(
+        len(value)
+        for value in vars(redactor).values()
+        if isinstance(value, str)
+    )
+    assert released == b'{"'
+    assert redactor._buffer == ""
+    assert string_state_size <= 512
+    assert redactor._key_whitespace_count == 16 * 1024
+
+    suffix = redactor.feed(b': "bounded-state-secret"}') + redactor.finish()
+    output = released + suffix
+    assert b"bounded-state-secret" not in output
+    assert output.endswith(b': "[REDACTED]"}')
 
 
 def test_streaming_redactor_covers_namespaced_sensitive_assignments():

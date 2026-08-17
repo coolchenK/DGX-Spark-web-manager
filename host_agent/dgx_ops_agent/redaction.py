@@ -9,7 +9,6 @@ from collections.abc import Iterable
 REDACTED = "[REDACTED]"
 _NORMAL_CARRY = 96
 _MAX_DIRECT_KEY_LENGTH = 256
-_MAX_KEY_WHITESPACE = 32
 _JSON_WHITESPACE = frozenset(" \t\r\n")
 _TOKEN_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-"
@@ -25,6 +24,12 @@ _ASSIGNMENT = re.compile(
     r"(?:secret[_-]access[_-]key|private[_-]key|api[_-]?key|access[_-]?token|"
     r"auth[_-]?token|token|password|passwd|secret)"
     r"['\"]?\s*[:=]\s*(?P<quote>['\"]?))(?=\S)"
+)
+_ASSIGNMENT_KEY = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"((?:[A-Za-z][A-Za-z0-9]*[_-])*"
+    r"(?:secret[_-]access[_-]key|private[_-]key|api[_-]?key|access[_-]?token|"
+    r"auth[_-]?token|token|password|passwd|secret)['\"])(?![A-Za-z0-9])"
 )
 _DIRECT_TOKEN = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:github_pat_|gh[oprsu]_|hf_|dgx_|sk-|xox[baprs]-)"
@@ -44,7 +49,7 @@ class StreamingRedactor:
         self._direct_text: str | None = ""
         self._direct_preservable = False
         self._direct_key_quote = ""
-        self._key_whitespace = ""
+        self._key_whitespace_count = 0
         self._finished = False
         secrets = tuple(value for value in secret_values if value)
         self._secret_pattern = (
@@ -113,6 +118,9 @@ class StreamingRedactor:
                 self._direct_key_quote = (
                     preceding if preceding in {'"', "'"} else ""
                 )
+            elif kind == "assignment_key":
+                output.append(marker)
+                self._mode = "key_colon"
             else:
                 output.append(marker)
                 if kind == "assignment" and match.groupdict().get("quote"):
@@ -131,6 +139,7 @@ class StreamingRedactor:
         candidates: list[tuple[str, re.Match[str]]] = []
         for kind, pattern in (
             ("authorization", _AUTHORIZATION),
+            ("assignment_key", _ASSIGNMENT_KEY),
             ("assignment", _ASSIGNMENT),
             ("direct", _DIRECT_TOKEN),
         ):
@@ -146,11 +155,18 @@ class StreamingRedactor:
                 candidates.append(("literal", match))
         if not candidates:
             return None
-        return min(candidates, key=lambda item: item[1].start())
+        priority = {"literal": 0, "direct": 1, "assignment_key": 2}
+        return min(
+            candidates,
+            key=lambda item: (item[1].start(), priority.get(item[0], 3)),
+        )
 
     def _consume_secret(self, output: list[str], *, final: bool) -> bool:
         if self._mode == "direct":
             return self._consume_direct(output, final=final)
+
+        if self._mode == "key_colon":
+            return self._consume_key_colon(output, final=final)
 
         if self._mode == "direct_key":
             return self._consume_direct_key(output, final=final)
@@ -208,7 +224,7 @@ class StreamingRedactor:
         if index is None:
             self._buffer = ""
             if final:
-                self._emit_direct_text(output, preserve=False)
+                self._emit_direct_text(output)
                 self._reset_direct()
             return False
 
@@ -217,12 +233,36 @@ class StreamingRedactor:
         if terminator == self._direct_key_quote:
             self._mode = "direct_key"
             self._quote = terminator
-            self._key_whitespace = ""
+            self._key_whitespace_count = 0
             return True
 
-        self._emit_direct_text(output, preserve=False)
+        self._emit_direct_text(output)
         output.append(terminator)
         self._reset_direct()
+        return True
+
+    def _consume_key_colon(self, output: list[str], *, final: bool) -> bool:
+        whitespace_length = 0
+        while (
+            whitespace_length < len(self._buffer)
+            and self._buffer[whitespace_length] in _JSON_WHITESPACE
+        ):
+            whitespace_length += 1
+        output.append(self._buffer[:whitespace_length])
+        self._buffer = self._buffer[whitespace_length:]
+
+        if not self._buffer:
+            if final:
+                self._mode = "normal"
+            return False
+
+        if self._buffer[0] == ":":
+            output.append(":")
+            self._buffer = self._buffer[1:]
+            self._mode = "assignment_value"
+            return True
+
+        self._mode = "normal"
         return True
 
     def _consume_direct_key(self, output: list[str], *, final: bool) -> bool:
@@ -232,32 +272,25 @@ class StreamingRedactor:
             and self._buffer[whitespace_length] in _JSON_WHITESPACE
         ):
             whitespace_length += 1
-        whitespace = self._buffer[:whitespace_length]
+        self._key_whitespace_count += whitespace_length
         self._buffer = self._buffer[whitespace_length:]
-
-        if len(self._key_whitespace) + len(whitespace) > _MAX_KEY_WHITESPACE:
-            self._emit_direct_text(output, preserve=False)
-            output.extend((self._quote, self._key_whitespace, whitespace))
-            self._reset_direct()
-            return True
-        self._key_whitespace += whitespace
 
         if not self._buffer:
             if final:
                 self._emit_direct_text(output, preserve=False)
-                output.extend((self._quote, self._key_whitespace))
+                output.extend((self._quote, " " * self._key_whitespace_count))
                 self._reset_direct()
             return False
 
         if self._buffer[0] == ":":
             self._emit_direct_text(output, preserve=True)
-            output.extend((self._quote, self._key_whitespace, ":"))
+            output.extend((self._quote, " " * self._key_whitespace_count, ":"))
             self._buffer = self._buffer[1:]
             self._reset_direct(mode="assignment_value")
             return True
 
         self._emit_direct_text(output, preserve=False)
-        output.extend((self._quote, self._key_whitespace))
+        output.extend((self._quote, " " * self._key_whitespace_count))
         self._reset_direct()
         return True
 
@@ -300,7 +333,7 @@ class StreamingRedactor:
         output.append(REDACTED)
         self._direct_text = None
 
-    def _emit_direct_text(self, output: list[str], *, preserve: bool) -> None:
+    def _emit_direct_text(self, output: list[str], *, preserve: bool = False) -> None:
         if self._direct_text is None:
             return
         output.append(
@@ -315,7 +348,7 @@ class StreamingRedactor:
         self._direct_preservable = False
         self._direct_key_quote = ""
         self._quote = ""
-        self._key_whitespace = ""
+        self._key_whitespace_count = 0
 
     @staticmethod
     def _find_unescaped_quote(
