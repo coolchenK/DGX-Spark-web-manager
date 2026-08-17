@@ -1,0 +1,18 @@
+[Unit]
+Description=DGX Spark privileged host operations agent
+Requires=dgx-spark-ops-agent.socket
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m dgx_ops_agent.server --systemd
+Environment=PYTHONPATH=/usr/local/lib/dgx-spark-ops-agent
+User=root
+Group=root
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=DGX Spark host operations agent socket
+
+[Socket]
+ListenStream=/run/dgx-spark-manager/ops-agent.sock
+SocketUser=root
+SocketGroup=dgx-spark-ops
+SocketMode=0660
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

@@ -11,6 +11,7 @@ services:
     user: "${PUID:-1000}:${PGID:-1000}"
     group_add:
       - "${DOCKER_GID:-988}"
+      - "${OPS_AGENT_GID:-989}"
     gpus: all
     environment:
       DGX_DATABASE_URL: sqlite:////app/data/manager.db
@@ -31,6 +32,11 @@ services:
       XDG_CACHE_HOME: /hf-cache/.cache
       DGX_AUTO_DISCOVERY: "true"
       DGX_DEPLOYMENT_STARTUP_TIMEOUT_SECONDS: ${DGX_DEPLOYMENT_STARTUP_TIMEOUT_SECONDS:-300}
+      DGX_OPS_AGENT_SOCKET: /run/dgx-spark-manager/ops-agent.sock
+      DGX_OPS_AGENT_KEY_FILE: /run/secrets/ops-agent.key
+      DGX_OPS_AGENT_CONNECT_TIMEOUT_SECONDS: ${DGX_OPS_AGENT_CONNECT_TIMEOUT_SECONDS:-3}
+      DGX_OPS_AGENT_READ_TIMEOUT_SECONDS: ${DGX_OPS_AGENT_READ_TIMEOUT_SECONDS:-30}
+      DGX_OPS_AGENT_OUTPUT_LIMIT_BYTES: ${DGX_OPS_AGENT_OUTPUT_LIMIT_BYTES:-1000000}
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
@@ -39,6 +45,8 @@ services:
       - ${HF_HOME_HOST:?Set HF_HOME_HOST in .env}:/hf-cache
       - ${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env}:/models
       - /etc/os-release:/host/etc/os-release:ro
+      - /run/dgx-spark-manager:/run/dgx-spark-manager
+      - /etc/dgx-spark-manager/ops-agent.key:/run/secrets/ops-agent.key:ro
     security_opt:
       - no-new-privileges:true
     logging:
