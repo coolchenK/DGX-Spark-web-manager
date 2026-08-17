@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, Protocol
 
@@ -45,6 +46,85 @@ ReadOnlyToolName = Literal[
     "manager.tasks",
     "manager.gateway",
 ]
+
+_CONTAINER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_SERVICE_PATTERN = re.compile(r"[A-Za-z0-9_.@-]+\Z")
+
+
+class _ToolArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class EmptyToolArguments(_ToolArguments):
+    pass
+
+
+class ContainerToolArguments(_ToolArguments):
+    container: str = Field(min_length=1, max_length=128)
+
+    @field_validator("container")
+    @classmethod
+    def validate_container(cls, value: str) -> str:
+        if _CONTAINER_PATTERN.fullmatch(value) is None:
+            raise ValueError("invalid container")
+        return value
+
+
+class ContainerTailToolArguments(ContainerToolArguments):
+    tail: int = Field(ge=1, le=5000, strict=True)
+
+
+class ServiceToolArguments(_ToolArguments):
+    service: str = Field(min_length=1, max_length=256)
+
+    @field_validator("service")
+    @classmethod
+    def validate_service(cls, value: str) -> str:
+        if value.startswith("-") or value.isdecimal() or _SERVICE_PATTERN.fullmatch(value) is None:
+            raise ValueError("invalid service")
+        return value
+
+
+class ServiceTailToolArguments(ServiceToolArguments):
+    tail: int = Field(ge=1, le=5000, strict=True)
+
+
+class ManagerTasksToolArguments(_ToolArguments):
+    limit: int = Field(default=20, ge=1, le=50, strict=True)
+
+
+class ManagerGatewayToolArguments(_ToolArguments):
+    minutes: int = Field(default=60, ge=1, le=1440, strict=True)
+    limit: int = Field(default=20, ge=1, le=50, strict=True)
+
+
+ReadOnlyToolArguments = (
+    EmptyToolArguments
+    | ContainerToolArguments
+    | ContainerTailToolArguments
+    | ServiceToolArguments
+    | ServiceTailToolArguments
+    | ManagerTasksToolArguments
+    | ManagerGatewayToolArguments
+)
+
+_TOOL_ARGUMENT_MODELS: dict[str, type[_ToolArguments]] = {
+    "host.memory": EmptyToolArguments,
+    "host.disk": EmptyToolArguments,
+    "host.gpu": EmptyToolArguments,
+    "host.ports": EmptyToolArguments,
+    "host.processes": EmptyToolArguments,
+    "docker.list": EmptyToolArguments,
+    "docker.inspect": ContainerToolArguments,
+    "docker.logs": ContainerTailToolArguments,
+    "docker.stats": ContainerToolArguments,
+    "systemd.status": ServiceToolArguments,
+    "systemd.journal": ServiceTailToolArguments,
+    "manager.summary": EmptyToolArguments,
+    "manager.tasks": ManagerTasksToolArguments,
+    "manager.gateway": ManagerGatewayToolArguments,
+}
+
 ChangeOperation = Literal[
     "start_deployment",
     "stop_deployment",
@@ -59,7 +139,29 @@ class ReadOnlyToolRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     name: ReadOnlyToolName
-    arguments: dict[str, Any] = Field(default_factory=dict, max_length=20)
+    arguments: ReadOnlyToolArguments
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_arguments_for_name(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        name = value.get("name")
+        arguments_model = _TOOL_ARGUMENT_MODELS.get(name)
+        if arguments_model is None:
+            return value
+        validated = arguments_model.model_validate(value.get("arguments", {}))
+        return {**value, "arguments": validated}
+
+    @model_validator(mode="after")
+    def arguments_match_name(self) -> ReadOnlyToolRequest:
+        expected = _TOOL_ARGUMENT_MODELS[self.name]
+        if type(self.arguments) is not expected:
+            raise ValueError("arguments do not match tool name")
+        return self
+
+    def argument_dict(self) -> dict[str, Any]:
+        return self.arguments.model_dump(mode="python")
 
 
 class ChangeStep(BaseModel):
