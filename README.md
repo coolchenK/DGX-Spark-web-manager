@@ -12,18 +12,25 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Real DGX Spark CPU, unified memory, disk, GPU, temperature, power, and driver status.
 - Read-only discovery of existing Docker inference services and Hugging Face caches.
 - Persistent Hugging Face search/download tasks with pause, resume, cancellation, and restart recovery.
-- Validated SGLang and vLLM deployment adapters with image and argument allowlists.
+- Validated SGLang, vLLM, and llama.cpp deployment adapters with image and argument allowlists.
 - Deployment preview, edit, clone, health-gated replacement, automatic rollback, and retained task history.
+- Automatic host-port allocation starts at `8000`, checks both Manager reservations and Docker
+  bindings, reuses the lowest released gap, and keeps the Docker port, endpoint, database row,
+  persisted spec, and ownership label consistent. Explicit ports are validated for conflicts.
 - Context, concurrency, batch-token, memory, quantization, route alias, and remote-code controls.
 - Model-card and device-aware deployment recommendations with per-field source, confidence, and
   warnings; optional bounded AI fallback for unresolved fields.
 - Optional compatible/reviewed Draft Model selection with runtime-specific speculative settings and
   combined base-plus-Draft resource checks.
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
+  Model discovery exposes runtime, endpoint, context length, maximum output tokens, and saved
+  generation defaults for each healthy running route; stopped deployments are hidden.
 - Hashed gateway API keys, encrypted provider/Hugging Face secrets, administrator sessions, CSRF protection, and audit history.
-- Third-party OpenAI-compatible providers for bounded deployment recommendations and diagnosis. AI
-  operations persist sessions and read-only tool results; exact Shell plans require administrator
-  approval before Host Agent execution.
+- DeepSeek is the intended reasoning backend for the AI operations assistant. Local Qwen, Gemma,
+  and GGUF services remain diagnosis targets, never the assistant brain. Configured OpenAI-compatible
+  providers can supply bounded model-card recommendations and diagnosis; AI operations persist
+  sessions and read-only tool results, while exact Shell plans require administrator approval before
+  Host Agent execution.
 - Responsive Ant Design interface with desktop/mobile layouts and light/dark/system themes.
 
 ## DGX Spark Installation
@@ -113,17 +120,23 @@ On startup the manager scans Docker without restarting or recreating existing co
 7. Follow the queued task through runtime health checks. The same panel then provides start, stop,
    restart, edit, clone, rollback-aware replacement, logs, task history, audit history, and gateway
    metrics for managed models. Discovered external containers remain protected from manager delete.
-8. Under **API Gateway**, create a gateway key and record it at creation time; only its hash is stored.
-   Call `GET /v1/models` to obtain the healthy route names, then use the selected name with an
-   OpenAI-compatible client. Saved generation defaults fill only omitted, runtime-supported request
-   fields, so callers can override them explicitly.
+8. Leave **主机端口** empty for a new deployment when automatic allocation is preferred. The service
+   chooses the lowest free port from `8000`, including ports held by stopped Manager deployments and
+   existing Docker containers. Clones also receive a fresh automatically allocated port.
+9. Under **API Gateway**, create a gateway key and record it at creation time; only its hash is stored.
+   Call `GET /v1/models` to obtain the healthy route names and their effective metadata, then use the
+   selected model ID with an OpenAI-compatible client. Saved generation defaults fill only omitted,
+   runtime-supported request fields, so callers can override them explicitly.
 
 Third-party AI providers are configured with an OpenAI-compatible base URL, API key, default model,
-timeout, and optional headers. Test a provider before using it for recommendations or diagnostics.
-The test reports connection/model-list readiness separately from a structured default-model probe.
-Diagnostic read tools use the local Host Agent automatically. A proposed Shell command remains a
-separate immutable plan: the panel shows its exact command, working directory, timeout, impact, and
-rollback, and execution requires explicit administrator approval.
+timeout, and optional headers. Configure the paid DeepSeek endpoint as the operations assistant
+provider and test it before use. The test reports connection/model-list readiness separately from a
+structured default-model probe. Diagnostic read tools use the local Host Agent automatically. When a
+model returns no data, disconnects, stops while thinking, reports a missing model, or becomes slow,
+the assistant can inspect Manager inventory, Docker state, GPU/memory, ports, logs, tasks, and gateway
+metrics without first asking for information already available to the Manager. A proposed Shell
+command remains a separate immutable plan: the panel shows its exact command, working directory,
+timeout, impact, and rollback, and execution requires explicit administrator approval.
 
 ## OpenAI API
 
@@ -137,8 +150,11 @@ client = OpenAI(
     api_key="dgx_your_key",
 )
 
+# Use an ID returned by GET /v1/models. Only running and healthy deployments are listed.
+model_id = client.models.list().data[0].id
+
 for chunk in client.chat.completions.create(
-    model="qwen3.8-27b",
+    model=model_id,
     messages=[{"role": "user", "content": "Hello"}],
     stream=True,
 ):
