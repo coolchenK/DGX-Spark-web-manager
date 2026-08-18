@@ -74,6 +74,23 @@ def test_hf_snapshot_requires_resolvable_repository_blobs(tmp_path):
     assert hf_snapshot_is_complete(repository, snapshot) is True
 
 
+def test_hf_snapshot_with_metadata_only_is_incomplete(tmp_path):
+    repository = tmp_path / "models--org--metadata-only"
+    snapshot = repository / "snapshots" / "commit123"
+    blob = repository / "blobs" / ("c" * 64)
+    snapshot.mkdir(parents=True)
+    blob.parent.mkdir()
+    link = snapshot / "README.md"
+    try:
+        link.symlink_to(Path("../../blobs") / blob.name)
+    except OSError:
+        pytest.skip("Symlink creation is unavailable")
+
+    blob.write_bytes(b"metadata")
+
+    assert hf_snapshot_is_complete(repository, snapshot) is False
+
+
 def test_scan_marks_broken_hf_snapshot_unavailable_and_recovers(settings):
     repository = settings.model_root_paths[0] / "models--org--broken-model"
     snapshot = repository / "snapshots" / "commit123"

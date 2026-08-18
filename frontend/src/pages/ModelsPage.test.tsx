@@ -133,6 +133,39 @@ describe('ModelsPage permanent deletion', () => {
     expect(within(record as HTMLElement).getByRole('button', { name: /部署模型/ })).toBeDisabled()
   })
 
+  it('distinguishes a local variant from an incomplete Hub cache with the same repository', async () => {
+    const repository = 'DavidAU/Qwen3.5-9B-Cold-Fusion-GAIN-v1.0-Uncensored-Heretic-NEO-MAX-Imatrix-GGUF'
+    const hubCache: ModelAsset = {
+      ...models[0],
+      id: 'hub-cache',
+      name: repository,
+      repository_id: repository,
+      source: 'huggingface',
+      local_path: '/hf-cache/hub/models--DavidAU--qwen35/snapshots/metadata',
+      size_bytes: 143.8 * 1024,
+      status: 'unavailable',
+    }
+    const localVariant: ModelAsset = {
+      ...models[0],
+      id: 'local-variant',
+      name: 'DavidAU/Qwen3.5-9B-C-Fusion-GAIN-NM-NEO-MTP-Q8_0',
+      repository_id: repository,
+      source: 'local',
+      local_path: '/models-extra/qwen35-gguf',
+      size_bytes: 13.4 * GiB,
+    }
+    renderModelsPage([hubCache, localVariant])
+
+    await waitFor(() => expect(api.get).toHaveBeenCalledWith('/api/models'))
+    await waitFor(
+      () => expect(screen.getAllByRole('button', { name: /部署模型/ })).toHaveLength(2),
+      { timeout: 5000 },
+    )
+    expect(document.body.textContent).toContain('HF 缓存')
+    expect(screen.getByRole('button', { name: /部署模型 Qwen3.5-9B-C-Fusion-GAIN-NM-NEO-MTP-Q8_0/ })).toBeInTheDocument()
+    expect(screen.queryAllByRole('button', { name: '部署 基础模型' })).toHaveLength(0)
+  })
+
   it('offers model-specific delete actions in the mobile list', async () => {
     renderModelsPage()
 

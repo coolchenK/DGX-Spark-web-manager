@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 
 from app.models import Deployment, ModelAsset, utc_now
 
+MODEL_PAYLOAD_SUFFIXES = (".safetensors", ".bin", ".gguf", ".pt", ".pth", ".onnx")
+
 
 def parse_hf_cache_repository(directory_name: str) -> str | None:
     if not directory_name.startswith("models--"):
@@ -63,6 +65,7 @@ def hf_snapshot_is_complete(repository_path: Path, snapshot_path: Path) -> bool:
 
         saw_file = False
         saw_nonempty_file = False
+        saw_model_payload = False
         for path in snapshot.rglob("*"):
             if path.is_symlink():
                 if lexical_blob_root.is_symlink():
@@ -87,7 +90,10 @@ def hf_snapshot_is_complete(repository_path: Path, snapshot_path: Path) -> bool:
                 return False
             saw_file = True
             saw_nonempty_file = saw_nonempty_file or size > 0
-        return saw_file and saw_nonempty_file
+            saw_model_payload = saw_model_payload or path.name.casefold().endswith(
+                MODEL_PAYLOAD_SUFFIXES
+            )
+        return saw_file and saw_nonempty_file and saw_model_payload
     except (OSError, RuntimeError, ValueError):
         return False
 

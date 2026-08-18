@@ -31,7 +31,10 @@ function modelFamilyName(model: ModelAsset): string {
 
 function variantLabel(model: ModelAsset, familyName: string): string {
   const identity = model.repository_id ?? model.name
-  if (identity === familyName) return '基础模型'
+  if (identity === familyName) {
+    if (model.name !== familyName) return model.name.split('/').pop() || model.name
+    return model.status === 'unavailable' ? 'HF 缓存' : '基础模型'
+  }
   return identity.slice(familyName.length).replace(/^[-_]/, '') || '变体'
 }
 
