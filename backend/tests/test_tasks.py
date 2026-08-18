@@ -179,6 +179,70 @@ def test_running_tasks_are_recovered_to_queue(settings):
         assert "Recovered after manager restart" in recovered.log
 
 
+def test_download_runs_alongside_control_tasks(settings):
+    from app.db import Database
+
+    database = Database(settings.database_url)
+    database.create_schema()
+    engine = TaskEngine(database.session_factory)
+    download_started = threading.Event()
+    control_started = threading.Event()
+    release_download = threading.Event()
+    control_finished = threading.Event()
+
+    def download_handler(_context, _payload):
+        download_started.set()
+        assert release_download.wait(timeout=5)
+        return {"kind": "download"}
+
+    def control_handler(_context, _payload):
+        control_started.set()
+        control_finished.set()
+        return {"kind": "control"}
+
+    engine.register("model.download", download_handler)
+    engine.register("deployment.action", control_handler)
+    engine.start()
+    try:
+        with database.session_factory() as db:
+            download = engine.create_task(
+                db,
+                task_type="model.download",
+                title="Download model",
+                input_json={},
+            )
+            control = engine.create_task(
+                db,
+                task_type="deployment.action",
+                title="Stop deployment",
+                input_json={},
+            )
+
+        assert download_started.wait(timeout=5)
+        assert control_started.wait(timeout=5)
+        with database.session_factory() as db:
+            for _ in range(50):
+                db.expire_all()
+                if db.get(TaskRecord, control.id).status == "succeeded":
+                    break
+                threading.Event().wait(0.05)
+            assert control_finished.is_set()
+            assert db.get(TaskRecord, download.id).status == "running"
+            assert db.get(TaskRecord, control.id).status == "succeeded"
+
+        release_download.set()
+        with database.session_factory() as db:
+            for _ in range(50):
+                db.expire_all()
+                if db.get(TaskRecord, download.id).status == "succeeded":
+                    break
+                threading.Event().wait(0.05)
+            assert db.get(TaskRecord, download.id).status == "succeeded"
+    finally:
+        release_download.set()
+        engine.stop()
+
+
 def test_task_transition_rejects_invalid_state_change():
     task = TaskRecord(type="scan", title="Scan", status="succeeded")
 

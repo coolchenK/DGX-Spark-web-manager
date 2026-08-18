@@ -90,12 +90,18 @@ TaskHandler = Callable[[TaskContext, dict[str, Any]], dict[str, Any] | None]
 
 
 class TaskEngine:
+    # Downloads are intentionally isolated from service mutations. A single
+    # download worker prevents competing downloads from saturating storage,
+    # while the control worker keeps deployment/uninstall operations ordered.
+    DOWNLOAD_TASK_TYPES = frozenset({"model.download"})
+
     def __init__(self, session_factory: sessionmaker[Session] | Callable[[], Any]):
         self.session_factory = session_factory
         self.handlers: dict[str, TaskHandler] = {}
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._threads: list[threading.Thread] = []
 
     def register(self, task_type: str, handler: TaskHandler) -> None:
         self.handlers[task_type] = handler
@@ -163,26 +169,40 @@ class TaskEngine:
         return count
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if any(thread.is_alive() for thread in self._threads):
             return
         self.recover_interrupted()
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="dgx-task-worker", daemon=True)
-        self._thread.start()
+        self._threads = []
+        for lane in ("control", "download"):
+            thread = threading.Thread(
+                target=self._run,
+                args=(lane,),
+                name=f"dgx-task-worker-{lane}",
+                daemon=True,
+            )
+            self._threads.append(thread)
+            thread.start()
+        self._thread = self._threads[0]
 
     def stop(self) -> None:
         self._stop.set()
         self._wake.set()
-        if self._thread:
-            self._thread.join(timeout=5)
+        for thread in self._threads:
+            thread.join(timeout=5)
 
-    def _claim(self) -> tuple[str, str, dict[str, Any]] | None:
+    def _claim(self, *, lane: str) -> tuple[str, str, dict[str, Any]] | None:
         with self.session_factory() as db:
-            task = db.scalar(
-                select(TaskRecord)
-                .where(TaskRecord.status == "queued")
-                .order_by(TaskRecord.created_at)
-            )
+            statement = select(TaskRecord).where(TaskRecord.status == "queued")
+            if lane == "download":
+                statement = statement.where(
+                    TaskRecord.type.in_(self.DOWNLOAD_TASK_TYPES)
+                )
+            else:
+                statement = statement.where(
+                    ~TaskRecord.type.in_(self.DOWNLOAD_TASK_TYPES)
+                )
+            task = db.scalar(statement.order_by(TaskRecord.created_at))
             if task is None:
                 return None
             transition_task(task, "running")
@@ -209,9 +229,9 @@ class TaskEngine:
             task.log = f"{task.log}Task {status}.\n"
             db.commit()
 
-    def _run(self) -> None:
+    def _run(self, lane: str) -> None:
         while not self._stop.is_set():
-            claimed = self._claim()
+            claimed = self._claim(lane=lane)
             if claimed is None:
                 self._wake.wait(timeout=1)
                 self._wake.clear()
