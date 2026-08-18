@@ -17,6 +17,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/app/backend
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends aria2 \
+    && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 10001 manager && useradd --uid 10001 --gid manager --create-home manager
 WORKDIR /app
 COPY pyproject.toml README.md alembic.ini ./

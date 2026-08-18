@@ -605,3 +605,108 @@ def test_huggingface_cli_errors_are_sanitized():
     result = sanitize("\x1b[31mPermission denied hf_abcdefghijklmnopqrstuvwxyz\x1b[0m")
 
     assert result == "Permission denied [REDACTED_HF_TOKEN]"
+
+
+def test_aria2_download_resumes_staging_and_publishes_snapshot(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "hub"
+    service = huggingface.HuggingFaceService(cache_dir, token="hf_test_token")
+    monkeypatch.setattr(
+        service,
+        "info",
+        lambda *_args: {
+            "sha": "abc",
+            "siblings": [
+                {"name": "model.safetensors", "size": 6},
+                {"name": "config.json", "size": 2},
+            ],
+            "total_size": 8,
+        },
+    )
+    monkeypatch.setattr(
+        huggingface.shutil,
+        "which",
+        lambda name: "/usr/bin/aria2c" if name == "aria2c" else None,
+    )
+    calls = []
+
+    class CompletedProcess:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("completed aria2 process should not be terminated")
+
+    def fake_popen(command, **_kwargs):
+        calls.append(command)
+        directory = Path(next(
+            value.removeprefix("--dir=")
+            for value in command
+            if value.startswith("--dir=")
+        ))
+        filename = next(
+            value.removeprefix("--out=")
+            for value in command
+            if value.startswith("--out=")
+        )
+        destination = directory / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if filename == "model.safetensors":
+            with destination.open("ab") as stream:
+                stream.write(b"def")
+        else:
+            destination.write_bytes(b"{}")
+        return CompletedProcess()
+
+    monkeypatch.setattr(huggingface.subprocess, "Popen", fake_popen)
+    staging = cache_dir / ".dgx-aria2" / "models--org--model" / "abc"
+    (staging / "model.safetensors").parent.mkdir(parents=True, exist_ok=True)
+    (staging / "model.safetensors").write_bytes(b"abc")
+    updates = []
+
+    class Context:
+        def update(self, **kwargs):
+            updates.append(kwargs)
+
+        def check_control(self):
+            return None
+
+    result = service.download_handler(
+        Context(),
+        {"repository_id": "org/model", "revision": "main"},
+    )
+
+    assert len(calls) == 2
+    assert all("--continue=true" in command for command in calls)
+    assert all("--always-resume=true" in command for command in calls)
+    assert any(
+        value == "--out=model.safetensors"
+        for value in calls[0]
+    )
+    snapshot = Path(result["local_path"])
+    assert (snapshot / "model.safetensors").read_bytes() == b"abcdef"
+    assert (snapshot / "config.json").read_bytes() == b"{}"
+    assert (cache_dir / "models--org--model" / "refs" / "main").read_text() == "abc"
+    assert not staging.exists()
+    assert updates[-1]["progress"] == 100
+
+
+def test_stale_incomplete_files_are_removed_but_recent_files_are_kept(tmp_path):
+    repository = tmp_path / "models--org--model"
+    repository.mkdir()
+    old = repository / "blobs" / "old.incomplete"
+    recent = repository / "blobs" / "recent.incomplete"
+    old.parent.mkdir()
+    old.write_bytes(b"old")
+    recent.write_bytes(b"recent")
+    old.touch()
+    recent.touch()
+    old_mtime = huggingface.time.time() - 7200
+    import os
+
+    os.utime(old, (old_mtime, old_mtime))
+
+    assert huggingface.stale_incomplete_files(repository) == 1
+    assert not old.exists()
+    assert recent.exists()

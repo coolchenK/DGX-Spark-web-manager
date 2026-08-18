@@ -10,11 +10,12 @@ import time
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from huggingface_hub import HfApi, hf_hub_download
 
 from app.services.discovery import directory_size, resolve_hf_snapshot
-from app.tasks.engine import TaskCancelled, TaskContext, TaskPaused
+from app.tasks.engine import TaskContext
 
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -108,6 +109,59 @@ def validate_disk_capacity(*, total_bytes: int, existing_bytes: int, free_bytes:
             f"Insufficient free disk space: need {required_bytes} bytes, have {free_bytes} bytes"
         )
     return required_bytes
+
+
+def repository_file_url(repository_id: str, revision: str, filename: str) -> str:
+    """Build a direct Hub URL that aria2 can resume with HTTP range requests."""
+    return (
+        f"https://huggingface.co/{quote(repository_id, safe='/')}/resolve/"
+        f"{quote(revision, safe='')}/{quote(filename, safe='/')}?download=true"
+    )
+
+
+def safe_relative_file_path(filename: str) -> Path:
+    """Reject repository file names that could escape a download directory."""
+    parts = filename.replace("\\", "/").split("/")
+    if not filename or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Unsafe repository file name: {filename}")
+    path = Path(*parts)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"Unsafe repository file name: {filename}")
+    return path
+
+
+def stale_incomplete_files(repository: Path, *, max_age_seconds: int = 3600) -> int:
+    """Remove old HF CLI temporary files without touching active downloads."""
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    if not repository.is_dir():
+        return removed
+    for candidate in repository.rglob("*.incomplete"):
+        try:
+            if candidate.is_file() and candidate.stat().st_mtime < cutoff:
+                candidate.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _safe_file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size if path.is_file() else 0
+    except OSError:
+        return 0
+
+
+def _stop_aria2(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
 
 
 def verify_snapshot_files(
@@ -359,78 +413,206 @@ class HuggingFaceService:
         info = self.info(repository_id, revision)
         include = [str(pattern) for pattern in (payload.get("include") or [])]
         exclude = [str(pattern) for pattern in (payload.get("exclude") or [])]
-        total_bytes = selected_download_size(
+        selected_names = selected_file_names(
             info["siblings"], include=include, exclude=exclude
         )
+        sizes = {
+            str(item.get("name")): max(0, int(item.get("size") or 0))
+            for item in info["siblings"]
+            if item.get("name") in selected_names
+        }
+        total_bytes = sum(sizes.values())
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         target = cache_repository_path(self.cache_dir, repository_id)
-        existing_bytes = directory_size(target) if target.exists() else 0
+        removed = stale_incomplete_files(target)
+        if removed:
+            context.update(message=f"Removed {removed} stale incomplete cache files")
+        snapshot = resolve_hf_snapshot(target)
+        existing_sources: dict[str, Path] = {}
+        for name in selected_names:
+            relative = safe_relative_file_path(name)
+            candidate = snapshot / relative if snapshot is not None else None
+            if candidate is None:
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+                if (
+                    is_safe_snapshot_file(snapshot, candidate, resolved)
+                    and resolved.is_file()
+                    and (not sizes[name] or resolved.stat().st_size == sizes[name])
+                ):
+                    existing_sources[name] = resolved
+            except (OSError, RuntimeError, ValueError):
+                continue
+        existing_bytes = sum(
+            sizes[name] if sizes[name] else _safe_file_size(source)
+            for name, source in existing_sources.items()
+        )
         disk = shutil.disk_usage(self.cache_dir)
         validate_disk_capacity(
             total_bytes=total_bytes,
             existing_bytes=existing_bytes,
             free_bytes=disk.free,
         )
-        executable = shutil.which("hf")
+        executable = shutil.which("aria2c")
         if not executable:
-            raise RuntimeError("Hugging Face CLI 'hf' is not installed")
-        command = [
-            executable,
-            "download",
-            repository_id,
-            "--revision",
-            revision,
-            "--cache-dir",
-            str(self.cache_dir),
-        ]
-        for pattern in include:
-            command.extend(["--include", str(pattern)])
-        for pattern in exclude:
-            command.extend(["--exclude", str(pattern)])
+            raise RuntimeError("aria2c is not installed")
+        commit_hash = str(info.get("sha") or revision)
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", commit_hash):
+            commit_hash = re.sub(r"[^A-Za-z0-9._-]+", "-", commit_hash)[:128]
+        staging = (
+            self.cache_dir
+            / ".dgx-aria2"
+            / f"models--{repository_id.replace('/', '--')}"
+            / commit_hash
+        )
+        staging.mkdir(parents=True, exist_ok=True)
         cache_home = self.cache_dir.parent
         (cache_home / "xet").mkdir(parents=True, exist_ok=True)
         (cache_home / ".cache").mkdir(parents=True, exist_ok=True)
         env = huggingface_environment(self.cache_dir, dict(os.environ))
-        if self.token:
-            env["HF_TOKEN"] = self.token
-        context.update(total_bytes=total_bytes, message=f"Downloading {repository_id}@{revision}")
-        with tempfile.TemporaryFile() as cli_output:
-            process = subprocess.Popen(
-                command,
-                env=env,
-                stdout=cli_output,
-                stderr=subprocess.STDOUT,
-            )
-            try:
-                while process.poll() is None:
-                    completed = directory_size(target) if target.exists() else 0
-                    progress = completed / total_bytes * 100 if total_bytes else 0
-                    context.update(
-                        progress=min(progress, 99),
-                        completed_bytes=completed,
-                        total_bytes=total_bytes,
-                    )
-                    try:
-                        context.check_control()
-                    except (TaskPaused, TaskCancelled):
-                        process.terminate()
-                        try:
-                            process.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                        raise
-                    time.sleep(1)
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-            if process.returncode != 0:
-                cli_output.seek(0)
-                details = sanitize_cli_output(cli_output.read().decode("utf-8", errors="replace"))
-                suffix = f": {details}" if details else ""
-                raise RuntimeError(
-                    f"Hugging Face download exited with code {process.returncode}{suffix}"
+        completed_by_name = dict(existing_sources)
+        context.update(
+            total_bytes=total_bytes,
+            completed_bytes=existing_bytes,
+            progress=(existing_bytes / total_bytes * 100 if total_bytes else 0),
+            message=f"Downloading {repository_id}@{revision} with aria2",
+        )
+
+        def completed_bytes() -> int:
+            total = existing_bytes
+            for name, path in completed_by_name.items():
+                if name in existing_sources:
+                    continue
+                size = _safe_file_size(path)
+                total += min(size, sizes[name]) if sizes[name] else size
+            return total
+
+        for name in selected_names:
+            if name in existing_sources:
+                continue
+            relative = safe_relative_file_path(name)
+            destination = staging / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            expected_size = sizes[name]
+            current_size = _safe_file_size(destination)
+            if expected_size and current_size == expected_size:
+                completed_by_name[name] = destination
+                continue
+            if expected_size and current_size > expected_size:
+                destination.unlink(missing_ok=True)
+                destination.with_name(destination.name + ".aria2").unlink(missing_ok=True)
+            url = repository_file_url(repository_id, revision, name)
+            command = [
+                executable,
+                url,
+                "--continue=true",
+                "--always-resume=true",
+                "--auto-file-renaming=false",
+                "--allow-overwrite=false",
+                "--file-allocation=none",
+                "--max-tries=5",
+                "--retry-wait=5",
+                "--timeout=60",
+                "--connect-timeout=30",
+                "--summary-interval=1",
+                "--console-log-level=warn",
+                "--download-result=hide",
+                f"--dir={destination.parent}",
+                f"--out={destination.name}",
+            ]
+            if self.token:
+                command.append(f"--header=Authorization: Bearer {self.token}")
+            with tempfile.TemporaryFile() as cli_output:
+                process = subprocess.Popen(
+                    command,
+                    env=env,
+                    stdout=cli_output,
+                    stderr=subprocess.STDOUT,
                 )
-        completed = directory_size(target)
+                try:
+                    while process.poll() is None:
+                        context.check_control()
+                        current = completed_bytes()
+                        context.update(
+                            progress=(current / total_bytes * 100 if total_bytes else 0),
+                            completed_bytes=current,
+                            total_bytes=total_bytes,
+                        )
+                        time.sleep(1)
+                finally:
+                    _stop_aria2(process)
+                if process.returncode != 0:
+                    cli_output.seek(0)
+                    details = sanitize_cli_output(
+                        cli_output.read().decode("utf-8", errors="replace")
+                    )
+                    suffix = f": {details}" if details else ""
+                    raise RuntimeError(
+                        f"aria2 download exited with code {process.returncode}{suffix}"
+                    )
+            if expected_size and _safe_file_size(destination) != expected_size:
+                raise RuntimeError(
+                    f"aria2 downloaded an unexpected size for {name}: "
+                    f"{_safe_file_size(destination)} != {expected_size}"
+                )
+            completed_by_name[name] = destination
+            current = completed_bytes()
+            context.update(
+                progress=(current / total_bytes * 100 if total_bytes else 100),
+                completed_bytes=current,
+                total_bytes=total_bytes,
+                message=f"Downloaded {name}",
+            )
+
+        if not selected_names:
+            raise RuntimeError("Downloaded repository has no valid snapshot")
+        sources = {
+            name: existing_sources.get(name) or completed_by_name[name]
+            for name in selected_names
+        }
+        snapshots = target / "snapshots"
+        snapshots.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshots / commit_hash
+        temporary_snapshot = snapshots / f".{commit_hash}.incomplete"
+        if temporary_snapshot.exists():
+            shutil.rmtree(temporary_snapshot)
+        temporary_snapshot.mkdir(parents=True)
+        try:
+            for name, source in sources.items():
+                relative = safe_relative_file_path(name)
+                destination = temporary_snapshot / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, destination)
+                except OSError:
+                    shutil.copy2(source, destination)
+            verify_snapshot_files(
+                temporary_snapshot,
+                info["siblings"],
+                include=include,
+                exclude=exclude,
+            )
+            if snapshot_path.exists():
+                shutil.rmtree(snapshot_path)
+            os.replace(temporary_snapshot, snapshot_path)
+        except Exception:
+            if temporary_snapshot.exists():
+                shutil.rmtree(temporary_snapshot)
+            raise
+        refs = target / "refs"
+        refs.mkdir(parents=True, exist_ok=True)
+        if revision == "main":
+            (refs / "main").write_text(commit_hash, encoding="utf-8")
+        elif re.fullmatch(r"[A-Za-z0-9._/-]+", revision):
+            try:
+                ref_path = refs / safe_relative_file_path(revision)
+            except ValueError:
+                ref_path = None
+            if ref_path is not None:
+                ref_path.parent.mkdir(parents=True, exist_ok=True)
+                ref_path.write_text(commit_hash, encoding="utf-8")
+        shutil.rmtree(staging, ignore_errors=True)
         snapshot = resolve_hf_snapshot(target)
         if snapshot is None:
             raise RuntimeError("Downloaded repository has no valid snapshot")
@@ -440,12 +622,16 @@ class HuggingFaceService:
             include=include,
             exclude=exclude,
         )
+        completed = sum(
+            sizes[name] if sizes[name] else _safe_file_size(source)
+            for name, source in sources.items()
+        )
         context.update(progress=100, completed_bytes=completed, total_bytes=total_bytes)
         return {
             "repository_id": repository_id,
             "revision": revision,
             "commit_hash": info["sha"],
             "local_path": str(snapshot),
-            "size_bytes": completed,
+            "size_bytes": directory_size(snapshot),
             "verified_files": len(verified_files),
         }
