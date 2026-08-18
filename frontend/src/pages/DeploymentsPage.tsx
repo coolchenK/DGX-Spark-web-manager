@@ -117,6 +117,11 @@ const basicFields: Array<keyof DeploymentWizardValues> = [
   'port',
 ]
 
+function isExternalDraftCandidate(candidate: DraftCandidate): boolean {
+  return candidate.method === 'draft_model'
+    && /[-_](?:dspark|dflash)$/i.test(candidate.repository_id ?? candidate.name)
+}
+
 const recommendationValidationFields: Array<string | string[]> = [
   'context_length',
   'memory_fraction',
@@ -427,12 +432,15 @@ export function DeploymentsPage() {
     applyingRecommendation.current = true
     const currentSpeculative = form.getFieldValue('speculative') as SpeculativeSettings | null | undefined
     const recommendedTokens = result.speculative_defaults?.num_speculative_tokens?.value
+    const compatibleDrafts = result.draft_candidates.filter((candidate) => candidate.status === 'compatible')
+    const preferredDraft = compatibleDrafts.find(isExternalDraftCandidate) ?? compatibleDrafts[0]
     const autoDraft = result.runtime !== 'llama_cpp'
       && !editingDeployment
       && !currentSpeculative
       && !currentEdited.has('speculative.draft_model_id')
-      && typeof recommendedTokens === 'number'
-      ? result.draft_candidates.find((candidate) => candidate.status === 'compatible')
+      && preferredDraft
+      && (typeof recommendedTokens === 'number' || isExternalDraftCandidate(preferredDraft))
+      ? preferredDraft
       : undefined
     const nextSpeculative = autoDraft
       ? {

@@ -127,10 +127,38 @@ describe('ModelsPage permanent deletion', () => {
     }
     renderModelsPage([incomplete])
 
-    const record = (await screen.findByText(incomplete.name, { selector: 'strong' })).closest('.mobile-record')
+    const record = (await screen.findByText('RadixArk/Qwen3.8-27B', { selector: 'strong' })).closest('.mobile-record')
     expect(record).not.toBeNull()
-    expect(within(record as HTMLElement).getByText('缓存不完整')).toBeInTheDocument()
-    expect(within(record as HTMLElement).getByRole('button', { name: /部署模型/ })).toBeDisabled()
+    expect(within(record as HTMLElement).getByText(/缓存不完整/)).toBeInTheDocument()
+    expect(within(record as HTMLElement).queryByRole('button', { name: /部署模型/ })).not.toBeInTheDocument()
+    expect(within(record as HTMLElement).getByText('Draft · DSpark')).toBeInTheDocument()
+  })
+
+  it('keeps DSpark attached to the base family and exposes only the base deployment action', async () => {
+    const repository = 'nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4'
+    const base: ModelAsset = {
+      ...models[0],
+      id: 'nemotron-base',
+      name: repository,
+      repository_id: repository,
+      size_bytes: 20.1 * GiB,
+    }
+    const draft: ModelAsset = {
+      ...models[0],
+      id: 'nemotron-draft',
+      name: `${repository}-DSpark`,
+      repository_id: `${repository}-DSpark`,
+      size_bytes: 1.3 * GiB,
+      capabilities: [],
+    }
+    renderModelsPage([base, draft])
+
+    const record = (await screen.findByText(repository, { selector: 'strong' })).closest('.mobile-record')
+    expect(record).not.toBeNull()
+    expect(within(record as HTMLElement).getByText('Draft · DSpark')).toBeInTheDocument()
+    expect(within(record as HTMLElement).getByRole('button', { name: /部署模型 基础模型/ })).toBeInTheDocument()
+    expect(within(record as HTMLElement).queryByRole('button', { name: /部署模型 DSpark/ })).not.toBeInTheDocument()
+    expect(within(record as HTMLElement).getByRole('button', { name: `删除模型 ${draft.name}` })).toBeInTheDocument()
   })
 
   it('distinguishes a local variant from an incomplete Hub cache with the same repository', async () => {

@@ -984,6 +984,30 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     expect(screen.getByRole('radio', { name: /Wrong-Tokenizer/ })).toBeDisabled()
   })
 
+  it('automatically applies a compatible DSpark draft when the card omits speculative token guidance', async () => {
+    const repository = 'nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4'
+    const recommendation = recommendationFixture({
+      speculative_defaults: {},
+      draft_candidates: [{
+        model_id: 'nemotron-dspark',
+        name: `${repository}-DSpark`,
+        repository_id: `${repository}-DSpark`,
+        method: 'draft_model',
+        status: 'compatible',
+        reasons: ['External speculative checkpoint explicitly matches the target repository'],
+        size_bytes: 1.3 * GiB,
+        estimated_total_bytes: 28 * GiB,
+      }],
+    })
+    const { user } = renderDeploymentsPage({ recommendations: async () => recommendation })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+
+    const draftRadio = screen.getByRole('radio', { name: new RegExp(`${repository}-DSpark`) })
+    expect(draftRadio).toBeChecked()
+    expect(screen.getByLabelText('每轮推测 Token')).toHaveValue('5')
+  })
+
   it('requires review acknowledgement before previewing a review draft', async () => {
     const { user, postSpy } = renderDeploymentsPage()
     await openCreateAndSelectModel(user)

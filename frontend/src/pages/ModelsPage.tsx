@@ -16,17 +16,25 @@ interface ModelFamily {
   key: string
   name: string
   variants: ModelAsset[]
+  baseVariants: ModelAsset[]
+  draftVariants: ModelAsset[]
   primary: ModelAsset
+}
+
+const DRAFT_ASSET_SUFFIX = /[-_]d(?:spark|flash)$/i
+
+function isDraftAsset(model: ModelAsset): boolean {
+  return DRAFT_ASSET_SUFFIX.test(model.repository_id ?? model.name)
 }
 
 function modelFamilyKey(model: ModelAsset): string {
   const identity = model.repository_id ?? model.name
-  return identity.trim().replace(/[-_]dspark$/i, '').toLowerCase()
+  return identity.trim().replace(DRAFT_ASSET_SUFFIX, '').toLowerCase()
 }
 
 function modelFamilyName(model: ModelAsset): string {
   const identity = model.repository_id ?? model.name
-  return identity.trim().replace(/[-_]dspark$/i, '')
+  return identity.trim().replace(DRAFT_ASSET_SUFFIX, '')
 }
 
 function variantLabel(model: ModelAsset, familyName: string): string {
@@ -80,20 +88,39 @@ export function ModelsPage() {
     },
   })
   const data = useMemo<ModelFamily[]>(() => {
-    const filtered = (models.data ?? []).filter((item) => `${item.name} ${item.repository_id ?? ''}`.toLowerCase().includes(filter.toLowerCase()))
     const groups = new Map<string, ModelAsset[]>()
-    for (const item of filtered) {
+    for (const item of models.data ?? []) {
       const key = modelFamilyKey(item)
       groups.set(key, [...(groups.get(key) ?? []), item])
     }
     return [...groups.entries()].map(([key, variants]) => {
       const ordered = [...variants].sort((left, right) => {
-        const leftAuxiliary = /[-_]dspark$/i.test(left.repository_id ?? left.name) ? 1 : 0
-        const rightAuxiliary = /[-_]dspark$/i.test(right.repository_id ?? right.name) ? 1 : 0
+        const leftAuxiliary = isDraftAsset(left) ? 1 : 0
+        const rightAuxiliary = isDraftAsset(right) ? 1 : 0
         return leftAuxiliary - rightAuxiliary || left.name.localeCompare(right.name)
       })
-      const name = ordered.length > 1 ? modelFamilyName(ordered[0]) : ordered[0].name
-      return { key, name, variants: ordered, primary: ordered.find((item) => item.status === 'available') ?? ordered[0] }
+      const baseVariants = ordered.filter((item) => !isDraftAsset(item))
+      const draftVariants = ordered.filter(isDraftAsset)
+      const base = baseVariants[0]
+      const name = base
+        ? (ordered.length > 1 ? modelFamilyName(base) : base.name)
+        : modelFamilyName(ordered[0])
+      return {
+        key,
+        name,
+        variants: ordered,
+        baseVariants,
+        draftVariants,
+        primary: base?.status === 'available'
+          ? base
+          : ordered.find((item) => item.status === 'available') ?? base ?? ordered[0],
+      }
+    }).filter((family) => {
+      const query = filter.trim().toLowerCase()
+      if (!query) return true
+      return `${family.name} ${family.variants.map((item) => `${item.name} ${item.repository_id ?? ''}`).join(' ')}`
+        .toLowerCase()
+        .includes(query)
     }).sort((left, right) => left.name.localeCompare(right.name))
   }, [models.data, filter])
   const deleteButton = (item: ModelAsset) => (
@@ -110,13 +137,13 @@ export function ModelsPage() {
       <div className="filter-bar"><Input.Search allowClear placeholder="按名称或仓库筛选" value={filter} onChange={(event) => setFilter(event.target.value)} /></div>
       <QueryState loading={models.isLoading} error={models.error} empty={!data.length} onRetry={() => models.refetch()}>
         <ResponsiveDataView data={data} rowKey="key" columns={[
-          { title: '模型家族', dataIndex: 'name', render: (_, item) => <div className="primary-cell"><strong>{item.name}</strong><small>{item.variants.length > 1 ? `${item.variants.length} 个相关变体已合并` : (item.primary.repository_id ?? item.primary.local_path)}</small><Space size={[2, 4]} wrap>{item.variants.map((variant) => <Tag key={variant.id}>{variantLabel(variant, item.name)}</Tag>)}</Space></div> },
+          { title: '模型家族', dataIndex: 'name', render: (_, item) => <div className="primary-cell"><strong>{item.name}</strong><small>{item.variants.length > 1 ? `${item.variants.length} 个相关变体已合并` : (item.primary.repository_id ?? item.primary.local_path)}</small><Space size={[2, 4]} wrap>{item.baseVariants.map((variant) => <Tag key={variant.id}>{variantLabel(variant, item.name)}</Tag>)}{item.draftVariants.map((variant) => <Tag color="blue" key={variant.id}>Draft · {variantLabel(variant, item.name)}</Tag>)}</Space></div> },
           { title: '来源', dataIndex: 'source', width: 120, render: (_, item) => <Tag>{item.primary.source}</Tag> },
-          { title: '大小', dataIndex: 'size_bytes', width: 110, render: (_, item) => item.variants.length === 1 ? sizeLabel(item.primary) : <Space direction="vertical" size={0}>{item.variants.map((variant) => <span key={variant.id}>{variantLabel(variant, item.name)}: {sizeLabel(variant)}</span>)}</Space> },
+          { title: '大小', dataIndex: 'size_bytes', width: 140, render: (_, item) => <Space direction="vertical" size={0}>{item.baseVariants.map((variant) => <span key={variant.id}>{variantLabel(variant, item.name)}: {sizeLabel(variant)}</span>)}{item.draftVariants.map((variant) => <Typography.Text type="secondary" key={variant.id}>Draft: {sizeLabel(variant)}</Typography.Text>)}</Space> },
           { title: '能力', dataIndex: 'capabilities', render: (_, item) => <Space size={[2, 4]} wrap>{[...new Set(item.variants.flatMap((variant) => variant.capabilities))].map((value) => <Tag key={value}>{value}</Tag>)}</Space> },
           { title: '状态', dataIndex: 'status', width: 100, render: (_, item) => <StatusBadge status={item.primary.status} /> },
-          { title: '', width: 180, render: (_, item) => <Space direction="vertical" size="small">{item.variants.map((variant) => <Space size="small" key={variant.id}><Button size="small" icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Space>)}</Space> },
-        ]} renderMobile={(item) => <div className="mobile-record"><Flex justify="space-between"><Space><AppstoreAddOutlined /><strong>{item.name}</strong></Space><StatusBadge status={item.primary.status} /></Flex><Typography.Text type="secondary">{item.variants.length > 1 ? `${item.variants.length} 个相关变体已合并` : (item.primary.repository_id ?? item.primary.local_path)}</Typography.Text><dl><div><dt>大小</dt><dd>{item.variants.length === 1 ? sizeLabel(item.primary) : item.variants.map((variant) => `${variantLabel(variant, item.name)}: ${sizeLabel(variant)}`).join(' · ')}</dd></div><div><dt>更新</dt><dd>{formatDate(item.primary.updated_at)}</dd></div></dl><Space direction="vertical" style={{ width: '100%' }}>{item.variants.map((variant) => <Flex gap="small" key={variant.id}><Button block icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署模型 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Flex>)}</Space></div>} />
+          { title: '', width: 180, render: (_, item) => <Space direction="vertical" size="small">{item.baseVariants.map((variant) => <Space size="small" key={variant.id}><Button size="small" icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Space>)}{item.draftVariants.map((variant) => <Space size="small" key={variant.id}><Tag color="blue">Draft · {variantLabel(variant, item.name)}</Tag>{deleteButton(variant)}</Space>)}</Space> },
+        ]} renderMobile={(item) => <div className="mobile-record"><Flex justify="space-between"><Space><AppstoreAddOutlined /><strong>{item.name}</strong></Space><StatusBadge status={item.primary.status} /></Flex><Typography.Text type="secondary">{item.variants.length > 1 ? `${item.variants.length} 个相关变体已合并` : (item.primary.repository_id ?? item.primary.local_path)}</Typography.Text><dl><div><dt>大小</dt><dd><Space direction="vertical" size={0}>{item.baseVariants.map((variant) => <span key={variant.id}>{variantLabel(variant, item.name)}: {sizeLabel(variant)}</span>)}{item.draftVariants.map((variant) => <Typography.Text type="secondary" key={variant.id}>Draft: {sizeLabel(variant)}</Typography.Text>)}</Space></dd></div><div><dt>更新</dt><dd>{formatDate(item.primary.updated_at)}</dd></div></dl><Space direction="vertical" style={{ width: '100%' }}>{item.baseVariants.map((variant) => <Flex gap="small" key={variant.id}><Button block icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署模型 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Flex>)}{item.draftVariants.map((variant) => <Flex align="center" justify="space-between" key={variant.id}><Tag color="blue">Draft · {variantLabel(variant, item.name)}</Tag>{deleteButton(variant)}</Flex>)}</Space></div>} />
       </QueryState>
       <Modal
         title="永久删除模型"
