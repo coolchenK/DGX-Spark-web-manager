@@ -1173,10 +1173,11 @@ class DeploymentRecommendationService:
         content = message.get("content")
         if not isinstance(content, str):
             raise ValueError("AI response shape is invalid")
-        if not content.strip() and not requested:
+        if not content.strip():
             # DeepSeek can put the entire validation trace in
-            # reasoning_content and leave the JSON channel empty when no
-            # field needs to be changed. That is a successful deep analysis.
+            # reasoning_content and leave the JSON channel empty. Treat that
+            # as a successful validation with no bounded overrides; any
+            # genuinely unresolved fields remain visible to the wizard.
             return {"fields": {}, "generation_defaults": {}}, False
         raw = _parse_ai_content(content)
         return self._sanitize_ai_values(
