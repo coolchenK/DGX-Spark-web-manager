@@ -146,6 +146,24 @@ def classify_draft_candidate(
         )
 
     if method == "draft_model":
+        external_draft = any(
+            marker in (draft.repository_id or draft.name).casefold()
+            for marker in ("-dspark", "_dspark", "-dflash", "_dflash")
+        )
+        if explicit_match and external_draft:
+            return _candidate(
+                draft,
+                method=method,
+                status="review" if resource_error else "compatible",
+                reasons=(
+                    [RESOURCE_ESTIMATE_UNAVAILABLE]
+                    if resource_error
+                    else [
+                        "External speculative checkpoint explicitly matches the target repository"
+                    ]
+                ),
+                resource_estimate=resource_estimate,
+            )
         target_fingerprint = target_evidence.tokenizer_fingerprint
         draft_fingerprint = draft_evidence.tokenizer_fingerprint
         if (

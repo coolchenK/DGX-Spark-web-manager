@@ -793,7 +793,12 @@ def _card_values(
         body = fence.body
         if language in {"bash", "sh", "shell"}:
             try:
-                deployment.update(_extract_shell_values(body))
+                shell_values = _extract_shell_values(body)
+                for key, value in shell_values.items():
+                    if key == "num_speculative_tokens":
+                        deployment.setdefault(key, value)
+                    else:
+                        deployment[key] = value
             except ValueError:
                 warnings.append("README.md contains a malformed shell fence")
         elif language == "json":
