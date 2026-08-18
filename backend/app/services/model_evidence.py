@@ -830,6 +830,10 @@ def _card_values(
                 continue
             if isinstance(value, dict):
                 generation.update(_extract_generation_values(value))
+    if any(score > 0 for score in deployment_scores.values()):
+        for key in list(deployment):
+            if deployment_scores.get(key) == 0:
+                del deployment[key]
     return deployment, generation
 
 
