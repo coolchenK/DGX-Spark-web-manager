@@ -78,7 +78,7 @@ interface DeploymentWizardValues extends DeploymentFormValues {
 const defaultValues: Partial<DeploymentWizardValues> = {
   runtime: 'vllm',
   image: 'vllm/vllm-openai:v0.27.1',
-  port: 8100,
+  port: undefined,
   context_length: 32768,
   memory_fraction: 0.8,
   max_concurrency: 8,

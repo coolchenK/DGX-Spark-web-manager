@@ -55,7 +55,7 @@ export interface DeploymentFormValues {
   route_alias?: string
   runtime: RuntimeName
   image: string
-  port: number
+  port?: number
   context_length: number
   memory_fraction: number
   max_concurrency: number
@@ -208,7 +208,7 @@ export function deploymentToFormValues(
     route_alias: routeAlias,
     runtime: deployment.runtime as RuntimeName,
     image: deployment.image ?? '',
-    port: deployment.port ?? 8100,
+    port: deployment.port ?? undefined,
     context_length: finiteNumber(saved.context_length ?? contextValue, 32768),
     memory_fraction: finiteNumber(saved.memory_fraction ?? memoryValue, 0.8),
     max_concurrency: finiteNumber(saved.max_concurrency ?? concurrencyValue, 8),
@@ -228,7 +228,7 @@ export function deploymentToFormValues(
   if (mode === 'clone') {
     values.name = `${values.name}-copy`
     values.api_model_name = `${values.api_model_name}-copy`
-    values.port = Math.min(values.port + 1, 65535)
+    values.port = undefined
     values.resource_warning_acknowledged = false
     if (values.speculative) {
       values.speculative = {

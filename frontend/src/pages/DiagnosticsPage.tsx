@@ -234,7 +234,17 @@ export function DiagnosticsPage() {
               </div>
             )}
             <Form.Item name="content" label="运维请求" rules={[{ required: true, whitespace: true, message: '请输入运维请求' }]}>
-              <Input.TextArea autoSize={{ minRows: 3, maxRows: 7 }} maxLength={10_000} placeholder="描述异常现象或需要完成的运维目标" />
+              <Input.TextArea
+                autoSize={{ minRows: 3, maxRows: 7 }}
+                maxLength={10_000}
+                placeholder="描述异常现象或需要完成的运维目标（Enter 发送，Shift+Enter 换行）"
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault()
+                    form.submit()
+                  }
+                }}
+              />
             </Form.Item>
             <div className="ops-composer-actions">
               <Typography.Text type="secondary">{busy ? '正在处理当前请求' : '所有变更操作均需审批'}</Typography.Text>

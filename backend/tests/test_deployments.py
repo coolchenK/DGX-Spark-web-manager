@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1876,6 +1877,41 @@ def test_create_handler_rechecks_resources_before_any_docker_call(tmp_path):
     assert docker_calls == 0
 
 
+def test_create_handler_with_auto_port_rechecks_resources_before_docker_call(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'handler-auto-port-preflight.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base")
+        base_id = base.id
+    service = build_preflight_service(
+        database,
+        (root,),
+        estimator=StaticEstimator("blocked"),
+    )
+    docker_calls = 0
+
+    def docker_client():
+        nonlocal docker_calls
+        docker_calls += 1
+        raise AssertionError("Docker must not be touched after a blocked preflight")
+
+    service.docker_client = docker_client
+    spec = DeploymentSpec(
+        name="base-auto-port",
+        model_id=base_id,
+        model_path=str(root / "base"),
+        api_model_name="base-auto-port",
+        runtime="vllm",
+        image="vllm:test",
+    )
+
+    with pytest.raises(ValueError, match="Deployment is blocked"):
+        service.create_handler(type("Context", (), {})(), spec.model_dump(mode="json"))
+
+    assert docker_calls == 0
+
+
 @pytest.mark.parametrize(
     ("existing_name", "existing_api"),
     [("base", "other-api"), ("other-name", "base")],
@@ -2830,6 +2866,107 @@ def test_settings_preserve_container_to_host_model_root_order(tmp_path):
 
     assert getattr(settings, "host_model_root_paths", ()) == (host_models, host_hf)
     assert getattr(settings, "deployment_startup_timeout_seconds", None) == 1200
+
+
+def test_port_allocator_uses_db_and_docker_ports_and_reuses_lowest_gap(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'ports.db'}")
+    database.create_schema()
+
+    class Container:
+        id = "external-container"
+        attrs = {
+            "HostConfig": {
+                "PortBindings": {"8000/tcp": [{"HostPort": "8003"}]}
+            }
+        }
+
+    class Containers:
+        def list(self, all=True):
+            return [Container()]
+
+    docker_client = type("Client", (), {"containers": Containers()})()
+    service = deployment_service.DeploymentService(
+        adapters={},
+        session_factory=database.session_factory,
+        model_roots=(tmp_path,),
+        docker_client=docker_client,
+    )
+    with database.session_factory() as db:
+        db.add_all(
+            [
+                Deployment(
+                    name="one",
+                    runtime="vllm",
+                    endpoint_url="http://one",
+                    api_model_name="one",
+                    port=8000,
+                ),
+                Deployment(
+                    name="three",
+                    runtime="vllm",
+                    endpoint_url="http://three",
+                    api_model_name="three",
+                    port=8002,
+                ),
+            ]
+        )
+        db.commit()
+        assert service._allocate_deployment_port(db) == 8001
+        db.query(Deployment).filter(Deployment.name == "one").delete()
+        db.commit()
+        assert service._allocate_deployment_port(db) == 8000
+
+
+def test_deployment_spec_can_omit_port_for_service_allocation():
+    spec = DeploymentSpec(
+        name="automatic-port",
+        model_path="/models/automatic-port",
+        api_model_name="automatic-port",
+        runtime="vllm",
+        image="vllm:test",
+    )
+
+    assert spec.port is None
+
+
+def test_concurrent_port_allocations_are_serialized_and_unique(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'concurrent-ports.db'}")
+    database.create_schema()
+    service = deployment_service.DeploymentService(
+        adapters={},
+        session_factory=database.session_factory,
+        model_roots=(tmp_path,),
+        docker_client=type(
+            "Client",
+            (),
+            {"containers": type("Containers", (), {"list": lambda self, all=True: []})()},
+        )(),
+    )
+    results: list[int] = []
+
+    def create(index: int):
+        with service._port_allocation_lock:
+            with database.session_factory() as db:
+                port = service._allocate_deployment_port(db)
+                db.add(
+                    Deployment(
+                        name=f"parallel-{index}",
+                        runtime="vllm",
+                        endpoint_url=f"http://parallel-{index}",
+                        api_model_name=f"parallel-{index}",
+                        port=port,
+                    )
+                )
+                db.commit()
+                results.append(port)
+
+    threads = [threading.Thread(target=create, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(results) == [8000, 8001]
 
 
 def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):

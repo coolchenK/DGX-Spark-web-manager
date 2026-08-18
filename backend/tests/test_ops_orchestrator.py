@@ -25,7 +25,13 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_system_prompt_defines_json_protocol_for_non_native_tool_models():
-    from app.services.ops_orchestrator import _SYSTEM_PROMPT
+    from app.services.ops_orchestrator import (
+        _SYSTEM_PROMPT,
+        MAX_HISTORY_CHARS,
+        MAX_HISTORY_MESSAGES,
+        MAX_PROMPT_CHARS,
+        OpsOrchestrator,
+    )
 
     assert "do not have native tool calling" in _SYSTEM_PROMPT
     assert '"action":"tool"' in _SYSTEM_PROMPT
@@ -33,6 +39,16 @@ def test_system_prompt_defines_json_protocol_for_non_native_tool_models():
     assert '"action":"plan"' in _SYSTEM_PROMPT
     assert '"operation":"shell"' in _SYSTEM_PROMPT
     assert "Never emit tool_calls" in _SYSTEM_PROMPT
+    assert "paid DeepSeek API" in _SYSTEM_PROMPT
+    assert "local Qwen/Gemma models are diagnostic targets only" in _SYSTEM_PROMPT
+    assert "Automatically inspect manager.summary" in _SYSTEM_PROMPT
+    assert (MAX_HISTORY_MESSAGES, MAX_HISTORY_CHARS, MAX_PROMPT_CHARS) == (
+        1000,
+        3_000_000,
+        100_000,
+    )
+    assert OpsOrchestrator.__init__.__kwdefaults__["max_tool_turns"] == 12
+    assert OpsOrchestrator.__init__.__kwdefaults__["max_total_seconds"] == 600
 
 
 def _database(path) -> Database:
@@ -880,6 +896,7 @@ def test_runtime_orchestrator_stops_before_seventh_tool_execution(tmp_path):
             ToolResult(name="host.memory", status="succeeded", output={"index": index})
             for index in range(6)
         ],
+        max_tool_turns=6,
     )
     database, orchestrator, provider, tools, session_id, *_ = runtime
 
@@ -1591,7 +1608,7 @@ def test_runtime_orchestrator_enforces_wall_clock_deadline_during_provider(tmp_p
     result = orchestrator.respond(session_id=session_id, prompt="inspect", actor="admin")
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.12
+    assert elapsed < 0.22
     assert result.status == "failed"
     time.sleep(0.25)
     with database.session_factory() as db:

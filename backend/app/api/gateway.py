@@ -154,6 +154,14 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
     for deployment in deployments:
         route_name = deployment_route_name(deployment)
         if route_name not in routes:
+            config = deployment.config if isinstance(deployment.config, Mapping) else {}
+            spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
+            context_length = spec.get("context_length") or config.get("context_length")
+            max_output_tokens = (
+                (spec.get("generation_defaults") or {}).get("max_tokens")
+                if isinstance(spec.get("generation_defaults"), Mapping)
+                else None
+            )
             routes[route_name] = {
                 "id": route_name,
                 "object": "model",
@@ -162,6 +170,17 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
                 "root": route_name,
                 "capabilities": list(deployment.capabilities),
                 "instances": 1,
+                "runtime": deployment.runtime,
+                "endpoint_url": deployment.endpoint_url,
+                "context_length": context_length,
+                "max_model_len": context_length,
+                "max_context_tokens": context_length,
+                "max_output_tokens": max_output_tokens,
+                "generation_defaults": (
+                    (spec.get("generation_defaults") or {})
+                    if isinstance(spec.get("generation_defaults"), Mapping)
+                    else {}
+                ),
             }
             continue
         route = routes[route_name]

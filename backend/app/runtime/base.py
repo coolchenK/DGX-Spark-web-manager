@@ -147,7 +147,7 @@ class DeploymentSpec(BaseModel):
     route_alias: str | None = Field(default=None, min_length=1, max_length=255)
     runtime: str
     image: str
-    port: int = Field(ge=1024, le=65535)
+    port: int | None = Field(default=None, ge=1024, le=65535)
     context_length: int = Field(default=32768, ge=1024, le=1_048_576)
     memory_fraction: float = Field(default=0.8, ge=0.05, le=0.98)
     max_concurrency: int = Field(default=8, ge=1, le=1024)

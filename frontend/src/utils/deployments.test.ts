@@ -93,12 +93,11 @@ describe('deploymentToFormValues', () => {
     })
   })
 
-  it('creates unique names and ports when cloning', () => {
+  it('clears the port when cloning so the service allocates the lowest gap', () => {
     expect(deploymentToFormValues(deployment, model, 'clone')).toMatchObject({
       name: 'qwen-production-copy',
       api_model_name: 'qwen-instance-a-copy',
       route_alias: 'qwen-production',
-      port: 8101,
       speculative: {
         draft_model_id: 'draft-1',
         method: 'eagle3',
@@ -106,6 +105,13 @@ describe('deploymentToFormValues', () => {
       },
       resource_warning_acknowledged: false,
     })
+    expect(deploymentToFormValues(deployment, model, 'clone').port).toBeUndefined()
+  })
+
+  it('preserves an empty port for historical deployments without an allocation', () => {
+    expect(
+      deploymentToFormValues({ ...deployment, port: null }, model, 'edit').port,
+    ).toBeUndefined()
   })
 
   it('restores saved recommendation provenance when editing', () => {

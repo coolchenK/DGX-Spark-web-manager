@@ -52,6 +52,105 @@ def test_models_requires_api_key_and_lists_healthy_deployments(client):
     assert response.json()["data"][0]["id"] == "qwen-upstream"
 
 
+def test_models_exposes_runtime_context_and_generation_metadata_and_hides_stopped(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        db.add_all(
+            [
+                Deployment(
+                    name="qwen-metadata",
+                    runtime="vllm",
+                    endpoint_url="http://127.0.0.1:8012",
+                    api_model_name="qwen38-upstream",
+                    status="running",
+                    health="healthy",
+                    config={
+                        "spec": {
+                            "context_length": 262144,
+                            "generation_defaults": {
+                                "temperature": 0.0,
+                                "top_p": 1.0,
+                                "top_k": 20,
+                                "max_tokens": 8192,
+                            },
+                        }
+                    },
+                ),
+                Deployment(
+                    name="stopped-metadata",
+                    runtime="vllm",
+                    endpoint_url="http://127.0.0.1:8013",
+                    api_model_name="stopped-upstream",
+                    status="stopped",
+                    health="unknown",
+                    config={"spec": {"context_length": 4096}},
+                ),
+            ]
+        )
+        db.commit()
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    models = {item["id"]: item for item in response.json()["data"]}
+    assert models["qwen38-upstream"] == {
+        "id": "qwen38-upstream",
+        "object": "model",
+        "created": models["qwen38-upstream"]["created"],
+        "owned_by": "dgx-spark-manager",
+        "root": "qwen38-upstream",
+        "capabilities": [],
+        "instances": 1,
+        "runtime": "vllm",
+        "endpoint_url": "http://127.0.0.1:8012",
+        "context_length": 262144,
+        "max_model_len": 262144,
+        "max_context_tokens": 262144,
+        "max_output_tokens": 8192,
+        "generation_defaults": {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 20,
+            "max_tokens": 8192,
+        },
+    }
+    assert "stopped-upstream" not in models
+
+
+def test_models_does_not_overwrite_shared_route_metadata_with_second_instance(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        for name, endpoint, context in (
+            ("shared-a", "http://127.0.0.1:8011", 8192),
+            ("shared-b", "http://127.0.0.1:8012", 262144),
+        ):
+            db.add(
+                Deployment(
+                    name=name,
+                    runtime="vllm",
+                    endpoint_url=endpoint,
+                    api_model_name=f"{name}-upstream",
+                    status="running",
+                    health="healthy",
+                    capabilities=["chat"],
+                    config={
+                        "route_alias": "shared-route",
+                        "spec": {"context_length": context},
+                    },
+                )
+            )
+        db.commit()
+
+    models = client.get(
+        "/v1/models", headers={"Authorization": f"Bearer {key}"}
+    ).json()["data"]
+    shared = next(item for item in models if item["id"] == "shared-route")
+
+    assert shared["instances"] == 2
+    assert shared["endpoint_url"] == "http://127.0.0.1:8011"
+    assert shared["context_length"] == 8192
+
+
 @respx.mock
 def test_chat_completions_routes_alias_and_records_usage(client):
     key = _create_gateway_key(client)

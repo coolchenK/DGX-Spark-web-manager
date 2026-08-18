@@ -8,6 +8,7 @@ import pytest
 from app.models import Provider
 from app.security import SecretBox
 from app.services.ops_provider import (
+    MAX_PROVIDER_RESPONSE_BYTES,
     MAX_REPAIR_MESSAGE_CHARS,
     MAX_REPAIR_MESSAGES,
     MAX_REPAIR_TOTAL_CHARS,
@@ -72,6 +73,12 @@ def _client(handler) -> OpsProviderClient:
         endpoint_resolver=_endpoint,
         http_client_factory=factory,
     )
+
+
+def test_structured_provider_response_budgets_match_long_context_contract():
+    assert MAX_PROVIDER_RESPONSE_BYTES == 4 * 1024 * 1024
+    assert MAX_REPAIR_MESSAGE_CHARS == 12_000
+    assert MAX_REPAIR_TOTAL_CHARS == 128_000
 
 
 def test_assistant_turn_contract_is_strict_and_action_specific() -> None:
@@ -139,7 +146,7 @@ def test_reasons_then_repairs_with_larger_budget_without_using_reasoning_content
     result = _client(handler).complete(_provider(), _messages())
 
     assert result.summary == "repaired"
-    assert [request["max_tokens"] for request in requests] == [2048, 4096]
+    assert [request["max_tokens"] for request in requests] == [16384, 32768]
     assert requests[0]["messages"] != requests[1]["messages"]
     assert any(
         message.get("content") == "Check the DGX Spark"
@@ -319,7 +326,7 @@ def test_response_format_named_400_retries_same_attempt_without_parameter() -> N
     assert result.summary == "fallback"
     assert "response_format" in requests[0]
     assert "response_format" not in requests[1]
-    assert requests[0]["max_tokens"] == requests[1]["max_tokens"] == 2048
+    assert requests[0]["max_tokens"] == requests[1]["max_tokens"] == 16384
 
 
 @pytest.mark.parametrize(

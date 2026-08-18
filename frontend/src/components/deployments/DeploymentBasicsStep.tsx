@@ -84,7 +84,7 @@ export function DeploymentBasicsStep({
         <Select options={runtimeImages[runtime].map((value) => ({ value, label: value }))} />
       </Form.Item>
       <div className="form-grid">
-        <Form.Item name="port" label="主机端口" rules={[{ required: true, message: '请输入主机端口' }]}>
+        <Form.Item name="port" label="主机端口" extra="留空则从 8000 起自动分配">
           <InputNumber min={1024} max={65535} />
         </Form.Item>
         <Form.Item name="provider_id" label="AI 推荐服务">

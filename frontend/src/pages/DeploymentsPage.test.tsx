@@ -1145,7 +1145,7 @@ describe('DeploymentsPage assisted deployment wizard', () => {
 
     expect(screen.getByLabelText('部署名称')).toHaveValue('qwen-production-copy')
     expect(screen.getByLabelText('实例模型名称')).toHaveValue('qwen-production-copy')
-    expect(screen.getByLabelText('主机端口')).toHaveValue('8101')
+    expect(screen.getByLabelText('主机端口')).toHaveValue('')
     expect(screen.getByText('新建模型部署')).toBeInTheDocument()
   })
 

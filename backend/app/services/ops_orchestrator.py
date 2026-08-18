@@ -29,12 +29,15 @@ from app.services.ops_tools import OpsToolRegistry
 from app.services.provider_errors import OpsProviderError
 from app.tasks.engine import TaskCancelled, TaskContext, TaskPaused
 
-MAX_HISTORY_MESSAGES = 100
-MAX_HISTORY_CHARS = 100_000
-MAX_PROMPT_CHARS = 10_000
+MAX_HISTORY_MESSAGES = 1_000
+MAX_HISTORY_CHARS = 3_000_000
+MAX_PROMPT_CHARS = 100_000
 _PROCESSABLE_STATUSES = ("active", "answered", "needs_input", "failed")
 _SYSTEM_PROMPT = (
-    "You are the DGX Spark operations assistant. You do not have native tool calling. "
+    "You are the DeepSeek-powered DGX Spark operations assistant. "
+    "The reasoning model is the paid DeepSeek API configured in the Manager; "
+    "local Qwen/Gemma models are diagnostic targets only, never the assistant brain. "
+    "You do not have native tool calling. "
     "Return exactly one JSON object in message.content, with no markdown or commentary. "
     "For a read-only inspection use: "
     '{"action":"tool","summary":"why this read is needed","tool":'
@@ -55,7 +58,14 @@ _SYSTEM_PROMPT = (
     "also requires integer tail. manager.tasks requires integer limit. manager.gateway "
     "requires integer minutes and limit. Other tools use empty arguments. Never emit "
     "tool_calls. Never expose credentials. Read-only tools may be requested automatically. "
-    "Every change, including shell, must be a plan for explicit approval."
+    "When the user reports a model returning nothing, disconnecting, stopping during thinking, "
+    "or being slow, do not ask which model first if the Manager inventory can identify it. "
+    "Automatically inspect manager.summary, docker.list, host.gpu, the relevant "
+    "deployment/container, docker.logs, docker.stats, and host.ports; correlate timestamps "
+    "and report evidence. Use manager.tasks and manager.gateway when request routing or "
+    "background tasks may be involved. Treat stopped containers as selectable targets but "
+    "never claim they are running. Every change, including shell, must be a plan for explicit "
+    "approval."
 )
 
 
@@ -150,8 +160,8 @@ class OpsOrchestrator:
         provider_client: OpsProviderClient | ProviderCompleter,
         tools: OpsToolRegistry,
         secret_box: SecretBox,
-        max_tool_turns: int = 6,
-        max_total_seconds: float = 180,
+        max_tool_turns: int = 12,
+        max_total_seconds: float = 600,
         max_tool_result_chars: int = 30_000,
         max_total_tool_chars: int = 120_000,
         monotonic: Callable[[], float] = time.monotonic,
@@ -184,7 +194,7 @@ class OpsOrchestrator:
         self._validate_identifier(session_id, "session_id")
         self._validate_identifier(actor, "actor")
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_PROMPT_CHARS:
-            raise ValueError("prompt must contain 1 to 10000 characters")
+            raise ValueError(f"prompt must contain 1 to {MAX_PROMPT_CHARS} characters")
         secrets = self._load_known_secrets()
         if secrets.contains(prompt) or secrets.contains(actor):
             raise ValueError("request contains secret material")

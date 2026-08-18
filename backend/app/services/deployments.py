@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -112,8 +113,107 @@ class DeploymentService:
         self.system_snapshot = system_snapshot
         self._docker_client = docker_client
 
+    _port_allocation_lock = threading.Lock()
+
     def docker_client(self):
         return self._docker_client or docker.from_env()
+
+    def _docker_reserved_ports(
+        self, *, excluded_container_ids: set[str] | None = None
+    ) -> set[int]:
+        reserved: set[int] = set()
+        excluded = excluded_container_ids or set()
+        try:
+            containers = self.docker_client().containers.list(all=True)
+        except Exception:
+            containers = []
+        for container in containers:
+            try:
+                if str(getattr(container, "id", "")) in excluded:
+                    continue
+                bindings = container.attrs.get("HostConfig", {}).get("PortBindings") or {}
+                for values in bindings.values():
+                    for value in values or []:
+                        host_port = value.get("HostPort")
+                        if host_port:
+                            reserved.add(int(host_port))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return reserved
+
+    def _db_reserved_ports(
+        self, db: Session, *, exclude_deployment_id: str | None = None
+    ) -> set[int]:
+        conditions = [Deployment.port.is_not(None)]
+        if exclude_deployment_id:
+            conditions.append(Deployment.id != exclude_deployment_id)
+        reserved = {
+            int(port)
+            for (port,) in db.execute(select(Deployment.port).where(*conditions)).all()
+            if port is not None
+        }
+        return reserved
+
+    def _deployment_reserved_ports(
+        self, db: Session, *, exclude_deployment_id: str | None = None
+    ) -> set[int]:
+        reserved = self._db_reserved_ports(
+            db, exclude_deployment_id=exclude_deployment_id
+        )
+        excluded_container_ids: set[str] = set()
+        if exclude_deployment_id:
+            deployment = db.get(Deployment, exclude_deployment_id)
+            if deployment and deployment.container_id:
+                excluded_container_ids.add(deployment.container_id)
+        reserved.update(self._docker_reserved_ports(excluded_container_ids=excluded_container_ids))
+        return reserved
+
+    def _allocate_deployment_port(
+        self, db: Session, *, exclude_deployment_id: str | None = None
+    ) -> int:
+        """Return the lowest free host port, starting at 8000.
+
+        Deployment rows reserve ports even while stopped. Deleting a deployment
+        releases its port, so the next creation naturally reuses the lowest gap.
+        Live Docker bindings are also checked to protect against DB drift.
+        """
+        reserved = self._deployment_reserved_ports(
+            db, exclude_deployment_id=exclude_deployment_id
+        )
+        port = 8000
+        while port in reserved:
+            port += 1
+        return port
+
+    def _prepare_spec_port(
+        self,
+        db: Session,
+        spec: DeploymentSpec,
+        *,
+        exclude_deployment_id: str | None = None,
+        include_docker: bool = True,
+    ) -> DeploymentSpec:
+        if spec.port is None:
+            reserved = (
+                self._deployment_reserved_ports(
+                    db, exclude_deployment_id=exclude_deployment_id
+                )
+                if include_docker
+                else self._db_reserved_ports(
+                    db, exclude_deployment_id=exclude_deployment_id
+                )
+            )
+            port = 8000
+            while port in reserved:
+                port += 1
+        else:
+            # The full Docker check runs after resource preflight. This DB-only check
+            # catches duplicate reservations without probing the daemon first.
+            reserved = self._db_reserved_ports(db, exclude_deployment_id=exclude_deployment_id)
+            if spec.port in reserved:
+                raise ValueError(f"Host port {spec.port} is already in use")
+            port = spec.port
+        return spec.model_copy(update={"port": port})
 
     def adapter(self, runtime: str) -> RuntimeAdapter:
         try:
@@ -213,10 +313,18 @@ class DeploymentService:
         *,
         exclude_deployment_id: str | None = None,
     ) -> dict[str, Any]:
-        _, preview = self._preflight(
+        auto_port = spec.port is None
+        effective_spec = self._prepare_spec_port(
             db,
             spec,
             exclude_deployment_id=exclude_deployment_id,
+            include_docker=not auto_port,
+        )
+        _, preview = self._preflight(
+            db,
+            effective_spec,
+            exclude_deployment_id=exclude_deployment_id,
+            auto_port=auto_port,
         )
         return preview
 
@@ -622,6 +730,7 @@ class DeploymentService:
         spec: DeploymentSpec,
         *,
         exclude_deployment_id: str | None = None,
+        auto_port: bool = False,
     ) -> tuple[ResolvedDeploymentSpec, dict[str, Any]]:
         resolved, capabilities = self._resolve_spec_with_capabilities(db, spec)
         adapter = self.adapter(resolved.runtime)
@@ -690,6 +799,19 @@ class DeploymentService:
             raise ValueError(f"Deployment is blocked by current resources: {reason}")
         if estimate.decision == "warning" and not resolved.resource_warning_acknowledged:
             raise ValueError("Resource warning acknowledgement is required")
+
+        if resolved.port in self._deployment_reserved_ports(
+            db, exclude_deployment_id=exclude_deployment_id
+        ):
+            if not auto_port:
+                raise ValueError(f"Host port {resolved.port} is already in use")
+            resolved = resolved.model_copy(
+                update={
+                    "port": self._allocate_deployment_port(
+                        db, exclude_deployment_id=exclude_deployment_id
+                    )
+                }
+            )
 
         preview = adapter.preview(resolved)
         warnings = list(capabilities.warnings)
@@ -820,17 +942,23 @@ class DeploymentService:
             return f"Container logs unavailable: {exc}"
 
     def create_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
-        spec = DeploymentSpec.model_validate(payload)
+        with self._port_allocation_lock:
+            return self._create_handler_locked(context, payload)
+
+    def _create_handler_locked(
+        self, context: TaskContext, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         committed = None
         with self.session_factory() as db:
+            spec = DeploymentSpec.model_validate(payload)
             matches = list(
                 db.scalars(
-                select(Deployment).where(
-                    or_(
-                        Deployment.name == spec.name,
-                        Deployment.api_model_name == spec.api_model_name,
+                    select(Deployment).where(
+                        or_(
+                            Deployment.name == spec.name,
+                            Deployment.api_model_name == spec.api_model_name,
+                        )
                     )
-                )
                 ).all()
             )
             if matches:
@@ -842,11 +970,15 @@ class DeploymentService:
                     or existing.api_model_name != spec.api_model_name
                 ):
                     raise ValueError("Deployment identity conflicts with an existing deployment")
+                if spec.port is None and existing.port is not None:
+                    spec = spec.model_copy(update={"port": existing.port})
                 if not self._deployment_matches_spec(existing, spec):
                     raise ValueError("Existing deployment uses a different deployment spec")
                 committed = existing
             else:
-                resolved, preview = self._preflight(db, spec)
+                auto_port = spec.port is None
+                spec = self._prepare_spec_port(db, spec, include_docker=not auto_port)
+                resolved, preview = self._preflight(db, spec, auto_port=auto_port)
                 fingerprint = preview["spec_fingerprint"]
         if committed is not None:
             return self._recover_committed_deployment(
@@ -937,6 +1069,13 @@ class DeploymentService:
                 raise ValueError("Deployment or container was not found")
             if not deployment.managed:
                 raise ValueError("Discovered containers cannot be edited")
+            auto_port = spec.port is None
+            spec = self._prepare_spec_port(
+                db,
+                spec,
+                exclude_deployment_id=deployment_id,
+                include_docker=not auto_port,
+            )
             conflict = db.scalar(
                 select(Deployment).where(
                     Deployment.id != deployment_id,
@@ -955,6 +1094,7 @@ class DeploymentService:
                     db,
                     spec,
                     exclude_deployment_id=deployment_id,
+                    auto_port=auto_port,
                 )
                 current_container_id = deployment.container_id
                 current_container_name = (
@@ -1468,4 +1608,3 @@ class DeploymentService:
             raise ValueError("Deployment has no container")
         container = self.docker_client().containers.get(deployment.container_id)
         return redact_log(self.adapter(deployment.runtime).logs(container, tail=tail))
-

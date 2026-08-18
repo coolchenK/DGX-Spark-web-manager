@@ -26,10 +26,10 @@ from app.services.provider_errors import (
 )
 from app.services.providers import PinnedProviderEndpoint, resolve_provider_endpoint
 
-MAX_PROVIDER_RESPONSE_BYTES = 256 * 1024
+MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_REPAIR_MESSAGES = 8
-MAX_REPAIR_MESSAGE_CHARS = 2400
-MAX_REPAIR_TOTAL_CHARS = 16_000
+MAX_REPAIR_MESSAGE_CHARS = 12_000
+MAX_REPAIR_TOTAL_CHARS = 128_000
 
 ReadOnlyToolName = Literal[
     "host.memory",
@@ -486,7 +486,7 @@ class OpsProviderClient:
             if timeout_seconds is not None
             else None
         )
-        initial_payload = self._chat_payload(provider, messages, max_tokens=2048)
+        initial_payload = self._chat_payload(provider, messages, max_tokens=16384)
         response = self._request_json(
             provider,
             "POST",
@@ -500,7 +500,7 @@ class OpsProviderClient:
         except _IncompleteProviderResponse as initial_error:
             repair_messages = _compact_repair_messages(messages, str(initial_error))
             repair_payload = self._chat_payload(
-                provider, repair_messages, max_tokens=4096
+                provider, repair_messages, max_tokens=32768
             )
             repaired = self._request_json(
                 provider,
