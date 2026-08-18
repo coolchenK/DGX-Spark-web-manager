@@ -102,14 +102,16 @@ unverifiable final preflight cannot be deployed.
 
 The manager reads bounded deployment flags from model-card shell examples, generation values from
 model-card JSON and local `generation_config.json`, architectural limits from `config.json`, and
-Draft metadata/tokenizer evidence. The deterministic order is model card, local config, runtime
-default, then device rules and clamps.
+Draft metadata/tokenizer evidence. When a card contains several hardware recipes, the DGX
+Spark/GB10 section wins over H100, GB200, and generic examples. The deterministic order is model
+card, local config, runtime default, then device rules and clamps.
 
-If deployment or generation fields remain unresolved, a configured, enabled third-party
-OpenAI-compatible provider whose latest test is not failed can analyze the bounded model-card/device
-context. AI output is limited to requested allowlisted fields and remains a medium-confidence
-suggestion. Invalid output degrades the recommendation to `partial`; it never bypasses capability,
-compatibility, memory, preview, or human-review requirements.
+For new deployment recommendations, the panel forces the configured, enabled DeepSeek provider to
+analyze the bounded model-card/device context, including when deterministic fields are already
+complete. AI output is limited to requested allowlisted fields and remains a medium-confidence
+suggestion. A reasoning-only response is accepted as validation with no overrides; invalid output
+degrades the recommendation to `partial`. AI never bypasses capability, compatibility, memory,
+preview, or human-review requirements.
 
 ## Model Layout
 

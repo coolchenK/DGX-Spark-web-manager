@@ -215,7 +215,8 @@ online AI provider is called.
 }
 ```
 
-Use `?refresh_ai=true` to bypass a matching AI cache entry. Model evidence, runtime capability,
+Use `?force_ai=true` to require the configured healthy provider even when deterministic fields are
+already complete. `?refresh_ai=true` also forces a fresh provider request and bypasses a matching AI cache entry. Model evidence, runtime capability,
 device memory, resource estimation, and Draft Model classification are still evaluated on every
 request. A missing provider returns `404`; a disabled provider or one whose last test failed returns
 `409`.
@@ -252,6 +253,15 @@ The response has this shape (values are illustrative):
       "source": "ai",
       "confidence": "medium",
       "reason": "AI filled a bounded generation recommendation",
+      "warning": null
+    }
+  },
+  "speculative_defaults": {
+    "num_speculative_tokens": {
+      "value": 3,
+      "source": "model_card",
+      "confidence": "high",
+      "reason": "Model card recommends the speculative draft length",
       "warning": null
     }
   },

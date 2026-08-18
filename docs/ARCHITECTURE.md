@@ -139,9 +139,10 @@ backend performs these stages in order:
 3. Select deterministic settings. Model-card values take precedence, followed by local config and
    conservative runtime defaults. Device rules map or clamp quantization, context, concurrency, and
    batch limits against capability and memory constraints.
-4. If allowlisted fields remain unresolved or have low-confidence numeric defaults, an enabled
-   third-party OpenAI-compatible provider whose latest test is not failed can fill only those fields.
-   Complete high-confidence deterministic recommendations do not call AI.
+4. For new deployment recommendations, an enabled third-party OpenAI-compatible provider whose
+   latest test is not failed is called for bounded validation even when deterministic fields are
+   complete. It can fill only unresolved allowlisted fields; a reasoning-only response is accepted
+   without overrides.
 5. Recompute the current unified-memory estimate and classify local Draft Models as `compatible`,
    `review`, or `incompatible` using method, target pairing, tokenizer evidence, and combined model
    memory.

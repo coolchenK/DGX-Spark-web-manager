@@ -714,6 +714,23 @@ def _sanitize_shell_fences(card_text: str) -> str:
     return "".join(parts)
 
 
+def _deployment_fence_score(card_text: str, fence: Fence) -> int:
+    """Prefer the model-card recipe that explicitly targets DGX Spark/GB10."""
+    prefix = card_text[: fence.start]
+    headings = list(re.finditer(r"(?im)^\s*#{1,6}\s+(.+?)\s*$", prefix))
+    heading = headings[-1].group(1) if headings else ""
+    normalized_heading = re.sub(r"[`*_]", "", heading).casefold()
+    if "local ai" in normalized_heading:
+        return 0
+    if "dgx spark" in normalized_heading or "gb10" in normalized_heading:
+        return 4
+    section_start = headings[-1].end() if headings else 0
+    section = prefix[section_start:]
+    if re.search(r"\b(?:dgx\s+spark|gb10)\b", section, flags=re.I):
+        return 2
+    return 0
+
+
 def _safe_card_data(value: dict[str, Any]) -> dict[str, Any]:
     safe: dict[str, Any] = {}
     for key in SAFE_CARD_DATA_KEYS:
@@ -784,6 +801,7 @@ def _card_values(
     card_text: str, warnings: list[str]
 ) -> tuple[dict[str, int | float | bool | str], dict[str, Any]]:
     deployment: dict[str, int | float | bool | str] = {}
+    deployment_scores: dict[str, int] = {}
     generation: dict[str, Any] = {}
     for fence in iter_fences(card_text):
         language = fence.language.casefold()
@@ -794,11 +812,14 @@ def _card_values(
         if language in {"bash", "sh", "shell"}:
             try:
                 shell_values = _extract_shell_values(body)
+                score = _deployment_fence_score(card_text, fence)
                 for key, value in shell_values.items():
-                    if key == "num_speculative_tokens":
-                        deployment.setdefault(key, value)
-                    else:
+                    previous_score = deployment_scores.get(key, -1)
+                    if score > previous_score or (
+                        score == previous_score == 0 and key != "num_speculative_tokens"
+                    ):
                         deployment[key] = value
+                        deployment_scores[key] = score
             except ValueError:
                 warnings.append("README.md contains a malformed shell fence")
         elif language == "json":

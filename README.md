@@ -105,15 +105,17 @@ On startup the manager scans Docker without restarting or recreating existing co
    reuse the Hugging Face cache. After inventory refresh marks the asset available, open
    **Deployments** and create a deployment.
 3. Select the base model, vLLM or SGLang runtime, and an allowlisted image. The panel reads model-card
-   and local configuration evidence, probes/caches image capabilities by digest, applies DGX Spark
-   resource rules, and shows the source, confidence, reason, and warning for each suggested field.
-4. When the model card does not resolve all supported fields, optionally select a tested provider
-   from **Online AI Service** and refresh AI analysis. Provider output can fill only bounded allowlisted
-   fields. Review every suggestion and edit it as needed; AI output is never applied as an
-   unreviewed deployment action.
-5. Optionally select a listed Draft Model. `review` candidates require explicit acknowledgement;
-   incompatible candidates are not deployable. vLLM exposes `num_speculative_tokens`, while SGLang
-   exposes its three grouped tuning values. The panel includes Draft weights in its resource view.
+   and local configuration evidence, prefers DGX Spark/GB10 hardware sections when a card contains
+   multiple recipes, probes/caches image capabilities by digest, applies unified-memory rules, and
+   shows the source, confidence, reason, and warning for each suggested field.
+4. The wizard selects the enabled DeepSeek provider by default and forces a bounded AI analysis for
+   every new recommendation. The provider receives the model card, runtime capability probe, and
+   current DGX Spark resource snapshot; it can only fill allowlisted fields. Review every suggestion
+   and edit it as needed; AI output is never applied as an unreviewed deployment action.
+5. A compatible Draft Model is selected automatically for a new deployment when the model card
+   recommends speculative decoding (DSpark/DFlash cards are recognized even when their metadata is
+   incomplete). `num_speculative_tokens` is taken from the selected hardware recipe. `review`
+   candidates require explicit acknowledgement; incompatible candidates are not deployable.
 6. Review the normalized spec, generated runtime command, mounts, current capability snapshot,
    memory estimate, provenance, and warnings. Resource warnings and review candidates require
    explicit acknowledgement. Submit only from the current preview; any form change invalidates it.

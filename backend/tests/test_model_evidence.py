@@ -870,6 +870,36 @@ def test_malformed_shell_and_later_explicit_values_are_handled_deterministically
     assert evidence.warnings == ["README.md contains a malformed shell fence"]
 
 
+def test_dgx_spark_recipe_wins_over_later_hardware_examples(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "README.md").write_text(
+        "## Quick Start\n"
+        "Use this on DGX Spark (GB10).\n"
+        "```bash\n"
+        "vllm serve x --gpu-memory-utilization 0.91 "
+        "--speculative_config.num_speculative_tokens 3\n"
+        "```\n"
+        "### 1x GB200\n"
+        "```bash\n"
+        "vllm serve x --gpu-memory-utilization 0.85 "
+        "--speculative_config.num_speculative_tokens 5\n"
+        "```\n"
+        "## Local AI (RTX 5090, DGX Spark)\n"
+        "```bash\n"
+        "vllm serve x --gpu-memory-utilization 0.78\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+    assert evidence.card_deployment_values == {
+        "memory_fraction": 0.91,
+        "num_speculative_tokens": 3,
+    }
+
+
 def test_front_matter_uses_model_card_metadata_allowlist(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
