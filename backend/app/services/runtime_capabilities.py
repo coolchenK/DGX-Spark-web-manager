@@ -7,6 +7,7 @@ from threading import Lock
 from typing import Any, Literal
 
 import docker
+from docker.types import DeviceRequest
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import Settings
@@ -140,6 +141,17 @@ def parse_runtime_help(
             for method in ("draft_model", "eagle", "eagle3", "mtp")
             if method in choices
         ]
+        if has_speculative_config and not choices:
+            # vLLM 0.27.x exposes the JSON transport as a generic nested
+            # argument and omits the method enum from --help. Keep the
+            # bounded runtime manifest so model-card draft checkpoints remain
+            # selectable instead of being marked incompatible solely because
+            # the help formatter hid the enum.
+            speculative_methods = ["draft_model", "eagle", "eagle3", "mtp"]
+            warnings.append(
+                "Runtime help did not expose speculative method choices; using the "
+                "bounded vLLM manifest"
+            )
         for method in speculative_methods:
             supported_mapping.setdefault(method, method)
         transport = "json" if has_speculative_config else "none"
@@ -256,6 +268,11 @@ def run_runtime_probe(
             stdin_open=False,
             tty=False,
             volumes={},
+            device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
+            environment={
+                "NVIDIA_VISIBLE_DEVICES": "all",
+                "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+            },
         )
         result = container.wait(timeout=settings.runtime_probe_timeout_seconds)
         raw_logs = _read_bounded_logs(
@@ -263,7 +280,11 @@ def run_runtime_probe(
         )
         status_code = result.get("StatusCode") if isinstance(result, dict) else result
         if status_code != 0:
-            raise RuntimeError(f"Runtime capability probe exited with status {status_code}")
+            error = RuntimeError(f"Runtime capability probe exited with status {status_code}")
+            probe_output = _bounded_warning(raw_logs.decode("utf-8", errors="replace"))
+            if probe_output:
+                error.add_note(f"Runtime capability probe output: {probe_output}")
+            raise error
         return raw_logs.decode("utf-8", errors="replace")
     except BaseException as exc:
         primary_error = exc

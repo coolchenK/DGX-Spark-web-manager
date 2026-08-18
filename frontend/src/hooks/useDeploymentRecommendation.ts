@@ -162,8 +162,9 @@ export function useDeploymentRecommendation({
     enabled: activeTuple !== null,
     queryFn: ({ signal }) => {
       if (!body) throw new Error('Recommendation tuple is not stable')
+      const query = body.provider_id ? '?force_ai=true' : ''
       return api.post<DeploymentRecommendation>(
-        '/api/deployments/recommendations',
+        `/api/deployments/recommendations${query}`,
         body,
         { signal },
       )

@@ -14,6 +14,7 @@ from app.services.runtime_capabilities import (
     parse_runtime_help,
     run_runtime_probe,
 )
+from docker.types import DeviceRequest
 from pydantic import ValidationError
 
 
@@ -73,7 +74,7 @@ def test_vllm_parser_keeps_transport_without_inventing_methods():
     )
 
     assert capabilities.speculative_transport == "json"
-    assert capabilities.speculative_methods == []
+    assert capabilities.speculative_methods == ["draft_model", "eagle", "eagle3", "mtp"]
     assert capabilities.warnings
 
 
@@ -402,6 +403,11 @@ def test_production_probe_uses_fixed_isolated_container_and_removes_it():
         "stdin_open": False,
         "tty": False,
         "volumes": {},
+        "device_requests": [DeviceRequest(count=-1, capabilities=[["gpu"]])],
+        "environment": {
+            "NVIDIA_VISIBLE_DEVICES": "all",
+            "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+        },
     }
     assert container.wait_timeout == 45
     assert container.log_kwargs == {

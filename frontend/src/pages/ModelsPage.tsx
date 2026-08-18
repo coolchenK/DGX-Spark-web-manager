@@ -12,6 +12,29 @@ import { ResponsiveDataView } from '../components/ResponsiveDataView'
 import { StatusBadge } from '../components/StatusBadge'
 import { formatBytes, formatDate } from '../utils/format'
 
+interface ModelFamily {
+  key: string
+  name: string
+  variants: ModelAsset[]
+  primary: ModelAsset
+}
+
+function modelFamilyKey(model: ModelAsset): string {
+  const identity = model.repository_id ?? model.name
+  return identity.trim().replace(/[-_]dspark$/i, '').toLowerCase()
+}
+
+function modelFamilyName(model: ModelAsset): string {
+  const identity = model.repository_id ?? model.name
+  return identity.trim().replace(/[-_]dspark$/i, '')
+}
+
+function variantLabel(model: ModelAsset, familyName: string): string {
+  const identity = model.repository_id ?? model.name
+  if (identity === familyName) return '基础模型'
+  return identity.slice(familyName.length).replace(/^[-_]/, '') || '变体'
+}
+
 
 export function ModelsPage() {
   const [filter, setFilter] = useState('')
@@ -53,7 +76,23 @@ export function ModelsPage() {
       message.error(error instanceof Error ? error.message : '删除模型失败')
     },
   })
-  const data = useMemo(() => (models.data ?? []).filter((item) => `${item.name} ${item.repository_id ?? ''}`.toLowerCase().includes(filter.toLowerCase())), [models.data, filter])
+  const data = useMemo<ModelFamily[]>(() => {
+    const filtered = (models.data ?? []).filter((item) => `${item.name} ${item.repository_id ?? ''}`.toLowerCase().includes(filter.toLowerCase()))
+    const groups = new Map<string, ModelAsset[]>()
+    for (const item of filtered) {
+      const key = modelFamilyKey(item)
+      groups.set(key, [...(groups.get(key) ?? []), item])
+    }
+    return [...groups.entries()].map(([key, variants]) => {
+      const ordered = [...variants].sort((left, right) => {
+        const leftAuxiliary = /[-_]dspark$/i.test(left.repository_id ?? left.name) ? 1 : 0
+        const rightAuxiliary = /[-_]dspark$/i.test(right.repository_id ?? right.name) ? 1 : 0
+        return leftAuxiliary - rightAuxiliary || left.name.localeCompare(right.name)
+      })
+      const name = ordered.length > 1 ? modelFamilyName(ordered[0]) : ordered[0].name
+      return { key, name, variants: ordered, primary: ordered.find((item) => item.status === 'available') ?? ordered[0] }
+    }).sort((left, right) => left.name.localeCompare(right.name))
+  }, [models.data, filter])
   const deleteButton = (item: ModelAsset) => (
     <Tooltip title="删除模型">
       <Button danger size="small" icon={<DeleteOutlined />} aria-label={`删除模型 ${item.name}`} onClick={() => openDelete(item)} />
@@ -67,14 +106,14 @@ export function ModelsPage() {
       <PageHeader title="模型库" description="统一查看 Hugging Face 缓存、本地目录与部署关联" extra={<Button icon={<ReloadOutlined />} loading={scan.isPending} onClick={() => scan.mutate()}>扫描模型</Button>} />
       <div className="filter-bar"><Input.Search allowClear placeholder="按名称或仓库筛选" value={filter} onChange={(event) => setFilter(event.target.value)} /></div>
       <QueryState loading={models.isLoading} error={models.error} empty={!data.length} onRetry={() => models.refetch()}>
-        <ResponsiveDataView data={data} rowKey="id" columns={[
-          { title: '模型', dataIndex: 'name', render: (_, item) => <div className="primary-cell"><strong>{item.name}</strong><small>{item.repository_id ?? item.local_path}</small></div> },
-          { title: '来源', dataIndex: 'source', width: 120, render: (value) => <Tag>{value}</Tag> },
-          { title: '大小', dataIndex: 'size_bytes', width: 110, render: (_, item) => sizeLabel(item) },
-          { title: '能力', dataIndex: 'capabilities', render: (values: string[]) => <Space size={[2, 4]} wrap>{values.map((value) => <Tag key={value}>{value}</Tag>)}</Space> },
-          { title: '状态', dataIndex: 'status', width: 100, render: (value) => <StatusBadge status={value} /> },
-          { title: '', width: 132, render: (_, item) => <Space size="small"><Button size="small" icon={<RocketOutlined />} disabled={item.status !== 'available'} onClick={() => navigate(`/deployments?model=${item.id}`)}>部署</Button>{deleteButton(item)}</Space> },
-        ]} renderMobile={(item) => <div className="mobile-record"><Flex justify="space-between"><Space><AppstoreAddOutlined /><strong>{item.name}</strong></Space><StatusBadge status={item.status} /></Flex><Typography.Text type="secondary">{item.repository_id ?? item.local_path}</Typography.Text><dl><div><dt>大小</dt><dd>{sizeLabel(item)}</dd></div><div><dt>更新</dt><dd>{formatDate(item.updated_at)}</dd></div></dl><Flex gap="small"><Button block icon={<RocketOutlined />} disabled={item.status !== 'available'} onClick={() => navigate(`/deployments?model=${item.id}`)}>部署模型</Button>{deleteButton(item)}</Flex></div>} />
+        <ResponsiveDataView data={data} rowKey="key" columns={[
+          { title: '模型家族', dataIndex: 'name', render: (_, item) => <div className="primary-cell"><strong>{item.name}</strong><small>{item.variants.length > 1 ? `${item.variants.length} 个相关变体已合并` : (item.primary.repository_id ?? item.primary.local_path)}</small><Space size={[2, 4]} wrap>{item.variants.map((variant) => <Tag key={variant.id}>{variantLabel(variant, item.name)}</Tag>)}</Space></div> },
+          { title: '来源', dataIndex: 'source', width: 120, render: (_, item) => <Tag>{item.primary.source}</Tag> },
+          { title: '大小', dataIndex: 'size_bytes', width: 110, render: (_, item) => item.variants.length === 1 ? sizeLabel(item.primary) : <Space direction="vertical" size={0}>{item.variants.map((variant) => <span key={variant.id}>{variantLabel(variant, item.name)}: {sizeLabel(variant)}</span>)}</Space> },
+          { title: '能力', dataIndex: 'capabilities', render: (_, item) => <Space size={[2, 4]} wrap>{[...new Set(item.variants.flatMap((variant) => variant.capabilities))].map((value) => <Tag key={value}>{value}</Tag>)}</Space> },
+          { title: '状态', dataIndex: 'status', width: 100, render: (_, item) => <StatusBadge status={item.primary.status} /> },
+          { title: '', width: 180, render: (_, item) => <Space direction="vertical" size="small">{item.variants.map((variant) => <Space size="small" key={variant.id}><Button size="small" icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Space>)}</Space> },
+        ]} renderMobile={(item) => <div className="mobile-record"><Flex justify="space-between"><Space><AppstoreAddOutlined /><strong>{item.name}</strong></Space><StatusBadge status={item.primary.status} /></Flex><Typography.Text type="secondary">{item.variants.length > 1 ? `${item.variants.length} 个相关变体已合并` : (item.primary.repository_id ?? item.primary.local_path)}</Typography.Text><dl><div><dt>大小</dt><dd>{item.variants.length === 1 ? sizeLabel(item.primary) : item.variants.map((variant) => `${variantLabel(variant, item.name)}: ${sizeLabel(variant)}`).join(' · ')}</dd></div><div><dt>更新</dt><dd>{formatDate(item.primary.updated_at)}</dd></div></dl><Space direction="vertical" style={{ width: '100%' }}>{item.variants.map((variant) => <Flex gap="small" key={variant.id}><Button block icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署模型 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Flex>)}</Space></div>} />
       </QueryState>
       <Modal
         title="永久删除模型"

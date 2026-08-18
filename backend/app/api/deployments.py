@@ -30,6 +30,7 @@ def recommend_deployment(
     db: DbSession,
     admin: CsrfAdmin,
     refresh_ai: bool = Query(default=False),
+    force_ai: bool = Query(default=False),
 ) -> dict[str, Any]:
     provider = db.get(Provider, payload.provider_id) if payload.provider_id else None
     provider_error: tuple[int, str, str] | None = None
@@ -62,6 +63,7 @@ def recommend_deployment(
         image=payload.image,
         provider=provider,
         refresh_ai=refresh_ai,
+        force_ai=force_ai,
     )
     record_audit(
         db,

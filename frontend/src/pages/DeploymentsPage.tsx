@@ -425,8 +425,28 @@ export function DeploymentsPage() {
     clearRecommendationValues(stalePaths, force ? stalePaths : new Set())
     invalidatePreview(1)
     applyingRecommendation.current = true
+    const currentSpeculative = form.getFieldValue('speculative') as SpeculativeSettings | null | undefined
+    const recommendedTokens = result.speculative_defaults?.num_speculative_tokens?.value
+    const autoDraft = result.runtime !== 'llama_cpp'
+      && !editingDeployment
+      && !currentSpeculative
+      && !currentEdited.has('speculative.draft_model_id')
+      && typeof recommendedTokens === 'number'
+      ? result.draft_candidates.find((candidate) => candidate.status === 'compatible')
+      : undefined
+    const nextSpeculative = autoDraft
+      ? {
+          draft_model_id: autoDraft.model_id,
+          method: autoDraft.method ?? 'draft_model',
+          num_speculative_tokens: result.runtime === 'vllm'
+            ? (typeof recommendedTokens === 'number' ? recommendedTokens : currentSpeculative?.num_speculative_tokens ?? 5)
+            : undefined,
+          manual_review_acknowledged: false,
+        }
+      : undefined
     form.setFieldsValue({
       ...valuesFromRecommendation(result, currentEdited, force),
+      ...(nextSpeculative ? { speculative: nextSpeculative } : {}),
       resource_warning_acknowledged: false,
     })
     applyingRecommendation.current = false
@@ -435,7 +455,7 @@ export function DeploymentsPage() {
       path !== 'resource_warning_acknowledged'
       && (!force || !nextPaths.has(path))
     ))))
-  }, [clearRecommendationValues, form, invalidatePreview, replaceEditedFields])
+  }, [clearRecommendationValues, editingDeployment, form, invalidatePreview, replaceEditedFields])
 
   useEffect(() => {
     if (activeRecommendation) applyRecommendation(activeRecommendation, false)
@@ -445,9 +465,11 @@ export function DeploymentsPage() {
     if (!drawerOpen || form.getFieldValue('provider_id') !== undefined || !providers.data) return
     const enabledProviders = providers.data.filter((provider) => provider.enabled)
     const saved = window.localStorage.getItem('dgx-deployment-recommendation-provider')
-    const selected = enabledProviders.length === 1
-      ? enabledProviders[0].id
-      : enabledProviders.some((provider) => provider.id === saved) ? saved ?? '' : ''
+    const deepSeek = enabledProviders.find((provider) => provider.name.toLowerCase().includes('deepseek'))
+    const selected = deepSeek?.id
+      ?? (enabledProviders.length === 1
+        ? enabledProviders[0].id
+        : enabledProviders.some((provider) => provider.id === saved) ? saved ?? '' : '')
     form.setFieldValue('provider_id', selected)
   }, [drawerOpen, form, providers.data])
 
@@ -806,7 +828,11 @@ export function DeploymentsPage() {
         draft_model_id: candidate.model_id,
         method: candidate.method ?? 'draft_model',
         num_speculative_tokens: runtime === 'vllm'
-          ? (keepRestored ? restored.num_speculative_tokens ?? 5 : 5)
+          ? (keepRestored
+            ? restored.num_speculative_tokens ?? 5
+            : (typeof activeRecommendation?.speculative_defaults?.num_speculative_tokens?.value === 'number'
+              ? activeRecommendation.speculative_defaults.num_speculative_tokens.value
+              : 5))
           : undefined,
         num_steps: runtime === 'sglang' && keepRestored ? restored.num_steps : undefined,
         eagle_top_k: runtime === 'sglang' && keepRestored ? restored.eagle_top_k : undefined,

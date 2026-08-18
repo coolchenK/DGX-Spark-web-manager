@@ -369,6 +369,7 @@ export interface DeploymentRecommendation {
   evidence_hash: string | null
   fields: Record<string, RecommendedValue>
   generation_defaults: Record<string, RecommendedValue>
+  speculative_defaults?: Record<string, RecommendedValue>
   resource_snapshot: Partial<ResourceSnapshot>
   resource_estimate: Partial<ResourceEstimate>
   runtime_capabilities: Partial<RuntimeCapabilities>

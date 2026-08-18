@@ -29,6 +29,10 @@ DEPLOYMENT_FLAGS = {
     "--max-running-requests": "max_concurrency",
     "--max-num-batched-tokens": "max_batched_tokens",
     "--quantization": "quantization",
+    # NVIDIA's Nemotron cards use both spellings across vLLM releases.
+    "--speculative_config.num_speculative_tokens": "num_speculative_tokens",
+    "--speculative-config.num-speculative-tokens": "num_speculative_tokens",
+    "--speculative-config.num_speculative_tokens": "num_speculative_tokens",
 }
 
 GENERATION_KEYS = {
@@ -646,7 +650,12 @@ def _extract_generation_values(value: dict[str, Any]) -> dict[str, Any]:
 def _normalize_deployment_value(key: str, value: str) -> int | float | str | None:
     if value.startswith("-"):
         return None
-    if key in {"context_length", "max_concurrency", "max_batched_tokens"}:
+    if key in {
+        "context_length",
+        "max_concurrency",
+        "max_batched_tokens",
+        "num_speculative_tokens",
+    }:
         return _normalize_int(value)
     if key == "memory_fraction":
         return _normalize_float(value)
@@ -755,6 +764,19 @@ def _speculative_method(card_data: dict[str, Any]) -> str | None:
             normalized = value.strip().casefold().replace("-", "_")
             if normalized in SPECULATIVE_METHODS:
                 return normalized
+    # DSpark and DFlash releases are external draft checkpoints. Their
+    # cards often describe the strategy in tags instead of a structured
+    # speculative_method field. vLLM transports both through draft_model.
+    hints: list[str] = []
+    model_name = card_data.get("model_name")
+    if isinstance(model_name, str):
+        hints.append(model_name)
+    tags = card_data.get("tags")
+    if isinstance(tags, list):
+        hints.extend(item for item in tags if isinstance(item, str))
+    hint_text = " ".join(hints).casefold().replace("-", "_")
+    if "dspark" in hint_text or "dflash" in hint_text:
+        return "draft_model"
     return None
 
 
