@@ -89,9 +89,9 @@ def legacy_spec_fingerprint(spec: DeploymentSpec) -> str:
         if isinstance(spec, ResolvedDeploymentSpec)
         else spec.model_dump(mode="json")
     )
-    canonical = json.dumps(
-        public, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("utf-8")
+    canonical = json.dumps(public, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+        "utf-8"
+    )
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -131,13 +131,9 @@ class StaticRuntimeCapabilities:
             ],
             quantization_methods=["auto", "modelopt_fp4"],
             quantization_mapping={"nvfp4": "modelopt_fp4"},
-            speculative_methods=(
-                ["draft_model", "eagle3"] if methods is None else methods
-            ),
+            speculative_methods=(["draft_model", "eagle3"] if methods is None else methods),
             method_mapping=(
-                {"draft_model": "draft_model", "eagle3": "eagle3"}
-                if mapping is None
-                else mapping
+                {"draft_model": "draft_model", "eagle3": "eagle3"} if mapping is None else mapping
             ),
             speculative_transport="json",
             warnings=[],
@@ -320,9 +316,7 @@ def add_action_deployment(db, *, managed, name="service", **values):
     return deployment
 
 
-def action_handler_payload(
-    deployment_id, action, *, container_id, container_name
-):
+def action_handler_payload(deployment_id, action, *, container_id, container_name):
     return {
         "deployment_id": deployment_id,
         "action": action,
@@ -335,18 +329,14 @@ def action_handler_payload(
     "payload",
     [None, {}, {"confirm_container_name": "wrong-container"}],
 )
-def test_discovered_delete_requires_exact_container_confirmation(
-    authenticated_client, payload
-):
+def test_discovered_delete_requires_exact_container_confirmation(authenticated_client, payload):
     authenticated_client.app.state.task_engine.stop()
     with authenticated_client.app.state.database.session_factory() as db:
         deployment = add_action_deployment(db, managed=False, name="discovered")
         deployment_id = deployment.id
 
     kwargs = {} if payload is None else {"json": payload}
-    response = authenticated_client.post(
-        f"/api/deployments/{deployment_id}/delete", **kwargs
-    )
+    response = authenticated_client.post(f"/api/deployments/{deployment_id}/delete", **kwargs)
 
     assert response.status_code == 422
     assert response.json()["detail"] == (
@@ -396,9 +386,7 @@ def test_discovered_delete_never_treats_missing_container_name_as_confirmation(
         )
         deployment_id = deployment.id
 
-    response = authenticated_client.post(
-        f"/api/deployments/{deployment_id}/delete", json={}
-    )
+    response = authenticated_client.post(f"/api/deployments/{deployment_id}/delete", json={})
 
     assert response.status_code == 422
     with authenticated_client.app.state.database.session_factory() as db:
@@ -443,9 +431,7 @@ def test_deployment_spec_serializes_recommendation_settings(tmp_path):
         ("max_tokens", 1, 1_048_576, 0, 1_048_577),
     ],
 )
-def test_generation_defaults_enforces_numeric_boundaries(
-    field, lower, upper, below, above
-):
+def test_generation_defaults_enforces_numeric_boundaries(field, lower, upper, below, above):
     assert getattr(GenerationDefaults.model_validate({field: lower}), field) == lower
     assert getattr(GenerationDefaults.model_validate({field: upper}), field) == upper
 
@@ -480,9 +466,7 @@ def test_generation_defaults_rejects_invalid_stop_boundaries(stop):
         ("num_draft_tokens", 1, 256, 0, 257),
     ],
 )
-def test_speculative_config_enforces_numeric_boundaries(
-    field, lower, upper, below, above
-):
+def test_speculative_config_enforces_numeric_boundaries(field, lower, upper, below, above):
     def payload(value):
         settings = {
             "draft_model_id": "draft-id",
@@ -565,9 +549,7 @@ def test_speculative_eagle_tuning_fields_must_be_set_together(tmp_path, tuning):
         ("speculative_runtime_method", "eagle"),
     ],
 )
-def test_public_deployment_spec_rejects_internal_resolution_fields(
-    tmp_path, field, value
-):
+def test_public_deployment_spec_rejects_internal_resolution_fields(tmp_path, field, value):
     payload = valid_spec_payload(tmp_path)
     payload["quantization"] = "fp8"
     payload[field] = value
@@ -665,8 +647,9 @@ def test_resolve_spec_rejects_missing_or_unavailable_database_asset(tmp_path, st
         port=8100,
     )
 
-    with database.session_factory() as db, pytest.raises(
-        ValueError, match="Base model is missing or unavailable"
+    with (
+        database.session_factory() as db,
+        pytest.raises(ValueError, match="Base model is missing or unavailable"),
     ):
         service.resolve_spec(db, spec)
 
@@ -760,9 +743,7 @@ def test_resolve_spec_reuses_base_mount_for_same_root_draft(tmp_path):
     )
 
     assert resolved.draft_container_model_path == "/models/draft"
-    assert captured["volumes"] == {
-        str(host_root): {"bind": "/models", "mode": "ro"}
-    }
+    assert captured["volumes"] == {str(host_root): {"bind": "/models", "mode": "ro"}}
 
 
 @pytest.mark.parametrize(
@@ -784,9 +765,7 @@ def test_resolve_spec_rejects_invalid_draft_assets(tmp_path, draft_state, messag
         elif draft_state == "same":
             draft_id = base.id
         else:
-            draft_id = add_model_asset(
-                db, root / "draft", name="Draft", status="failed"
-            ).id
+            draft_id = add_model_asset(db, root / "draft", name="Draft", status="failed").id
         base_id = base.id
     service = build_preflight_service(database, (root,))
     spec = DeploymentSpec(
@@ -817,9 +796,7 @@ def test_resolve_spec_rejects_invalid_draft_assets(tmp_path, draft_state, messag
         ),
     ],
 )
-def test_resolve_spec_rejects_unsupported_speculative_capabilities(
-    tmp_path, capabilities, message
-):
+def test_resolve_spec_rejects_unsupported_speculative_capabilities(tmp_path, capabilities, message):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'capabilities.db'}")
     database.create_schema()
@@ -862,9 +839,7 @@ def test_disallowed_image_is_rejected_without_capability_probe(tmp_path):
         port=8100,
     )
 
-    with database.session_factory() as db, pytest.raises(
-        ValueError, match="Image is not allowed"
-    ):
+    with database.session_factory() as db, pytest.raises(ValueError, match="Image is not allowed"):
         service.preview(db, spec)
 
     assert capabilities.calls == 0
@@ -952,8 +927,9 @@ def test_preview_rejects_shared_route_with_different_generation_defaults(tmp_pat
         generation_defaults={"temperature": 0.7},
     )
 
-    with database.session_factory() as db, pytest.raises(
-        ValueError, match="Shared route generation defaults must match"
+    with (
+        database.session_factory() as db,
+        pytest.raises(ValueError, match="Shared route generation defaults must match"),
     ):
         service.preview(db, spec)
 
@@ -1075,8 +1051,9 @@ def test_preview_compares_effective_routes_and_legacy_generation_defaults(
         generation_defaults={"temperature": 0.7},
     )
 
-    with database.session_factory() as db, pytest.raises(
-        ValueError, match="Shared route generation defaults must match"
+    with (
+        database.session_factory() as db,
+        pytest.raises(ValueError, match="Shared route generation defaults must match"),
     ):
         service.preview(db, spec)
 
@@ -1149,9 +1126,7 @@ def test_preview_enforces_realtime_resource_decision(tmp_path, decision):
             }
         }
 
-    service = build_preflight_service(
-        database, (root,), estimator=estimator, snapshot=snapshot
-    )
+    service = build_preflight_service(database, (root,), estimator=estimator, snapshot=snapshot)
     spec = DeploymentSpec(
         name="base",
         model_id=base_id,
@@ -1236,9 +1211,7 @@ def test_preview_persists_public_spec_capabilities_resource_and_mounts(tmp_path)
     with database.session_factory() as db:
         base = add_model_asset(db, root / "base")
         base_id = base.id
-    service = build_preflight_service(
-        database, (root,), host_model_roots=(host_root,)
-    )
+    service = build_preflight_service(database, (root,), host_model_roots=(host_root,))
     spec = DeploymentSpec(
         name="base",
         model_id=base_id,
@@ -1285,8 +1258,9 @@ def test_preview_rejects_incompatible_base_model_before_resource_estimation(tmp_
         port=8100,
     )
 
-    with database.session_factory() as db, pytest.raises(
-        ValueError, match="Base model is incompatible"
+    with (
+        database.session_factory() as db,
+        pytest.raises(ValueError, match="Base model is incompatible"),
     ):
         service.preview(db, spec)
 
@@ -1382,9 +1356,7 @@ def test_runtime_adapters_generate_only_validated_arguments(tmp_path):
     assert "--gpu-memory-utilization" in command
 
     sglang_spec = spec.model_copy(update={"runtime": "sglang", "image": "sglang:test"})
-    sglang = SGLangAdapter(
-        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
-    )
+    sglang = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
     assert sglang.command(sglang_spec)[:3] == ["python3", "-m", "sglang.launch_server"]
 
 
@@ -1504,15 +1476,12 @@ def test_vllm_command_uses_canonical_speculative_json(tmp_path):
 
     index = command.index("--speculative-config")
     assert command[index + 1] == (
-        '{"method":"draft_model","model":"/draft-models/draft",'
-        '"num_speculative_tokens":5}'
+        '{"method":"draft_model","model":"/draft-models/draft","num_speculative_tokens":5}'
     )
 
 
 def test_vllm_command_rejects_unsupported_grouped_speculative_tuning(tmp_path):
-    adapter = VllmAdapter(
-        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
-    )
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
     spec = resolved_speculative_spec(
         tmp_path,
         num_steps=2,
@@ -1541,9 +1510,7 @@ def test_vllm_speculative_json_keeps_path_content_in_one_argument(tmp_path):
 
 
 def test_sglang_command_adds_only_base_speculative_flags_without_tuning(tmp_path):
-    adapter = SGLangAdapter(
-        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
-    )
+    adapter = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
     spec = resolved_speculative_spec(
         tmp_path,
         runtime="sglang",
@@ -1566,9 +1533,7 @@ def test_sglang_command_adds_only_base_speculative_flags_without_tuning(tmp_path
 
 
 def test_sglang_command_adds_complete_grouped_speculative_tuning(tmp_path):
-    adapter = SGLangAdapter(
-        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
-    )
+    adapter = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
     spec = resolved_speculative_spec(
         tmp_path,
         runtime="sglang",
@@ -1603,12 +1568,8 @@ def test_sglang_command_adds_complete_grouped_speculative_tuning(tmp_path):
         ("mtp", "NEXTN"),
     ],
 )
-def test_sglang_command_accepts_only_trusted_method_mappings(
-    tmp_path, method, runtime_method
-):
-    adapter = SGLangAdapter(
-        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
-    )
+def test_sglang_command_accepts_only_trusted_method_mappings(tmp_path, method, runtime_method):
+    adapter = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
     spec = resolved_speculative_spec(
         tmp_path,
         runtime="sglang",
@@ -1630,13 +1591,9 @@ def test_sglang_command_accepts_only_trusted_method_mappings(
         ("sglang", "speculative_runtime_method", "resolved speculative runtime method is required"),
     ],
 )
-def test_speculative_commands_require_resolved_internal_fields(
-    tmp_path, runtime, field, message
-):
+def test_speculative_commands_require_resolved_internal_fields(tmp_path, runtime, field, message):
     adapter_type = VllmAdapter if runtime == "vllm" else SGLangAdapter
-    adapter = adapter_type(
-        allowed_images={f"{runtime}:test"}, model_roots=(tmp_path / "models",)
-    )
+    adapter = adapter_type(allowed_images={f"{runtime}:test"}, model_roots=(tmp_path / "models",))
     runtime_method = "draft_model" if runtime == "vllm" else "STANDALONE"
     spec = resolved_speculative_spec(
         tmp_path, runtime=runtime, runtime_method=runtime_method
@@ -1647,12 +1604,8 @@ def test_speculative_commands_require_resolved_internal_fields(
 
 
 @pytest.mark.parametrize("draft_path", ["", "relative/draft", "--draft-model"])
-def test_speculative_commands_reject_non_absolute_draft_container_paths(
-    tmp_path, draft_path
-):
-    adapter = VllmAdapter(
-        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
-    )
+def test_speculative_commands_reject_non_absolute_draft_container_paths(tmp_path, draft_path):
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
     spec = resolved_speculative_spec(tmp_path, draft_container_path=draft_path)
 
     with pytest.raises(ValueError, match="resolved draft container path is required"):
@@ -1662,9 +1615,7 @@ def test_speculative_commands_reject_non_absolute_draft_container_paths(
 def test_public_speculative_spec_cannot_build_a_runtime_command(tmp_path):
     model_path = tmp_path / "models" / "qwen"
     model_path.mkdir(parents=True)
-    adapter = VllmAdapter(
-        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
-    )
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
     spec = DeploymentSpec(
         name="Qwen",
         model_path=str(model_path),
@@ -1675,9 +1626,7 @@ def test_public_speculative_spec_cannot_build_a_runtime_command(tmp_path):
         speculative={"draft_model_id": "org/draft", "method": "draft_model"},
     )
 
-    with pytest.raises(
-        ValueError, match="resolved speculative runtime method is required"
-    ):
+    with pytest.raises(ValueError, match="resolved speculative runtime method is required"):
         adapter.command(spec)
 
 
@@ -1694,9 +1643,7 @@ def test_speculative_commands_reject_mismatched_or_unsupported_mappings(
     tmp_path, runtime, method, runtime_method
 ):
     adapter_type = VllmAdapter if runtime == "vllm" else SGLangAdapter
-    adapter = adapter_type(
-        allowed_images={f"{runtime}:test"}, model_roots=(tmp_path / "models",)
-    )
+    adapter = adapter_type(allowed_images={f"{runtime}:test"}, model_roots=(tmp_path / "models",))
     spec = resolved_speculative_spec(
         tmp_path,
         runtime=runtime,
@@ -1709,9 +1656,7 @@ def test_speculative_commands_reject_mismatched_or_unsupported_mappings(
 
 
 def test_sglang_command_rejects_unmapped_num_speculative_tokens(tmp_path):
-    adapter = SGLangAdapter(
-        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
-    )
+    adapter = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
     spec = resolved_speculative_spec(
         tmp_path,
         runtime="sglang",
@@ -1756,9 +1701,7 @@ def test_runtime_commands_without_speculative_config_remain_unchanged(tmp_path):
         "8",
     ]
 
-    sglang = SGLangAdapter(
-        allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",)
-    )
+    sglang = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
     sglang_spec = DeploymentSpec(runtime="sglang", image="sglang:test", **common)
     assert sglang.command(sglang_spec) == [
         "python3",
@@ -1807,15 +1750,11 @@ def test_create_endpoint_persists_json_safe_recommendation(authenticated_client,
     assert response.status_code == 202
     with authenticated_client.app.state.database.session_factory() as db:
         task = db.get(TaskRecord, response.json()["id"])
-        assert task.input_json["recommendation"]["generated_at"] == (
-            "2026-08-16T00:00:00Z"
-        )
+        assert task.input_json["recommendation"]["generated_at"] == ("2026-08-16T00:00:00Z")
         json.dumps(task.input_json)
 
 
-def test_preview_endpoint_passes_database_and_deployment_exclusion(
-    authenticated_client, tmp_path
-):
+def test_preview_endpoint_passes_database_and_deployment_exclusion(authenticated_client, tmp_path):
     payload = valid_spec_payload(tmp_path)
     payload["speculative"] = None
     payload["recommendation"] = None
@@ -2057,9 +1996,7 @@ def test_create_handler_recovers_committed_target_before_blocked_live_preflight(
             self.status = "running"
 
     container = Container()
-    containers = type(
-        "Containers", (), {"get": lambda _self, _identifier: container}
-    )()
+    containers = type("Containers", (), {"get": lambda _self, _identifier: container})()
     monkeypatch.setattr(
         service,
         "docker_client",
@@ -2068,9 +2005,7 @@ def test_create_handler_recovers_committed_target_before_blocked_live_preflight(
     monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
     blocked = StaticEstimator("blocked")
     service.resource_estimator = blocked
-    retry = original.model_copy(
-        update={"model_path": str(tmp_path / "browser-path-b")}
-    )
+    retry = original.model_copy(update={"model_path": str(tmp_path / "browser-path-b")})
 
     result = service.create_handler(
         HandlerContext(task_id="retry-task"), retry.model_dump(mode="json")
@@ -2088,9 +2023,7 @@ def test_create_handler_recovers_committed_target_before_blocked_live_preflight(
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])
-def test_committed_recovery_rejects_different_full_fingerprint(
-    tmp_path, monkeypatch, operation
-):
+def test_committed_recovery_rejects_different_full_fingerprint(tmp_path, monkeypatch, operation):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / f'fingerprint-{operation}.db'}")
     database.create_schema()
@@ -2131,9 +2064,7 @@ def test_committed_recovery_rejects_different_full_fingerprint(
     labels = service._expected_container_labels(
         spec,
         task_id="original-task",
-        spec_fingerprint=deployment_service.deployment_spec_fingerprint(
-            different_spec
-        ),
+        spec_fingerprint=deployment_service.deployment_spec_fingerprint(different_spec),
         deployment_id=deployment_id if operation == "update" else None,
     )
 
@@ -2144,9 +2075,7 @@ def test_committed_recovery_rejects_different_full_fingerprint(
         attrs = {"Config": {"Labels": labels}}
 
     container = Container()
-    containers = type(
-        "Containers", (), {"get": lambda _self, _identifier: container}
-    )()
+    containers = type("Containers", (), {"get": lambda _self, _identifier: container})()
     monkeypatch.setattr(
         service,
         "docker_client",
@@ -2164,9 +2093,7 @@ def test_committed_recovery_rejects_different_full_fingerprint(
             )
 
 
-def test_create_handler_rejects_orphan_container_with_incomplete_labels(
-    tmp_path, monkeypatch
-):
+def test_create_handler_rejects_orphan_container_with_incomplete_labels(tmp_path, monkeypatch):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'orphan-labels.db'}")
     database.create_schema()
@@ -2179,17 +2106,13 @@ def test_create_handler_rejects_orphan_container_with_incomplete_labels(
         id = "orphan"
         name = "dgx-base"
         status = "running"
-        attrs = {
-            "Config": {"Labels": {"com.dgx-spark-manager.managed": "true"}}
-        }
+        attrs = {"Config": {"Labels": {"com.dgx-spark-manager.managed": "true"}}}
 
         def reload(self):
             return None
 
     existing_container = ExistingContainer()
-    containers = type(
-        "Containers", (), {"get": lambda _self, _name: existing_container}
-    )()
+    containers = type("Containers", (), {"get": lambda _self, _name: existing_container})()
     monkeypatch.setattr(
         service,
         "docker_client",
@@ -2265,16 +2188,12 @@ def test_create_handler_removes_new_container_for_all_pre_persist_failures(
         "docker_client",
         lambda: type("Client", (), {"containers": Containers()})(),
     )
-    context = HandlerContext(
-        update_error=TaskCancelled() if failure_stage == "cancel" else None
-    )
+    context = HandlerContext(update_error=TaskCancelled() if failure_stage == "cancel" else None)
     if failure_stage == "health":
         monkeypatch.setattr(
             service,
             "wait_for_health",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError("health probe failed")
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("health probe failed")),
         )
     else:
         monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
@@ -2364,9 +2283,7 @@ def test_update_handler_blocked_preflight_does_not_touch_old_container(tmp_path)
         assert unchanged.status == "running"
 
 
-def test_update_recovers_committed_target_and_keeps_unmanaged_backup(
-    tmp_path, monkeypatch
-):
+def test_update_recovers_committed_target_and_keeps_unmanaged_backup(tmp_path, monkeypatch):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'update-committed-retry.db'}")
     database.create_schema()
@@ -2450,9 +2367,7 @@ def test_update_recovers_committed_target_and_keeps_unmanaged_backup(
     blocked = StaticEstimator("blocked")
     service.resource_estimator = blocked
     context = HandlerContext(task_id="retry-task")
-    retry = spec.model_copy(
-        update={"model_path": str(tmp_path / "browser-path-b")}
-    )
+    retry = spec.model_copy(update={"model_path": str(tmp_path / "browser-path-b")})
 
     result = service.update_handler(
         context,
@@ -2473,9 +2388,7 @@ def test_update_recovers_committed_target_and_keeps_unmanaged_backup(
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])
-def test_committed_recovery_rejects_wrong_deployment_label(
-    tmp_path, monkeypatch, operation
-):
+def test_committed_recovery_rejects_wrong_deployment_label(tmp_path, monkeypatch, operation):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'wrong-deployment-label.db'}")
     database.create_schema()
@@ -2526,9 +2439,7 @@ def test_committed_recovery_rejects_wrong_deployment_label(
         attrs = {"Config": {"Labels": labels}}
 
     container = Container()
-    containers = type(
-        "Containers", (), {"get": lambda _self, _identifier: container}
-    )()
+    containers = type("Containers", (), {"get": lambda _self, _identifier: container})()
     monkeypatch.setattr(
         service,
         "docker_client",
@@ -2683,9 +2594,7 @@ def test_committed_recovery_cas_rejects_race_and_coordinates_started_container(
         assert changed.health == db_health
 
 
-def test_committed_recovery_health_failure_stops_container_started_by_retry(
-    tmp_path, monkeypatch
-):
+def test_committed_recovery_health_failure_stops_container_started_by_retry(tmp_path, monkeypatch):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'recovery-health-failure.db'}")
     database.create_schema()
@@ -2746,9 +2655,7 @@ def test_committed_recovery_health_failure_stops_container_started_by_retry(
             self.status = "exited"
 
     container = Container()
-    containers = type(
-        "Containers", (), {"get": lambda _self, _identifier: container}
-    )()
+    containers = type("Containers", (), {"get": lambda _self, _identifier: container})()
     monkeypatch.setattr(
         service,
         "docker_client",
@@ -2772,10 +2679,7 @@ def test_create_app_shares_preflight_dependencies(settings):
     deployments = app.state.deployment_service
     recommendations = app.state.deployment_recommendation_service
 
-    assert (
-        deployments.runtime_capability_service
-        is recommendations.runtime_capability_service
-    )
+    assert deployments.runtime_capability_service is recommendations.runtime_capability_service
     assert deployments.evidence_loader is recommendations.evidence_loader
     assert deployments.resource_estimator is recommendations.resource_estimator
     assert deployments.draft_service is recommendations.draft_service
@@ -2808,9 +2712,9 @@ def test_update_endpoint_queues_managed_deployment_change(authenticated_client, 
         deployment_id, model_id = deployment.id, target.id
 
     original_preview = authenticated_client.app.state.deployment_service.preview
-    authenticated_client.app.state.deployment_service.preview = (
-        lambda _db, spec, **_kwargs: {"spec": spec.model_dump(mode="json")}
-    )
+    authenticated_client.app.state.deployment_service.preview = lambda _db, spec, **_kwargs: {
+        "spec": spec.model_dump(mode="json")
+    }
 
     try:
         response = authenticated_client.patch(
@@ -2833,9 +2737,7 @@ def test_update_endpoint_queues_managed_deployment_change(authenticated_client, 
     assert response.json()["type"] == "deployment.update"
     with authenticated_client.app.state.database.session_factory() as db:
         task = db.get(TaskRecord, response.json()["id"])
-        assert task.input_json["spec"]["recommendation"]["generated_at"] == (
-            "2026-08-16T00:00:00Z"
-        )
+        assert task.input_json["spec"]["recommendation"]["generated_at"] == ("2026-08-16T00:00:00Z")
         json.dumps(task.input_json)
 
 
@@ -2859,9 +2761,7 @@ def test_settings_preserve_container_to_host_model_root_order(tmp_path):
         secret_key="test-secret-key-with-at-least-32-characters",
         admin_password="Test-password-1234",
         model_roots=f"{container_models},{container_hf}",
-        model_root_mappings=(
-            f"{container_models}={host_models};{container_hf}={host_hf}"
-        ),
+        model_root_mappings=(f"{container_models}={host_models};{container_hf}={host_hf}"),
     )
 
     assert getattr(settings, "host_model_root_paths", ()) == (host_models, host_hf)
@@ -2874,11 +2774,7 @@ def test_port_allocator_uses_db_and_docker_ports_and_reuses_lowest_gap(tmp_path)
 
     class Container:
         id = "external-container"
-        attrs = {
-            "HostConfig": {
-                "PortBindings": {"8000/tcp": [{"HostPort": "8003"}]}
-            }
-        }
+        attrs = {"HostConfig": {"PortBindings": {"8000/tcp": [{"HostPort": "8003"}]}}}
 
     class Containers:
         def list(self, all=True):
@@ -3037,8 +2933,8 @@ def test_deployment_service_mounts_the_host_model_root(tmp_path, monkeypatch):
     service.create_handler(
         Context(),
         DeploymentSpec(
-                name="Test Model",
-                model_id=model_id,
+            name="Test Model",
+            model_id=model_id,
             model_path=str(model_path),
             api_model_name="test-model",
             runtime="vllm",
@@ -3134,8 +3030,8 @@ def test_deployment_timeout_captures_logs_and_rolls_back_new_container(tmp_path,
         service.create_handler(
             Context(),
             DeploymentSpec(
-                    name="Timeout",
-                    model_id=model_id,
+                name="Timeout",
+                model_id=model_id,
                 model_path=str(model_path),
                 api_model_name="timeout",
                 runtime="vllm",
@@ -3262,9 +3158,7 @@ def test_not_found_cleanup_cas_preserves_concurrently_rebound_deployment(tmp_pat
         assert current.health == "healthy"
 
 
-def test_failed_action_recovery_cas_does_not_pollute_rebound_deployment(
-    tmp_path, monkeypatch
-):
+def test_failed_action_recovery_cas_does_not_pollute_rebound_deployment(tmp_path, monkeypatch):
     database = Database(f"sqlite:///{tmp_path / 'failed-rebound.db'}")
     database.create_schema()
     container_a = ActionContainer("5a" * 32, "shared-name")
@@ -3311,9 +3205,7 @@ def test_failed_action_recovery_cas_does_not_pollute_rebound_deployment(
     assert "identity changed concurrently" in "\n".join(context.messages)
 
 
-def test_successful_delete_cas_does_not_delete_rebound_deployment(
-    tmp_path, monkeypatch
-):
+def test_successful_delete_cas_does_not_delete_rebound_deployment(tmp_path, monkeypatch):
     database = Database(f"sqlite:///{tmp_path / 'success-rebound.db'}")
     database.create_schema()
     container_a = ActionContainer("6a" * 32, "shared-name")
@@ -3499,9 +3391,7 @@ def test_action_rejects_changed_container_identity(tmp_path, actual_id, actual_n
         assert current.status != "deleting"
 
 
-@pytest.mark.parametrize(
-    "container_name", ["dgx-spark-web-manager", "dgx-spark-ops-agent"]
-)
+@pytest.mark.parametrize("container_name", ["dgx-spark-web-manager", "dgx-spark-ops-agent"])
 def test_action_rejects_reserved_manager_containers(tmp_path, container_name):
     database = Database(f"sqlite:///{tmp_path / f'{container_name}.db'}")
     database.create_schema()
@@ -3839,9 +3729,7 @@ def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
         db.commit()
         deployment_id = deployment.id
     service = deployment_service.DeploymentService(
-        adapters={
-            "vllm": VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path,))
-        },
+        adapters={"vllm": VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path,))},
         session_factory=database.session_factory,
         model_roots=(tmp_path,),
         startup_timeout_seconds=4,
@@ -3990,8 +3878,8 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
         {
             "deployment_id": deployment_id,
             "spec": DeploymentSpec(
-                    name="managed",
-                    model_id=model_id,
+                name="managed",
+                model_id=model_id,
                 model_path=str(model_path),
                 api_model_name="managed",
                 route_alias="managed-route",
@@ -4012,9 +3900,7 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
         assert updated.config["route_alias"] == "managed-route"
 
 
-def test_update_handler_restores_old_container_when_replacement_is_unhealthy(
-    tmp_path, monkeypatch
-):
+def test_update_handler_restores_old_container_when_replacement_is_unhealthy(tmp_path, monkeypatch):
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'update-rollback.db'}")
     database.create_schema()
@@ -4069,6 +3955,7 @@ def test_update_handler_restores_old_container_when_replacement_is_unhealthy(
 
     old = Container("old-container", "dgx-base")
     new = Container("new-container", "dgx-base")
+
     class Containers:
         def get(self, identifier):
             if identifier == "old-container":
@@ -4115,9 +4002,7 @@ def test_update_handler_restores_old_container_when_replacement_is_unhealthy(
         assert unchanged.config == {"before": True}
 
 
-@pytest.mark.parametrize(
-    "crash_stage", ["renamed", "replacement", "committed", "mismatched"]
-)
+@pytest.mark.parametrize("crash_stage", ["renamed", "replacement", "committed", "mismatched"])
 def test_update_handler_reconciles_interrupted_replacement_stages(
     tmp_path, monkeypatch, crash_stage
 ):
@@ -4155,9 +4040,7 @@ def test_update_handler_reconciles_interrupted_replacement_stages(
         port=8101,
     )
     with database.session_factory() as db:
-        resolved, preview = service._preflight(
-            db, spec, exclude_deployment_id=deployment_id
-        )
+        resolved, preview = service._preflight(db, spec, exclude_deployment_id=deployment_id)
     fingerprint = preview["spec_fingerprint"]
     target_name = deterministic_container_name(spec.name)
     backup_name = f"dgx-backup-{deployment_id}"[:63]
@@ -4209,9 +4092,7 @@ def test_update_handler_reconciles_interrupted_replacement_stages(
             "new-container",
             target_name,
             labels=(
-                {"com.dgx-spark-manager.managed": "true"}
-                if crash_stage == "mismatched"
-                else labels
+                {"com.dgx-spark-manager.managed": "true"} if crash_stage == "mismatched" else labels
             ),
         )
     )
@@ -4299,3 +4180,366 @@ def test_update_handler_reconciles_interrupted_replacement_stages(
         assert updated.container_id == "new-container"
         assert updated.config["spec_fingerprint"] == fingerprint
 
+
+class LaunchContractContainer(ActionContainer):
+    def __init__(self, container_id, name, attrs, *, status="exited"):
+        super().__init__(container_id, name, status=status)
+        self.attrs = attrs
+        self.renames = []
+        self.remove_error = None
+
+    def rename(self, name):
+        self.renames.append(name)
+        self.name = name
+
+    def remove(self, **_kwargs):
+        if self.remove_error is not None:
+            raise self.remove_error
+        self.removed = True
+
+    def logs(self, **_kwargs):
+        return b"launch failed"
+
+
+def launch_contract():
+    return {
+        "image": "runtime:test",
+        "entrypoint": ["/opt/runtime/server"],
+        "command": ["--model", "/models/base", "--port", "8000"],
+        "environment": {"HF_HUB_OFFLINE": "1", "MODE": "serve"},
+        "mounts": [
+            {
+                "type": "bind",
+                "source": "/host/models",
+                "target": "/models",
+                "read_only": True,
+            }
+        ],
+        "network_mode": "bridge",
+        "ipc_mode": "host",
+        "restart_policy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
+        "device_requests": [
+            {
+                "Driver": "",
+                "Count": -1,
+                "DeviceIDs": [],
+                "Capabilities": [["gpu"]],
+                "Options": {},
+            }
+        ],
+        "port": {
+            "container_port": 8000,
+            "host_port": 8100,
+            "protocol": "tcp",
+        },
+    }
+
+
+def launch_contract_attrs(contract=None):
+    contract = contract or launch_contract()
+    return {
+        "Config": {
+            "Image": contract["image"],
+            "Entrypoint": contract["entrypoint"],
+            "Cmd": contract["command"],
+            "Env": [f"{key}={value}" for key, value in contract["environment"].items()],
+        },
+        "Mounts": [
+            {
+                "Type": mount["type"],
+                "Source": mount["source"],
+                "Destination": mount["target"],
+                "RW": not mount["read_only"],
+            }
+            for mount in contract["mounts"]
+        ],
+        "HostConfig": {
+            "NetworkMode": contract["network_mode"],
+            "IpcMode": contract["ipc_mode"],
+            "RestartPolicy": contract["restart_policy"],
+            "DeviceRequests": contract["device_requests"],
+            "PortBindings": {"8000/tcp": [{"HostIp": "", "HostPort": "8100"}]},
+        },
+    }
+
+
+def test_start_with_drifted_launch_contract_atomically_rebuilds_and_updates_db(
+    tmp_path,
+):
+    database = Database(f"sqlite:///{tmp_path / 'contract-drift.db'}")
+    database.create_schema()
+    contract = launch_contract()
+    drifted = launch_contract_attrs(contract)
+    drifted["Config"]["Image"] = "wrong:snapshot"
+    old = LaunchContractContainer("a" * 64, "dgx-managed", drifted)
+    replacement = LaunchContractContainer(
+        "b" * 64,
+        "dgx-managed",
+        launch_contract_attrs(contract),
+        status="running",
+    )
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=old.id,
+            container_name=old.name,
+            status="exited",
+            config={"launch_contract": contract},
+        )
+        deployment_id = deployment.id
+
+    class Containers:
+        def __init__(self):
+            self.run_calls = []
+
+        def get(self, identifier):
+            if identifier == old.id:
+                return old
+            raise docker.errors.NotFound("missing")
+
+        def run(self, image, **kwargs):
+            self.run_calls.append((image, kwargs))
+            return replacement
+
+    containers = Containers()
+    service, _, _ = build_action_service(database, tmp_path, old)
+    service._docker_client = type("Client", (), {"containers": containers})()
+    service.wait_for_health = lambda *_args, **_kwargs: True
+
+    result = service.action_handler(
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "start",
+            container_id=old.id,
+            container_name="dgx-managed",
+        ),
+    )
+
+    assert old.starts == 0 and old.restarts == 0
+    assert old.name != "dgx-managed" and old.removed is True
+    image, kwargs = containers.run_calls[0]
+    assert image == contract["image"]
+    assert kwargs["entrypoint"] == contract["entrypoint"]
+    assert kwargs["command"] == contract["command"]
+    assert kwargs["environment"] == contract["environment"]
+    assert kwargs["volumes"] == {"/host/models": {"bind": "/models", "mode": "ro"}}
+    assert kwargs["network_mode"] == "bridge" and kwargs["ipc_mode"] == "host"
+    assert kwargs["restart_policy"] == contract["restart_policy"]
+    assert kwargs["ports"] == {"8000/tcp": ("", 8100)}
+    assert kwargs["device_requests"][0]["Count"] == -1
+    assert result["status"] == "running" and result["health"] == "healthy"
+    with database.session_factory() as db:
+        updated = db.get(Deployment, deployment_id)
+        assert (updated.container_id, updated.container_name) == (
+            replacement.id,
+            "dgx-managed",
+        )
+        assert updated.status == "running"
+        assert updated.health == "healthy"
+        assert updated.managed is True
+
+
+def test_restart_with_matching_launch_contract_uses_existing_container(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'contract-match.db'}")
+    database.create_schema()
+    contract = launch_contract()
+    container = LaunchContractContainer(
+        "c" * 64,
+        "dgx-managed",
+        launch_contract_attrs(contract),
+        status="running",
+    )
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=container.id,
+            container_name=container.name,
+            config={"launch_contract": contract},
+        )
+        deployment_id = deployment.id
+    service, _, _ = build_action_service(database, tmp_path, container)
+    service.wait_for_health = lambda *_args, **_kwargs: True
+
+    result = service.action_handler(
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "restart",
+            container_id=container.id,
+            container_name=container.name,
+        ),
+    )
+
+    assert container.restarts == 1 and container.renames == []
+    assert result["health"] == "healthy"
+
+
+def test_start_with_missing_launch_contract_container_rebuilds(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'contract-missing.db'}")
+    database.create_schema()
+    contract = launch_contract()
+    replacement = LaunchContractContainer(
+        "d" * 64,
+        "dgx-managed",
+        launch_contract_attrs(contract),
+        status="running",
+    )
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id="e" * 64,
+            container_name="dgx-managed",
+            status="exited",
+            config={"launch_contract": contract},
+        )
+        deployment_id = deployment.id
+
+    class Containers:
+        def __init__(self):
+            self.runs = 0
+
+        def get(self, _identifier):
+            raise docker.errors.NotFound("missing")
+
+        def run(self, _image, **_kwargs):
+            self.runs += 1
+            return replacement
+
+    containers = Containers()
+    service, _, _ = build_action_service(database, tmp_path, docker.errors.NotFound("missing"))
+    service._docker_client = type("Client", (), {"containers": containers})()
+    service.wait_for_health = lambda *_args, **_kwargs: True
+
+    result = service.action_handler(
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "start",
+            container_id="e" * 64,
+            container_name="dgx-managed",
+        ),
+    )
+
+    assert containers.runs == 1 and result["container_missing"] is True
+    with database.session_factory() as db:
+        assert db.get(Deployment, deployment_id).container_id == replacement.id
+
+
+def test_unhealthy_launch_contract_replacement_rolls_back_and_marks_unhealthy(
+    tmp_path,
+):
+    database = Database(f"sqlite:///{tmp_path / 'contract-rollback.db'}")
+    database.create_schema()
+    contract = launch_contract()
+    drifted = launch_contract_attrs(contract)
+    drifted["Config"]["Cmd"] = ["wrong"]
+    old = LaunchContractContainer("f" * 64, "dgx-managed", drifted, status="running")
+    replacement = LaunchContractContainer(
+        "1" * 64,
+        "dgx-managed",
+        launch_contract_attrs(contract),
+        status="running",
+    )
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=old.id,
+            container_name=old.name,
+            config={"launch_contract": contract},
+        )
+        deployment_id = deployment.id
+
+    class Containers:
+        def get(self, identifier):
+            if identifier == old.id:
+                return old
+            raise docker.errors.NotFound("missing")
+
+        def run(self, _image, **_kwargs):
+            return replacement
+
+    service, _, _ = build_action_service(database, tmp_path, old)
+    service._docker_client = type("Client", (), {"containers": Containers()})()
+    service.wait_for_health = lambda *_args, **_kwargs: False
+
+    with pytest.raises(RuntimeError, match="did not become healthy"):
+        service.action_handler(
+            HandlerContext(),
+            action_handler_payload(
+                deployment_id,
+                "restart",
+                container_id=old.id,
+                container_name="dgx-managed",
+            ),
+        )
+
+    assert replacement.removed is True
+    assert old.name == "dgx-managed" and old.starts == 1 and old.restarts == 0
+    with database.session_factory() as db:
+        updated = db.get(Deployment, deployment_id)
+        assert updated.container_id == old.id
+        assert updated.status == "running" and updated.health == "unhealthy"
+
+
+def test_launch_contract_cleanup_failure_keeps_committed_replacement(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'contract-cleanup.db'}")
+    database.create_schema()
+    contract = launch_contract()
+    drifted = launch_contract_attrs(contract)
+    drifted["Config"]["Image"] = "wrong:snapshot"
+    old = LaunchContractContainer("2" * 64, "dgx-managed", drifted)
+    old.remove_error = RuntimeError("cleanup failed")
+    replacement = LaunchContractContainer(
+        "3" * 64,
+        "dgx-managed",
+        launch_contract_attrs(contract),
+        status="running",
+    )
+    with database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="managed",
+            container_id=old.id,
+            container_name=old.name,
+            status="exited",
+            config={"launch_contract": contract},
+        )
+        deployment_id = deployment.id
+
+    class Containers:
+        def get(self, _identifier):
+            return old
+
+        def run(self, _image, **_kwargs):
+            return replacement
+
+    service, _, _ = build_action_service(database, tmp_path, old)
+    service._docker_client = type("Client", (), {"containers": Containers()})()
+    service.wait_for_health = lambda *_args, **_kwargs: True
+
+    result = service.action_handler(
+        HandlerContext(),
+        action_handler_payload(
+            deployment_id,
+            "start",
+            container_id=old.id,
+            container_name="dgx-managed",
+        ),
+    )
+
+    assert result["status"] == "running"
+    assert replacement.removed is False
+    with database.session_factory() as db:
+        updated = db.get(Deployment, deployment_id)
+        assert updated.container_id == replacement.id
+        assert updated.status == "running" and updated.health == "healthy"

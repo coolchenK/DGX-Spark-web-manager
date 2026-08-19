@@ -59,11 +59,11 @@ def resolve_host_model_mount(
     raise ValueError("Model path is outside configured model roots")
 
 
-def _deployment_spec_fingerprint(
-    spec: DeploymentSpec, *, include_model_path: bool
-) -> str:
-    public = spec.public_dump() if isinstance(spec, ResolvedDeploymentSpec) else spec.model_dump(
-        mode="json"
+def _deployment_spec_fingerprint(spec: DeploymentSpec, *, include_model_path: bool) -> str:
+    public = (
+        spec.public_dump()
+        if isinstance(spec, ResolvedDeploymentSpec)
+        else spec.model_dump(mode="json")
     )
     if not include_model_path:
         public.pop("model_path", None)
@@ -118,9 +118,7 @@ class DeploymentService:
     def docker_client(self):
         return self._docker_client or docker.from_env()
 
-    def _docker_reserved_ports(
-        self, *, excluded_container_ids: set[str] | None = None
-    ) -> set[int]:
+    def _docker_reserved_ports(self, *, excluded_container_ids: set[str] | None = None) -> set[int]:
         reserved: set[int] = set()
         excluded = excluded_container_ids or set()
         try:
@@ -157,9 +155,7 @@ class DeploymentService:
     def _deployment_reserved_ports(
         self, db: Session, *, exclude_deployment_id: str | None = None
     ) -> set[int]:
-        reserved = self._db_reserved_ports(
-            db, exclude_deployment_id=exclude_deployment_id
-        )
+        reserved = self._db_reserved_ports(db, exclude_deployment_id=exclude_deployment_id)
         excluded_container_ids: set[str] = set()
         if exclude_deployment_id:
             deployment = db.get(Deployment, exclude_deployment_id)
@@ -177,9 +173,7 @@ class DeploymentService:
         releases its port, so the next creation naturally reuses the lowest gap.
         Live Docker bindings are also checked to protect against DB drift.
         """
-        reserved = self._deployment_reserved_ports(
-            db, exclude_deployment_id=exclude_deployment_id
-        )
+        reserved = self._deployment_reserved_ports(db, exclude_deployment_id=exclude_deployment_id)
         port = 8000
         while port in reserved:
             port += 1
@@ -195,13 +189,9 @@ class DeploymentService:
     ) -> DeploymentSpec:
         if spec.port is None:
             reserved = (
-                self._deployment_reserved_ports(
-                    db, exclude_deployment_id=exclude_deployment_id
-                )
+                self._deployment_reserved_ports(db, exclude_deployment_id=exclude_deployment_id)
                 if include_docker
-                else self._db_reserved_ports(
-                    db, exclude_deployment_id=exclude_deployment_id
-                )
+                else self._db_reserved_ports(db, exclude_deployment_id=exclude_deployment_id)
             )
             port = 8000
             while port in reserved:
@@ -226,8 +216,10 @@ class DeploymentService:
         for index, root in enumerate(self.model_roots):
             resolved_root = root.resolve()
             if resolved == resolved_root or resolved.is_relative_to(resolved_root):
-                return resolved_root, self.host_model_roots[index], resolved.relative_to(
-                    resolved_root
+                return (
+                    resolved_root,
+                    self.host_model_roots[index],
+                    resolved.relative_to(resolved_root),
                 )
         raise ValueError("Model path is outside configured model roots")
 
@@ -241,9 +233,7 @@ class DeploymentService:
     ) -> tuple[ResolvedDeploymentSpec, RuntimeCapabilities]:
         adapter = self.adapter(spec.runtime)
         if spec.runtime != adapter.runtime:
-            raise ValueError(
-                f"Adapter {adapter.runtime} cannot deploy runtime {spec.runtime}"
-            )
+            raise ValueError(f"Adapter {adapter.runtime} cannot deploy runtime {spec.runtime}")
         if spec.image not in adapter.allowed_images:
             raise ValueError(f"Image is not allowed for {spec.runtime}")
         target = db.get(ModelAsset, spec.model_id) if spec.model_id else None
@@ -291,9 +281,7 @@ class DeploymentService:
                     "resolved_draft_model_path": str(draft_path),
                     "draft_model_root": str(draft_root),
                     "draft_host_model_root": str(draft_host_root),
-                    "draft_container_model_path": self._container_path(
-                        draft_bind, draft_relative
-                    ),
+                    "draft_container_model_path": self._container_path(draft_bind, draft_relative),
                     "speculative_runtime_method": runtime_method,
                 }
             )
@@ -353,9 +341,7 @@ class DeploymentService:
                 continue
             config = deployment.config if isinstance(deployment.config, Mapping) else {}
             stored_spec_value = config.get("spec")
-            stored_spec = (
-                stored_spec_value if isinstance(stored_spec_value, Mapping) else {}
-            )
+            stored_spec = stored_spec_value if isinstance(stored_spec_value, Mapping) else {}
             stored_route = (
                 config.get("route_alias")
                 or stored_spec.get("route_alias")
@@ -403,8 +389,7 @@ class DeploymentService:
                 "model_path": resolved.resolved_draft_model_path,
                 "container_model_path": resolved.draft_container_model_path,
                 "mode": "ro",
-                "reuses_base_mount": resolved.draft_model_root
-                == resolved.base_model_root,
+                "reuses_base_mount": resolved.draft_model_root == resolved.base_model_root,
             }
         return mounts
 
@@ -452,14 +437,9 @@ class DeploymentService:
                 and key not in labels
             ):
                 continue
-            if (
-                accepted_fingerprints is not None
-                and key == f"{LABEL_PREFIX}spec-fingerprint"
-            ):
+            if accepted_fingerprints is not None and key == f"{LABEL_PREFIX}spec-fingerprint":
                 if labels.get(key) not in accepted_fingerprints:
-                    raise ValueError(
-                        "Existing container labels do not match this task and spec"
-                    )
+                    raise ValueError("Existing container labels do not match this task and spec")
                 continue
             if labels.get(key) != value:
                 raise ValueError("Existing container labels do not match this task and spec")
@@ -504,19 +484,14 @@ class DeploymentService:
     def _adapter_for_spec(self, spec: DeploymentSpec) -> RuntimeAdapter:
         adapter = self.adapter(spec.runtime)
         if spec.runtime != adapter.runtime:
-            raise ValueError(
-                f"Adapter {adapter.runtime} cannot deploy runtime {spec.runtime}"
-            )
+            raise ValueError(f"Adapter {adapter.runtime} cannot deploy runtime {spec.runtime}")
         if spec.image not in adapter.allowed_images:
             raise ValueError(f"Image is not allowed for {spec.runtime}")
         return adapter
 
-    def _deployment_matches_spec(
-        self, deployment: Deployment, spec: DeploymentSpec
-    ) -> bool:
+    def _deployment_matches_spec(self, deployment: Deployment, spec: DeploymentSpec) -> bool:
         return (
-            self._stored_spec_fingerprint(deployment)
-            == deployment_spec_fingerprint(spec)
+            self._stored_spec_fingerprint(deployment) == deployment_spec_fingerprint(spec)
             and deployment.name == spec.name
             and deployment.model_id == spec.model_id
             and deployment.runtime == spec.runtime
@@ -532,9 +507,7 @@ class DeploymentService:
         target: Any,
         deployment_id: str,
     ) -> None:
-        backup = self._get_container_optional(
-            client, self._backup_container_name(deployment_id)
-        )
+        backup = self._get_container_optional(client, self._backup_container_name(deployment_id))
         if backup is None or backup.id == target.id:
             return
         target_labels = (target.attrs.get("Config") or {}).get("Labels") or {}
@@ -545,9 +518,7 @@ class DeploymentService:
             or not replaced_id
             or backup.id != replaced_id
         ):
-            context.update(
-                message="backup cleanup conflict: ownership could not be verified"
-            )
+            context.update(message="backup cleanup conflict: ownership could not be verified")
             return
         self._remove_owned_container(backup)
 
@@ -609,9 +580,7 @@ class DeploymentService:
             )
         except BaseException:
             if started_here:
-                self._coordinate_failed_recovery_start(
-                    adapter, target, deployment_id, container_id
-                )
+                self._coordinate_failed_recovery_start(adapter, target, deployment_id, container_id)
             raise
         if cleanup_backup:
             self._cleanup_committed_backup(context, client, target, deployment_id)
@@ -701,9 +670,7 @@ class DeploymentService:
         try:
             with self.session_factory() as db:
                 reference = db.scalar(
-                    select(Deployment).where(
-                        Deployment.container_id == container_id
-                    )
+                    select(Deployment).where(Deployment.container_id == container_id)
                 )
                 should_stop = reference is None or (
                     reference.id == deployment_id
@@ -758,9 +725,7 @@ class DeploymentService:
         selected_candidate = None
         if resolved.speculative is not None:
             draft = db.get(ModelAsset, resolved.speculative.draft_model_id)
-            candidates = self.draft_service.list_candidates(
-                db, target, capabilities, snapshot
-            )
+            candidates = self.draft_service.list_candidates(db, target, capabilities, snapshot)
             selected_candidate = next(
                 (
                     candidate
@@ -891,13 +856,8 @@ class DeploymentService:
             raise ValueError("Resolved deployment spec is required")
         if not spec.base_host_model_root or not spec.base_container_model_path:
             raise ValueError("Resolved base model mount is required")
-        volumes = {
-            spec.base_host_model_root: {"bind": "/models", "mode": "ro"}
-        }
-        if (
-            spec.speculative is not None
-            and spec.draft_model_root != spec.base_model_root
-        ):
+        volumes = {spec.base_host_model_root: {"bind": "/models", "mode": "ro"}}
+        if spec.speculative is not None and spec.draft_model_root != spec.base_model_root:
             if not spec.draft_host_model_root:
                 raise ValueError("Resolved Draft Model mount is required")
             volumes[spec.draft_host_model_root] = {
@@ -965,10 +925,7 @@ class DeploymentService:
                 if len(matches) != 1:
                     raise ValueError("Deployment identity conflicts with existing deployments")
                 existing = matches[0]
-                if (
-                    existing.name != spec.name
-                    or existing.api_model_name != spec.api_model_name
-                ):
+                if existing.name != spec.name or existing.api_model_name != spec.api_model_name:
                     raise ValueError("Deployment identity conflicts with an existing deployment")
                 if spec.port is None and existing.port is not None:
                     spec = spec.model_copy(update={"port": existing.port})
@@ -1097,16 +1054,13 @@ class DeploymentService:
                     auto_port=auto_port,
                 )
                 current_container_id = deployment.container_id
-                current_container_name = (
-                    deployment.container_name
-                    or deterministic_container_name(deployment.name)
+                current_container_name = deployment.container_name or deterministic_container_name(
+                    deployment.name
                 )
                 current_status = deployment.status
 
         if committed is not None:
-            return self._recover_committed_deployment(
-                context, committed, spec, cleanup_backup=True
-            )
+            return self._recover_committed_deployment(context, committed, spec, cleanup_backup=True)
 
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
@@ -1428,6 +1382,248 @@ class DeploymentService:
             "container_missing": container_missing,
         }
 
+    @staticmethod
+    def _launch_contract_snapshot(contract: Mapping[str, Any]) -> dict[str, Any]:
+        required = {
+            "image",
+            "entrypoint",
+            "command",
+            "environment",
+            "mounts",
+            "network_mode",
+            "ipc_mode",
+            "restart_policy",
+            "device_requests",
+            "port",
+        }
+        missing = sorted(required - set(contract))
+        if missing:
+            raise ValueError(f"launch_contract is missing fields: {', '.join(missing)}")
+        port = contract["port"]
+        if not isinstance(port, Mapping) or not {
+            "container_port",
+            "host_port",
+            "protocol",
+        }.issubset(port):
+            raise ValueError("launch_contract.port is invalid")
+        try:
+            snapshot = json.loads(json.dumps(contract))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("launch_contract must contain JSON-compatible values") from exc
+        if not isinstance(snapshot, dict):
+            raise ValueError("launch_contract must be an object")
+        return snapshot
+
+    @staticmethod
+    def _container_matches_launch_contract(container: Any, contract: Mapping[str, Any]) -> bool:
+        attrs = getattr(container, "attrs", {}) or {}
+        config = attrs.get("Config", {}) or {}
+        host = attrs.get("HostConfig", {}) or {}
+        actual_env: dict[str, str] = {}
+        for item in config.get("Env") or []:
+            key, separator, value = str(item).partition("=")
+            actual_env[key] = value if separator else ""
+        actual_mounts = sorted(
+            (
+                str(item.get("Type") or ""),
+                str(item.get("Source") or ""),
+                str(item.get("Destination") or ""),
+                not bool(item.get("RW", False)),
+            )
+            for item in attrs.get("Mounts") or []
+        )
+        expected_mounts = sorted(
+            (
+                str(item.get("type") or "bind"),
+                str(item.get("source") or ""),
+                str(item.get("target") or ""),
+                bool(item.get("read_only", False)),
+            )
+            for item in contract["mounts"]
+        )
+        port = contract["port"]
+        binding_key = f"{int(port['container_port'])}/{port['protocol']}"
+        bindings = (host.get("PortBindings") or {}).get(binding_key) or []
+        actual_binding = sorted(
+            (str(item.get("HostIp") or ""), str(item.get("HostPort") or "")) for item in bindings
+        )
+        expected_binding = [(str(port.get("host_ip") or ""), str(int(port["host_port"])))]
+        expected_env = {str(key): str(value) for key, value in contract["environment"].items()}
+        expected_labels = {
+            str(key): str(value) for key, value in contract.get("labels", {}).items()
+        }
+        actual_labels = {
+            str(key): str(value) for key, value in (config.get("Labels") or {}).items()
+        }
+
+        def normalize_device_requests(items: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "Driver": item.get("Driver") or "",
+                    "Count": int(item.get("Count", 0)),
+                    "DeviceIDs": item.get("DeviceIDs") or [],
+                    "Capabilities": item.get("Capabilities") or [],
+                    "Options": item.get("Options") or {},
+                }
+                for item in items or []
+            ]
+
+        return all(
+            (
+                config.get("Image") == contract["image"],
+                (config.get("Entrypoint") or []) == (contract["entrypoint"] or []),
+                (config.get("Cmd") or []) == (contract["command"] or []),
+                all(actual_env.get(key) == value for key, value in expected_env.items()),
+                all(actual_labels.get(key) == value for key, value in expected_labels.items()),
+                actual_mounts == expected_mounts,
+                host.get("NetworkMode") == contract["network_mode"],
+                host.get("IpcMode") == contract["ipc_mode"],
+                (host.get("RestartPolicy") or {}) == contract["restart_policy"],
+                normalize_device_requests(host.get("DeviceRequests"))
+                == normalize_device_requests(contract["device_requests"]),
+                actual_binding == expected_binding,
+            )
+        )
+
+    @staticmethod
+    def _run_launch_contract_container(client: Any, contract: Mapping[str, Any], name: str) -> Any:
+        volumes = {
+            item["source"]: {
+                "bind": item["target"],
+                "mode": "ro" if item.get("read_only", False) else "rw",
+            }
+            for item in contract["mounts"]
+        }
+        port = contract["port"]
+        device_requests = [
+            DeviceRequest(
+                driver=item.get("Driver", ""),
+                count=item.get("Count", 0),
+                device_ids=item.get("DeviceIDs") or [],
+                capabilities=item.get("Capabilities") or [],
+                options=item.get("Options") or {},
+            )
+            for item in contract["device_requests"]
+        ]
+        return client.containers.run(
+            contract["image"],
+            entrypoint=contract["entrypoint"],
+            command=contract["command"],
+            environment=contract["environment"],
+            volumes=volumes,
+            network_mode=contract["network_mode"],
+            ipc_mode=contract["ipc_mode"],
+            restart_policy=contract["restart_policy"],
+            device_requests=device_requests,
+            ports={
+                f"{int(port['container_port'])}/{port['protocol']}": (
+                    str(port.get("host_ip") or ""),
+                    int(port["host_port"]),
+                )
+            },
+            labels={str(key): str(value) for key, value in contract.get("labels", {}).items()},
+            name=name,
+            detach=True,
+        )
+
+    def _rebuild_action_container_from_contract(
+        self,
+        context: TaskContext,
+        *,
+        deployment_id: str,
+        action: str,
+        adapter: RuntimeAdapter,
+        contract: Mapping[str, Any],
+        old_container: Any | None,
+        expected_container_id: str,
+        expected_container_name: str,
+        endpoint_url: str,
+        original_status: str,
+        transient_status: str,
+    ) -> dict[str, Any]:
+        client = self.docker_client()
+        backup_name = self._backup_container_name(deployment_id)
+        replacement = None
+        old_was_running = old_container is not None and old_container.status == "running"
+        container_missing = old_container is None
+        try:
+            if old_container is not None:
+                if old_was_running:
+                    adapter.stop(old_container, timeout=30)
+                old_container.rename(backup_name)
+            context.update(
+                progress=20,
+                message=f"Rebuilding drifted container {expected_container_name}",
+            )
+            replacement = self._run_launch_contract_container(
+                client, contract, expected_container_name
+            )
+            if not self.wait_for_health(
+                context,
+                endpoint_url,
+                adapter=adapter,
+                progress_start=30,
+                progress_end=95,
+            ):
+                logs = self._startup_logs(adapter, replacement)
+                raise RuntimeError(
+                    f"Runtime did not become healthy within {self.startup_timeout_seconds} "
+                    f"seconds. Last logs:\n{logs}"
+                )
+            replacement.reload()
+            with self.session_factory() as db:
+                result = db.execute(
+                    update(Deployment)
+                    .where(
+                        *self._deployment_identity_filters(
+                            deployment_id,
+                            expected_container_id=expected_container_id,
+                            expected_container_name=expected_container_name,
+                        ),
+                        Deployment.status == transient_status,
+                    )
+                    .values(
+                        container_id=replacement.id,
+                        container_name=expected_container_name,
+                        status="running",
+                        health="healthy",
+                        managed=True,
+                    )
+                )
+                if result.rowcount != 1:
+                    db.rollback()
+                    raise ValueError(CONCURRENT_DEPLOYMENT_CHANGE_ERROR)
+                db.commit()
+            if old_container is not None:
+                self._remove_owned_container(old_container)
+            return self._action_result(
+                deployment_id,
+                action,
+                "running",
+                "healthy",
+                container_missing=container_missing,
+            )
+        except BaseException:
+            if replacement is not None:
+                self._remove_owned_container(replacement)
+            if old_container is not None:
+                try:
+                    if old_container.name == backup_name:
+                        old_container.rename(expected_container_name)
+                    if old_was_running and old_container.status != "running":
+                        adapter.start(old_container)
+                except BaseException:
+                    pass
+            self._best_effort_recover_action_failure(
+                deployment_id,
+                container=old_container,
+                original_status=original_status,
+                expected_container_id=expected_container_id,
+                expected_container_name=expected_container_name,
+                transient_status=transient_status,
+            )
+            raise
+
     def action_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         deployment_id = str(payload["deployment_id"])
         action = str(payload["action"])
@@ -1453,6 +1649,13 @@ class DeploymentService:
             endpoint_url = deployment.endpoint_url
             runtime = deployment.runtime
             original_status = deployment.status
+            launch_contract = None
+            if action in {"start", "restart"} and isinstance(deployment.config, Mapping):
+                raw_contract = deployment.config.get("launch_contract")
+                if raw_contract is not None:
+                    if not isinstance(raw_contract, Mapping):
+                        raise ValueError("launch_contract must be an object")
+                    launch_contract = self._launch_contract_snapshot(raw_contract)
             if action != "delete" and not container_id:
                 raise ValueError("Deployment or container was not found")
             transient_status = {
@@ -1494,14 +1697,33 @@ class DeploymentService:
             )
 
         container = None
+        adapter = None
         try:
+            if action in {"start", "restart"}:
+                adapter = self.adapter(runtime)
             container = self.docker_client().containers.get(container_id)
             self._validate_action_container(
                 container,
                 recorded_id=container_id,
                 recorded_name=container_name,
             )
-            adapter = self.adapter(runtime)
+            if launch_contract is not None and not self._container_matches_launch_contract(
+                container, launch_contract
+            ):
+                return self._rebuild_action_container_from_contract(
+                    context,
+                    deployment_id=deployment_id,
+                    action=action,
+                    adapter=adapter,
+                    contract=launch_contract,
+                    old_container=container,
+                    expected_container_id=expected_container_id,
+                    expected_container_name=expected_container_name,
+                    endpoint_url=endpoint_url,
+                    original_status=original_status,
+                    transient_status=transient_status,
+                )
+            adapter = adapter or self.adapter(runtime)
             context.update(progress=20, message=f"Executing {action} on {container.name}")
             if action == "start":
                 adapter.start(container)
@@ -1516,6 +1738,20 @@ class DeploymentService:
                 adapter.uninstall(container)
                 new_status = "deleted"
         except NotFound:
+            if launch_contract is not None and action in {"start", "restart"}:
+                return self._rebuild_action_container_from_contract(
+                    context,
+                    deployment_id=deployment_id,
+                    action=action,
+                    adapter=adapter,
+                    contract=launch_contract,
+                    old_container=None,
+                    expected_container_id=expected_container_id,
+                    expected_container_name=expected_container_name,
+                    endpoint_url=endpoint_url,
+                    original_status=original_status,
+                    transient_status=transient_status,
+                )
             if action == "delete":
                 self._delete_stale_deployment(
                     deployment_id,
