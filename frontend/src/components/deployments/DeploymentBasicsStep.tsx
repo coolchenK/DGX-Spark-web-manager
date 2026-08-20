@@ -15,7 +15,12 @@ interface DeploymentBasicsStepProps {
 
 const runtimeImages = {
   vllm: ['vllm/vllm-openai:v0.27.1'],
-  sglang: ['lmsysorg/sglang:qwen38-27b', 'sglang-inkling:specforge', 'lmsysorg/sglang:dev-cu13-inkling-dspark'],
+  sglang: [
+    'dgx-local/sglang-qwen38-dflash2:61fa64a',
+    'lmsysorg/sglang:qwen38-27b',
+    'sglang-inkling:specforge',
+    'lmsysorg/sglang:dev-cu13-inkling-dspark',
+  ],
   llama_cpp: ['nvidia/cuda:12.9.0-devel-ubuntu24.04'],
 } as const
 

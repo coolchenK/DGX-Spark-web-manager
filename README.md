@@ -120,10 +120,11 @@ On startup the manager scans Docker without restarting or recreating existing co
    and edit it as needed; AI output is never applied as an unreviewed deployment action.
 5. A compatible Draft Model is selected automatically for a new deployment when the model card
    recommends speculative decoding (DSpark/DFlash cards are recognized even when their metadata is
-   incomplete). `num_speculative_tokens` is taken from the selected hardware recipe. `review`
-   candidates require explicit acknowledgement; incompatible candidates are not deployable. Native
-   SGLang DSpark uses the `DSPARK` algorithm and resolves its repository from the mounted local Hugging
-   Face cache, including when the Draft Model comes from a different configured model root.
+   incomplete). DFlash uses the card's `num_draft_tokens`; other methods use their runtime-specific
+   tuning fields. `review` candidates require explicit acknowledgement; incompatible candidates are
+   not deployable. Native SGLang DFlash and DSpark use the `DFLASH` and `DSPARK` algorithms and resolve
+   repositories from the mounted local Hugging Face cache, including when the Draft Model comes from
+   a different configured model root.
 6. Review the normalized spec, generated runtime command, mounts, current capability snapshot,
    memory estimate, provenance, and warnings. Resource warnings and review candidates require
    explicit acknowledgement. Submit only from the current preview; any form change invalidates it.
