@@ -124,6 +124,40 @@ def test_explicit_eagle3_target_match_is_compatible_despite_tokenizer_difference
     assert result.method == "eagle3"
 
 
+def test_explicit_dspark_target_match_is_compatible() -> None:
+    target = asset("org/Target-NVFP4", model_id="target")
+    draft = asset("org/Target-NVFP4-DSpark", model_id="draft")
+
+    result = classify(
+        target,
+        draft,
+        draft_evidence=evidence(
+            draft,
+            targets=["org/Target-NVFP4"],
+            method="dspark",
+        ),
+        supported={"dspark"},
+    )
+
+    assert result.status == "compatible"
+    assert result.method == "dspark"
+
+
+def test_dspark_without_target_pairing_requires_review() -> None:
+    target = asset("org/Target-NVFP4", model_id="target")
+    draft = asset("org/Target-NVFP4-DSpark", model_id="draft")
+
+    result = classify(
+        target,
+        draft,
+        draft_evidence=evidence(draft, method="dspark"),
+        supported={"dspark"},
+    )
+
+    assert result.status == "review"
+    assert result.reasons == ["DSpark target pairing evidence is missing"]
+
+
 def test_explicit_target_mismatch_is_incompatible() -> None:
     target = asset("org/Target-8B", model_id="target")
     draft = asset("org/Other-EAGLE3", model_id="draft")

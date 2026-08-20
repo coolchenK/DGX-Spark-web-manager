@@ -987,12 +987,21 @@ describe('DeploymentsPage assisted deployment wizard', () => {
   it('automatically applies a compatible DSpark draft when the card omits speculative token guidance', async () => {
     const repository = 'nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4'
     const recommendation = recommendationFixture({
+      runtime: 'sglang',
+      runtime_capabilities: {
+        ...recommendationFixture().runtime_capabilities,
+        runtime: 'sglang',
+        image: 'lmsysorg/sglang:qwen38-27b',
+        speculative_methods: ['draft_model', 'dspark', 'eagle3'],
+        method_mapping: { draft_model: 'STANDALONE', dspark: 'DSPARK', eagle3: 'EAGLE3' },
+        speculative_transport: 'flags',
+      },
       speculative_defaults: {},
       draft_candidates: [{
         model_id: 'nemotron-dspark',
         name: `${repository}-DSpark`,
         repository_id: `${repository}-DSpark`,
-        method: 'draft_model',
+        method: 'dspark',
         status: 'compatible',
         reasons: ['External speculative checkpoint explicitly matches the target repository'],
         size_bytes: 1.3 * GiB,
@@ -1001,11 +1010,11 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     })
     const { user } = renderDeploymentsPage({ recommendations: async () => recommendation })
     await openCreateAndSelectModel(user)
+    await user.click(screen.getByText('SGLang'))
     await goToDraftStep(user)
 
     const draftRadio = screen.getByRole('radio', { name: new RegExp(`${repository}-DSpark`) })
     expect(draftRadio).toBeChecked()
-    expect(screen.getByLabelText('每轮推测 Token')).toHaveValue('5')
   })
 
   it('requires review acknowledgement before previewing a review draft', async () => {

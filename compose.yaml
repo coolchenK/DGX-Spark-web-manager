@@ -17,6 +17,8 @@ services:
       DGX_DATABASE_URL: sqlite:////app/data/manager.db
       DGX_DATA_DIR: /app/data
       DGX_STATIC_DIR: /app/frontend/dist
+      DGX_LISTEN_HOST: ${DGX_LISTEN_HOST:-0.0.0.0}
+      DGX_LISTEN_PORT: ${DGX_LISTEN_PORT:-3000}
       DGX_SECRET_KEY: ${DGX_SECRET_KEY:?Set DGX_SECRET_KEY in .env}
       DGX_ADMIN_USERNAME: ${DGX_ADMIN_USERNAME:-admin}
       DGX_ADMIN_PASSWORD: ${DGX_ADMIN_PASSWORD:?Set DGX_ADMIN_PASSWORD in .env}
@@ -43,6 +45,7 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - ./data:/app/data
+      - ./scripts/entrypoint.sh:/app/scripts/entrypoint.sh:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HF_HOME_HOST:?Set HF_HOME_HOST in .env}:/hf-cache
       - ${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env}:/models
@@ -57,3 +60,9 @@ services:
       options:
         max-size: 10m
         max-file: "5"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.getenv('DGX_LISTEN_PORT','3000')+'/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5

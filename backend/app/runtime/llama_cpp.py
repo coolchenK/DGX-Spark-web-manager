@@ -4,7 +4,12 @@ import os
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from app.runtime.base import DeploymentSpec, LlamaCppConfig, RuntimeAdapter
+from app.runtime.base import (
+    DeploymentSpec,
+    LlamaCppConfig,
+    RuntimeAdapter,
+    default_chat_template_kwargs_flags,
+)
 
 DEFAULT_CONTAINER_RUNTIME_DIR = PurePosixPath("/opt/llamacpp")
 
@@ -162,6 +167,13 @@ class LlamaCppAdapter(RuntimeAdapter):
                     str(config.mtp_tokens),
                 ]
             )
+
+        # llama-server takes the same JSON object but under a shorter flag
+        # name, and only when the jinja engine is on -- with --no-jinja there is
+        # no template to hand the kwargs to.
+        template_kwargs = default_chat_template_kwargs_flags(spec)
+        if template_kwargs and config.jinja:
+            command.extend(["--chat-template-kwargs", template_kwargs[1]])
 
         generation_flags = {
             "temperature": "--temp",

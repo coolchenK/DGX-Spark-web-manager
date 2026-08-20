@@ -12,7 +12,7 @@ interface ThemeState {
 
 export const useThemeStore = create<ThemeState>()(
   persist(
-    (set) => ({ mode: 'system', setMode: (mode) => set({ mode }) }),
+    (set) => ({ mode: 'dark', setMode: (mode) => set({ mode }) }),
     { name: 'dgx-theme' },
   ),
 )

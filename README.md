@@ -21,7 +21,10 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Model-card and device-aware deployment recommendations with per-field source, confidence, and
   warnings; optional bounded AI fallback for unresolved fields.
 - Optional compatible/reviewed Draft Model selection with runtime-specific speculative settings and
-  combined base-plus-Draft resource checks.
+  combined base-plus-Draft resource checks. SGLang DSpark checkpoints are detected, paired with the
+  base model, and launched with the DGX Spark cache, attention, and Mamba settings.
+- Model-aware SGLang/vLLM launch flags detect tool-call and reasoning parsers from the chat template;
+  optional deployment defaults control template thinking behavior without overriding each request.
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
   Model discovery exposes runtime, endpoint, context length, maximum output tokens, and saved
   generation defaults for each healthy running route; stopped deployments are hidden.
@@ -88,7 +91,10 @@ are required. The first command only prints the changes, disk estimate, commands
 Native logs are managed by journald and can be read with
 `journalctl --user -u dgx-spark-web-manager.service`.
 
-Do not expose port 3000 to the public internet without TLS and an authenticated reverse proxy. Set `DGX_COOKIE_SECURE=true` when the panel is served over HTTPS.
+Do not expose port 3000 to the public internet without TLS and an authenticated reverse proxy. Set
+`DGX_COOKIE_SECURE=true` when the panel is served over HTTPS. A host reverse proxy can keep Uvicorn
+private by setting `DGX_LISTEN_HOST=127.0.0.1` and moving it to another port with
+`DGX_LISTEN_PORT`; the defaults remain `0.0.0.0:3000`.
 
 ## Existing Services
 
@@ -115,7 +121,9 @@ On startup the manager scans Docker without restarting or recreating existing co
 5. A compatible Draft Model is selected automatically for a new deployment when the model card
    recommends speculative decoding (DSpark/DFlash cards are recognized even when their metadata is
    incomplete). `num_speculative_tokens` is taken from the selected hardware recipe. `review`
-   candidates require explicit acknowledgement; incompatible candidates are not deployable.
+   candidates require explicit acknowledgement; incompatible candidates are not deployable. Native
+   SGLang DSpark uses the `DSPARK` algorithm and resolves its repository from the mounted local Hugging
+   Face cache, including when the Draft Model comes from a different configured model root.
 6. Review the normalized spec, generated runtime command, mounts, current capability snapshot,
    memory estimate, provenance, and warnings. Resource warnings and review candidates require
    explicit acknowledgement. Submit only from the current preview; any form change invalidates it.

@@ -41,7 +41,8 @@ class Settings(BaseSettings):
     memory_reserve_min_bytes: int = Field(default=8 * 1024**3, ge=1024**3)
     allowed_vllm_images: str = "vllm/vllm-openai:v0.27.1"
     allowed_sglang_images: str = (
-        "sglang-inkling:specforge,lmsysorg/sglang:dev-cu13-inkling-dspark"
+        "lmsysorg/sglang:qwen38-27b,sglang-inkling:specforge,"
+        "lmsysorg/sglang:dev-cu13-inkling-dspark"
     )
     allowed_llama_cpp_images: str = "nvidia/cuda:12.9.0-devel-ubuntu24.04"
     llama_cpp_host_dir: Path = Path("/opt/llamacpp")

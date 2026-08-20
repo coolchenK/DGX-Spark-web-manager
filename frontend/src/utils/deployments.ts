@@ -28,7 +28,7 @@ export type QuantizationMethod =
 
 export interface SpeculativeSettings {
   draft_model_id: string
-  method: 'draft_model' | 'eagle' | 'eagle3' | 'mtp'
+  method: 'draft_model' | 'dspark' | 'eagle' | 'eagle3' | 'mtp'
   num_speculative_tokens?: number
   num_steps?: number
   eagle_top_k?: number
@@ -63,6 +63,7 @@ export interface DeploymentFormValues {
   quantization?: QuantizationMethod
   trust_remote_code: boolean
   generation_defaults: GenerationDefaults
+  chat_template_kwargs?: Record<string, string | number | boolean>
   speculative?: SpeculativeSettings | null
   llama_cpp?: LlamaCppSettings | null
   recommendation?: RecommendationProvenance | null
@@ -116,10 +117,26 @@ function normalizeGenerationDefaults(value: unknown): GenerationDefaults {
 }
 
 
+function normalizeChatTemplateKwargs(
+  value: unknown,
+): Record<string, string | number | boolean> | undefined {
+  const saved = objectValue(value)
+  if (!saved) return undefined
+  const normalized = Object.fromEntries(
+    Object.entries(saved).filter(([, item]) => (
+      typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean'
+    )),
+  ) as Record<string, string | number | boolean>
+  return Object.keys(normalized).length ? normalized : undefined
+}
+
+
 function normalizeSpeculativeSettings(value: unknown): SpeculativeSettings | null {
   const saved = objectValue(value)
   if (!saved || typeof saved.draft_model_id !== 'string') return null
-  if (!['draft_model', 'eagle', 'eagle3', 'mtp'].includes(String(saved.method))) return null
+  if (!['draft_model', 'dspark', 'eagle', 'eagle3', 'mtp'].includes(String(saved.method))) {
+    return null
+  }
   const normalized: SpeculativeSettings = {
     draft_model_id: saved.draft_model_id,
     method: saved.method as SpeculativeSettings['method'],
@@ -220,6 +237,7 @@ export function deploymentToFormValues(
       ?? commandValue(command, '--quantization') as DeploymentFormValues['quantization'],
     trust_remote_code: saved.trust_remote_code ?? command.includes('--trust-remote-code'),
     generation_defaults: normalizeGenerationDefaults(saved.generation_defaults),
+    chat_template_kwargs: normalizeChatTemplateKwargs(saved.chat_template_kwargs),
     speculative: normalizeSpeculativeSettings(saved.speculative),
     llama_cpp: normalizeLlamaCppSettings(saved.llama_cpp),
     recommendation: normalizeRecommendationProvenance(saved.recommendation),

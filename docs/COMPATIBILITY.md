@@ -39,9 +39,10 @@ Only verified adapters are offered in the deployment wizard. Upstream availabili
 is not treated as DGX Spark compatibility evidence.
 
 The current allowlist defaults include `vllm/vllm-openai:v0.27.1`,
-`sglang-inkling:specforge` (plus `lmsysorg/sglang:dev-cu13-inkling-dspark`), and the CUDA 12.9
-development image used with the server-managed llama.cpp runtime mount. An image must be locally
-available, ARM64/CUDA compatible, and present in the relevant configured allowlist before preview.
+`lmsysorg/sglang:qwen38-27b`, `sglang-inkling:specforge`,
+`lmsysorg/sglang:dev-cu13-inkling-dspark`, and the CUDA 12.9 development image used with the
+server-managed llama.cpp runtime mount. An image must be locally available, ARM64/CUDA compatible,
+and present in the relevant configured allowlist before preview.
 
 ## Runtime Policy
 
@@ -79,18 +80,25 @@ repository/image combination will pass capability and resource preflight.
 
 ## Speculative and Draft Model Support
 
-Both runtimes accept the public methods `draft_model`, `eagle`, `eagle3`, and `mtp` only when the
-selected image capability snapshot includes the method. Transport and tuning differ:
+Both runtimes accept only methods present in the selected image capability snapshot. The common
+methods are `draft_model`, `eagle`, `eagle3`, and `mtp`; SGLang additionally supports `dspark` when
+its help output or bounded manifest exposes `DSPARK`. Transport and tuning differ:
 
 | Runtime | Transport | Tuning accepted by the adapter |
 | --- | --- | --- |
 | vLLM | One JSON value passed to `--speculative-config` | Optional `num_speculative_tokens` (1-64); SGLang grouped fields are rejected |
-| SGLang | `--speculative-algorithm` and `--speculative-draft-model-path` flags | `num_steps` (1-32), `eagle_top_k` (1-32), and `num_draft_tokens` (1-256), set together or all omitted; `num_speculative_tokens` is rejected |
+| SGLang | `--speculative-algorithm` and `--speculative-draft-model-path` flags | `num_steps` (1-32), `eagle_top_k` (1-32), and `num_draft_tokens` (1-256), set together or all omitted; `num_speculative_tokens` is rejected; DSpark adds its validated DGX Spark flags |
 | llama.cpp | Dedicated GGUF settings | Optional same-model `draft-mtp` with `mtp_tokens` (1-64); external Draft Model settings are rejected |
 
 Method mappings are resolved from the capability snapshot. The SGLang adapter maps `draft_model` to
-`STANDALONE`, `eagle` to `EAGLE`, `eagle3` to `EAGLE3`, and `mtp` to `NEXTN`; a missing or mismatched
-mapping fails preview.
+`STANDALONE`, `dspark` to `DSPARK`, `eagle` to `EAGLE`, `eagle3` to `EAGLE3`, and `mtp` to `NEXTN`;
+a missing or mismatched mapping fails preview. DSpark repository IDs are resolved against the
+mounted local Hugging Face cache, so offline runtime containers do not redownload the Draft Model.
+
+SGLang also sizes hybrid GDN/Mamba state slots from deployment concurrency, selects
+`flashinfer_cutlass` for NVFP4 MoE checkpoints, and detects tool-call/reasoning parsers from local chat
+templates. vLLM performs the corresponding parser detection. Deployment-level
+`chat_template_kwargs` can set template defaults such as thinking mode and reasoning effort.
 
 Draft candidates must be separate available local assets with readable evidence and paths. Explicit
 target pairing, supported method, tokenizer fingerprints for ordinary draft models, and combined

@@ -69,7 +69,7 @@ SPECULATIVE_METHOD_KEYS = (
     "speculative_method",
     "speculative_decoding_method",
 )
-SPECULATIVE_METHODS = {"draft_model", "eagle", "eagle3", "mtp"}
+SPECULATIVE_METHODS = {"draft_model", "dspark", "eagle", "eagle3", "mtp"}
 SAFE_CARD_DATA_KEYS = (
     *TARGET_MODEL_KEYS,
     *SPECULATIVE_METHOD_KEYS,
@@ -792,7 +792,9 @@ def _speculative_method(card_data: dict[str, Any]) -> str | None:
     if isinstance(tags, list):
         hints.extend(item for item in tags if isinstance(item, str))
     hint_text = " ".join(hints).casefold().replace("-", "_")
-    if "dspark" in hint_text or "dflash" in hint_text:
+    if "dspark" in hint_text:
+        return "dspark"
+    if "dflash" in hint_text:
         return "draft_model"
     return None
 

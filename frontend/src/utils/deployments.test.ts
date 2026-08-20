@@ -32,6 +32,10 @@ const deployment: Deployment = {
         top_p: 0.95,
         stop: ['END'],
       },
+      chat_template_kwargs: {
+        enable_thinking: false,
+        reasoning_effort: 'high',
+      },
       speculative: {
         draft_model_id: 'draft-1',
         method: 'eagle3',
@@ -84,6 +88,10 @@ describe('deploymentToFormValues', () => {
         top_p: 0.95,
         stop: ['END'],
       },
+      chat_template_kwargs: {
+        enable_thinking: false,
+        reasoning_effort: 'high',
+      },
       speculative: {
         draft_model_id: 'draft-1',
         method: 'eagle3',
@@ -119,6 +127,29 @@ describe('deploymentToFormValues', () => {
       provider_id: 'provider-1',
       modified_fields: ['generation_defaults.temperature'],
       sources: { 'generation_defaults.temperature': 'model_card' },
+    })
+  })
+
+  it('restores DSpark speculative settings', () => {
+    const dsparkDeployment: Deployment = {
+      ...deployment,
+      runtime: 'sglang',
+      config: {
+        spec: {
+          ...(deployment.config.spec as Record<string, unknown>),
+          speculative: {
+            draft_model_id: 'draft-dspark',
+            method: 'dspark',
+            manual_review_acknowledged: false,
+          },
+        },
+      },
+    }
+
+    expect(deploymentToFormValues(dsparkDeployment, model, 'edit').speculative).toEqual({
+      draft_model_id: 'draft-dspark',
+      method: 'dspark',
+      manual_review_acknowledged: false,
     })
   })
 

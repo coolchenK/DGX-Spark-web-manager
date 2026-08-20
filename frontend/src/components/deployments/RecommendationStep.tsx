@@ -1,6 +1,7 @@
 import { ReloadOutlined, UndoOutlined } from '@ant-design/icons'
 import {
   Alert,
+  AutoComplete,
   Button,
   Collapse,
   Form,
@@ -142,6 +143,38 @@ export function RecommendationStep({
           <RecommendedField name={['generation_defaults', 'stop']} path="generation_defaults.stop" label="停止序列" recommended={generation('stop')} editedFields={editedFields}>
             <Select mode="tags" tokenSeparators={[',']} maxCount={16} placeholder="输入后回车，可设置多个" />
           </RecommendedField>
+          <div className="field-grid">
+            <Form.Item
+              name={['chat_template_kwargs', 'enable_thinking']}
+              label="默认思考模式"
+              tooltip="随启动参数下发，单次请求的 chat_template_kwargs 仍可覆盖。留空则跟随模型模板自身的默认值。"
+            >
+              <Select
+                allowClear
+                placeholder="跟随模型默认"
+                options={[
+                  { value: true, label: '开启' },
+                  { value: false, label: '关闭' },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item
+              name={['chat_template_kwargs', 'reasoning_effort']}
+              label="默认思考强度"
+              tooltip="仅对模板实现了 reasoning_effort 的模型有效（如 Qwen3.8 支持 low/medium/xhigh）。可直接输入模型自定义的取值。"
+            >
+              <AutoComplete
+                allowClear
+                placeholder="跟随模型默认"
+                options={[
+                  { value: 'low' },
+                  { value: 'medium' },
+                  { value: 'high' },
+                  { value: 'xhigh' },
+                ]}
+              />
+            </Form.Item>
+          </div>
         </div>
       ),
     },

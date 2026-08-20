@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -115,7 +116,26 @@ class ModelLifecycleService:
                 opened.append(os.open(component, flags, dir_fd=opened[-1]))
             shutil.rmtree(relative.parts[-1], dir_fd=opened[-1])
         except OSError as exc:
-            raise RuntimeError("Secure local model deletion failed") from exc
+            # The bare message here used to swallow the cause, which made an
+            # unwritable model root look like a bug in the delete itself. The
+            # two that actually happen are a read-only bind mount and a root
+            # owned directory the manager user cannot write, so name them.
+            if exc.errno == errno.EROFS:
+                hint = (
+                    f"{root_lexical} is mounted read-only; remount it writable "
+                    "or remove the files on the host"
+                )
+            elif exc.errno in (errno.EACCES, errno.EPERM):
+                hint = (
+                    f"the manager has no write permission under {root_lexical} "
+                    f"(running as uid {os.geteuid()}); fix the ownership of the "
+                    "model root on the host"
+                )
+            else:
+                hint = exc.strerror or str(exc)
+            raise RuntimeError(
+                f"Secure local model deletion failed: {hint}"
+            ) from exc
         finally:
             for descriptor in reversed(opened):
                 os.close(descriptor)

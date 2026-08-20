@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -691,6 +692,21 @@ def test_secure_rmtree_does_not_follow_replaced_intermediate_component(
 
     assert not (moved_parent / "target").exists()
     assert (outside_target / "keep").read_bytes() == b"outside"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fd-safe deletion is POSIX-specific")
+def test_secure_rmtree_reports_model_root_permission_failures(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    target = root / "target"
+    target.mkdir(parents=True)
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(shutil, "rmtree", denied)
+
+    with pytest.raises(RuntimeError, match="no write permission.*running as uid"):
+        ModelLifecycleService._secure_rmtree(root, target)
 
 
 def test_delete_local_directory_and_database_record(database, tmp_path):

@@ -102,6 +102,25 @@ def test_sglang_parser_maps_exact_algorithm_choices():
     assert capabilities.speculative_methods == ["draft_model", "eagle", "eagle3", "mtp"]
 
 
+def test_sglang_parser_reads_dspark_from_builtins_description():
+    capabilities = parse_runtime_help(
+        "sglang",
+        "--speculative-algorithm ALGORITHM\n"
+        "Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK.",
+        image="sglang:test",
+        image_digest="sha256:sglang",
+    )
+
+    assert capabilities.speculative_transport == "flags"
+    assert capabilities.speculative_methods == [
+        "draft_model",
+        "dspark",
+        "eagle",
+        "eagle3",
+        "mtp",
+    ]
+
+
 def test_sglang_parser_keeps_transport_without_inventing_methods():
     capabilities = parse_runtime_help(
         "sglang",

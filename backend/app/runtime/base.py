@@ -101,7 +101,7 @@ class SpeculativeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     draft_model_id: str = Field(min_length=1, max_length=64)
-    method: Literal["draft_model", "eagle", "eagle3", "mtp"]
+    method: Literal["draft_model", "dspark", "eagle", "eagle3", "mtp"]
     num_speculative_tokens: int | None = Field(default=None, ge=1, le=64)
     num_steps: int | None = Field(default=None, ge=1, le=32)
     eagle_top_k: int | None = Field(default=None, ge=1, le=32)
@@ -155,10 +155,37 @@ class DeploymentSpec(BaseModel):
     quantization: QuantizationMethod | None = None
     trust_remote_code: bool = False
     generation_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
+    chat_template_kwargs: dict[str, str | bool | int | float] | None = None
     speculative: SpeculativeConfig | None = None
     llama_cpp: LlamaCppConfig | None = None
     recommendation: RecommendationProvenance | None = None
     resource_warning_acknowledged: bool = False
+
+    @field_validator("chat_template_kwargs")
+    @classmethod
+    def validate_chat_template_kwargs(
+        cls, value: dict[str, str | bool | int | float] | None
+    ) -> dict[str, str | bool | int | float] | None:
+        """Defaults handed to the model's chat template at launch.
+
+        Keys are whatever that template reads -- enable_thinking,
+        reasoning_effort, preserve_thinking -- so they cannot be validated
+        against a fixed list here; a wrong key is simply ignored by the
+        template. The shape is constrained instead, since the value is
+        serialised into a single argv element.
+        """
+        if not value:
+            return None
+        if len(value) > 16:
+            raise ValueError("chat_template_kwargs accepts at most 16 entries")
+        for key, item in value.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key):
+                raise ValueError(f"Unsupported chat template kwarg name: {key!r}")
+            if isinstance(item, str) and (not item or len(item) > 200):
+                raise ValueError(
+                    f"chat template kwarg {key!r} must be 1-200 characters"
+                )
+        return value
 
     @field_validator("api_model_name", "route_alias")
     @classmethod
@@ -220,6 +247,70 @@ def require_speculative_runtime_method(spec: DeploymentSpec) -> str:
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", method):
         raise ValueError("resolved speculative runtime method is invalid")
     return method
+
+
+CHAT_TEMPLATE_FILES = ("chat_template.jinja", "chat_template.json")
+
+
+def chat_template_text(model_path: Path) -> str:
+    """Return the model's chat template, or "" when it ships without one.
+
+    Both runtimes need the tool-call and reasoning parsers named at launch, and
+    the right parser follows from the payload the template asks the model to
+    emit, so the template is the one place worth reading for it.
+    """
+    for filename in CHAT_TEMPLATE_FILES:
+        candidate = model_path / filename
+        if candidate.is_file():
+            try:
+                return candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return ""
+    # Older checkpoints keep the template inside tokenizer_config.json.
+    tokenizer_config = model_path / "tokenizer_config.json"
+    if tokenizer_config.is_file():
+        try:
+            payload = json.loads(tokenizer_config.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        template = payload.get("chat_template") if isinstance(payload, dict) else None
+        if isinstance(template, str):
+            return template
+        # Some checkpoints ship a list of named templates.
+        if isinstance(template, list):
+            return "".join(
+                item.get("template", "")
+                for item in template
+                if isinstance(item, dict)
+            )
+    return ""
+
+
+def match_parser(template: str, markers: tuple) -> str | None:
+    """First parser whose marker set is fully present in the template.
+
+    Marker tables are ordered most-specific first, since the XML formats are
+    supersets of the bare-JSON one.
+    """
+    for name, required in markers:
+        if all(marker in template for marker in required):
+            return name
+    return None
+
+
+def default_chat_template_kwargs_flags(spec: DeploymentSpec) -> list[str]:
+    """Launch flags carrying the deployment's chat-template defaults.
+
+    Both runtimes spell this the same way and give per-request
+    chat_template_kwargs precedence over it, so a caller can still override
+    thinking behaviour on a single request.
+    """
+    if not spec.chat_template_kwargs:
+        return []
+    return [
+        "--default-chat-template-kwargs",
+        json.dumps(spec.chat_template_kwargs, sort_keys=True, separators=(",", ":")),
+    ]
 
 
 def deterministic_container_name(name: str) -> str:

@@ -84,6 +84,7 @@ const defaultValues: Partial<DeploymentWizardValues> = {
   max_concurrency: 8,
   trust_remote_code: false,
   generation_defaults: {},
+  chat_template_kwargs: {},
   speculative: null,
   llama_cpp: null,
   recommendation: null,
@@ -118,8 +119,9 @@ const basicFields: Array<keyof DeploymentWizardValues> = [
 ]
 
 function isExternalDraftCandidate(candidate: DraftCandidate): boolean {
-  return candidate.method === 'draft_model'
-    && /[-_](?:dspark|dflash)$/i.test(candidate.repository_id ?? candidate.name)
+  const identifier = candidate.repository_id ?? candidate.name
+  return candidate.method === 'dspark'
+    || (candidate.method === 'draft_model' && /[-_]dflash$/i.test(identifier))
 }
 
 const recommendationValidationFields: Array<string | string[]> = [
@@ -648,6 +650,10 @@ export function DeploymentsPage() {
         Object.entries(deploymentValues.generation_defaults ?? {})
           .filter(([, value]) => value !== undefined && value !== null),
       ),
+      chat_template_kwargs: Object.fromEntries(
+        Object.entries(deploymentValues.chat_template_kwargs ?? {})
+          .filter(([, value]) => value !== undefined && value !== null && value !== ''),
+      ),
       speculative: runtime === 'llama_cpp' ? null : speculative,
       llama_cpp: runtime === 'llama_cpp' ? {
         model_file: deploymentValues.llama_cpp?.model_file || undefined,
@@ -663,6 +669,11 @@ export function DeploymentsPage() {
     }
     if (runtime !== 'vllm' || result.max_batched_tokens === undefined) {
       delete result.max_batched_tokens
+    }
+    // The backend rejects an empty object here, and "no defaults" is the
+    // common case, so send the key only when something is actually set.
+    if (!Object.keys(result.chat_template_kwargs ?? {}).length) {
+      delete result.chat_template_kwargs
     }
     return cloneJson(result)
   }, [activeRecommendation, currentTupleKey, form, providerId, runtime])
@@ -1231,7 +1242,7 @@ export function DeploymentsPage() {
           { title: '端点', dataIndex: 'endpoint_url' },
           { title: '所有权', dataIndex: 'managed', width: 90, render: (value) => value ? '管理器' : '已发现' },
           { title: '状态', dataIndex: 'health', width: 100, render: (value) => <StatusBadge status={value} /> },
-          { title: '操作', width: 330, render: (_, item) => operationButtons(item) },
+          { title: '操作', width: 400, render: (_, item) => operationButtons(item) },
         ]} renderMobile={(item) => (
           <div className="mobile-record">
             <Flex justify="space-between"><strong>{item.name}</strong><StatusBadge status={item.health} /></Flex>

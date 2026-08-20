@@ -379,6 +379,10 @@ Preview, create, and edit accept the same strict `DeploymentSpec` JSON body:
     "max_tokens": 2048,
     "stop": ["<|end|>"]
   },
+  "chat_template_kwargs": {
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+  },
   "speculative": {
     "draft_model_id": "draft-model-asset-id",
     "method": "eagle3",
@@ -412,7 +416,14 @@ the administrator changed after application; both use dotted generation paths su
 
 For SGLang, replace `num_speculative_tokens` with all three grouped values `num_steps`,
 `eagle_top_k`, and `num_draft_tokens`, or omit all three. These tuning groups are mutually exclusive
-by runtime.
+by runtime. A SGLang DSpark candidate uses `method: "dspark"`; the adapter maps it to `DSPARK`,
+resolves a Hugging Face cache path back to its repository ID, and applies the DGX Spark-specific
+draft attention, cache, and Mamba flags.
+
+`chat_template_kwargs` is optional and accepts at most 16 identifier keys with scalar string,
+number, or boolean values. vLLM and SGLang receive it as `--default-chat-template-kwargs`;
+llama.cpp receives `--chat-template-kwargs` when Jinja templates are enabled. Per-request template
+kwargs continue to take precedence.
 
 After login, these commands exercise recommendation, preview, and create using JSON files containing
 the request bodies shown in this reference:

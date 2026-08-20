@@ -505,7 +505,7 @@ def test_speculative_config_rejects_invalid_draft_model_id_lengths(draft_model_i
         SpeculativeConfig(draft_model_id=draft_model_id, method="draft_model")
 
 
-@pytest.mark.parametrize("method", ["draft_model", "eagle", "eagle3", "mtp"])
+@pytest.mark.parametrize("method", ["draft_model", "dspark", "eagle", "eagle3", "mtp"])
 def test_speculative_config_accepts_supported_methods(method):
     assert SpeculativeConfig(draft_model_id="draft-id", method=method).method == method
 
@@ -597,6 +597,48 @@ def test_deployment_spec_fingerprint_ignores_browser_model_path(tmp_path):
     assert deployment_service.deployment_spec_fingerprint(
         first
     ) == deployment_service.deployment_spec_fingerprint(second)
+
+
+def test_stored_container_fingerprints_accept_specs_created_before_optional_fields(
+    tmp_path,
+):
+    spec = DeploymentSpec(
+        name="Qwen",
+        model_id="model-1",
+        model_path=str(tmp_path / "models" / "qwen"),
+        api_model_name="qwen",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+    deployment = Deployment(
+        name=spec.name,
+        model_id=spec.model_id,
+        runtime=spec.runtime,
+        api_model_name=spec.api_model_name,
+        image=spec.image,
+        port=spec.port,
+        status="stopped",
+        health="unknown",
+        managed=True,
+        config={"spec": spec.model_dump(mode="json")},
+    )
+    legacy = spec.model_dump(mode="json")
+    legacy.pop("chat_template_kwargs")
+    legacy_without_path = {key: value for key, value in legacy.items() if key != "model_path"}
+
+    def fingerprint(payload):
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    accepted = deployment_service.DeploymentService._stored_container_fingerprints(
+        deployment
+    )
+
+    assert fingerprint(legacy) in accepted
+    assert fingerprint(legacy_without_path) in accepted
 
 
 def test_resolve_spec_uses_available_database_asset_instead_of_browser_path(tmp_path):
@@ -1438,6 +1480,29 @@ def test_vllm_command_includes_batch_and_quantization_settings(tmp_path):
     assert command[command.index("--quantization") + 1] == "fp8"
 
 
+def test_chat_template_kwargs_are_bounded_and_serialized_canonically(tmp_path):
+    model_path = tmp_path / "models" / "qwen"
+    model_path.mkdir(parents=True)
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
+    spec = DeploymentSpec(
+        name="Qwen",
+        model_path=str(model_path),
+        api_model_name="qwen",
+        runtime="vllm",
+        image="vllm:test",
+        chat_template_kwargs={"reasoning_effort": "high", "enable_thinking": True},
+    )
+
+    command = adapter.command(spec)
+
+    index = command.index("--default-chat-template-kwargs")
+    assert command[index + 1] == '{"enable_thinking":true,"reasoning_effort":"high"}'
+    with pytest.raises(ValueError, match="Unsupported chat template kwarg name"):
+        DeploymentSpec.model_validate(
+            {**spec.model_dump(mode="json"), "chat_template_kwargs": {"bad-key": True}}
+        )
+
+
 def resolved_speculative_spec(
     tmp_path,
     *,
@@ -1563,6 +1628,7 @@ def test_sglang_command_adds_complete_grouped_speculative_tuning(tmp_path):
     ("method", "runtime_method"),
     [
         ("draft_model", "STANDALONE"),
+        ("dspark", "DSPARK"),
         ("eagle", "EAGLE"),
         ("eagle3", "EAGLE3"),
         ("mtp", "NEXTN"),
@@ -1668,6 +1734,74 @@ def test_sglang_command_rejects_unmapped_num_speculative_tokens(tmp_path):
         adapter.command(spec)
 
 
+def test_sglang_dspark_uses_repo_id_cache_root_and_dgx_spark_flags(tmp_path):
+    adapter = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
+    spec = resolved_speculative_spec(
+        tmp_path,
+        runtime="sglang",
+        method="dspark",
+        runtime_method="DSPARK",
+        draft_container_path=(
+            "/draft-models/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/abc123"
+        ),
+    )
+
+    command = adapter.command(spec)
+
+    assert command[command.index("--speculative-algorithm") + 1] == "DSPARK"
+    assert command[command.index("--speculative-draft-model-path") + 1] == (
+        "RadixArk/Qwen3.8-27B-DSpark"
+    )
+    assert command[command.index("--speculative-draft-model-quantization") + 1] == "unquant"
+    assert command[command.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
+    assert command[command.index("--mamba-ssm-dtype") + 1] == "float32"
+    assert adapter.environment(spec)["HF_HUB_CACHE"] == "/draft-models"
+
+
+def test_runtime_commands_detect_model_specific_parsers_and_memory_flags(tmp_path):
+    model_path = tmp_path / "models" / "qwen"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["QwenMoeForCausalLM"],
+                "layer_types": ["linear_attention", "full_attention"],
+                "num_experts": 128,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_path / "hf_quant_config.json").write_text(
+        '{"quantization":{"format":"NVFP4"}}', encoding="utf-8"
+    )
+    (model_path / "chat_template.jinja").write_text(
+        "<think><tool_call><function=name><parameter=key>", encoding="utf-8"
+    )
+    common = {
+        "name": "Qwen",
+        "model_path": str(model_path),
+        "api_model_name": "qwen",
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+
+    sglang = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
+    sglang_command = sglang.command(
+        DeploymentSpec(runtime="sglang", image="sglang:test", **common)
+    )
+    assert sglang_command[sglang_command.index("--max-mamba-cache-size") + 1] == "40"
+    assert sglang_command[sglang_command.index("--moe-runner-backend") + 1] == (
+        "flashinfer_cutlass"
+    )
+    assert sglang_command[sglang_command.index("--tool-call-parser") + 1] == "qwen3_coder"
+    assert sglang_command[sglang_command.index("--reasoning-parser") + 1] == "qwen3"
+
+    vllm = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
+    vllm_command = vllm.command(DeploymentSpec(runtime="vllm", image="vllm:test", **common))
+    assert "--enable-auto-tool-choice" in vllm_command
+    assert vllm_command[vllm_command.index("--tool-call-parser") + 1] == "qwen3_xml"
+    assert vllm_command[vllm_command.index("--reasoning-parser") + 1] == "qwen3"
+
+
 def test_runtime_commands_without_speculative_config_remain_unchanged(tmp_path):
     model_path = tmp_path / "models" / "qwen"
     model_path.mkdir(parents=True)
@@ -1721,6 +1855,8 @@ def test_runtime_commands_without_speculative_config_remain_unchanged(tmp_path):
         "0.8",
         "--max-running-requests",
         "8",
+        "--weight-loader-prefetch-num-threads",
+        "20",
     ]
 
 

@@ -147,6 +147,11 @@ backend performs these stages in order:
    `review`, or `incompatible` using method, target pairing, tokenizer evidence, and combined model
    memory.
 
+Runtime command generation then reads only local bounded model files. Chat-template markers select
+known tool-call and reasoning parsers. SGLang hybrid GDN/NVFP4 models receive bounded Mamba-state and
+MoE backend flags, while DSpark Draft Models are translated from mounted Hub cache paths to repository
+IDs and resolved offline inside the runtime container.
+
 The AI cache defaults to 900 seconds and is keyed by model revision, evidence hash, runtime, image
 digest, provider ID, and recommendation schema version. `refresh_ai=true` bypasses a cache hit. A
 fresh system/deployment snapshot and resource estimate are still collected on every recommendation

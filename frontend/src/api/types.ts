@@ -339,7 +339,7 @@ export interface DraftCandidate {
   model_id: string
   name: string
   repository_id: string | null
-  method: 'draft_model' | 'eagle' | 'eagle3' | 'mtp' | null
+  method: 'draft_model' | 'dspark' | 'eagle' | 'eagle3' | 'mtp' | null
   status: 'compatible' | 'review' | 'incompatible'
   reasons: string[]
   size_bytes: number

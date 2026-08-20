@@ -85,6 +85,24 @@ def test_llama_cpp_command_preserves_gguf_mmproj_and_mtp_settings(tmp_path):
     assert "--cont-batching" in command
 
 
+def test_llama_cpp_passes_chat_template_kwargs_only_with_jinja(tmp_path):
+    adapter, model_path, _ = _adapter(tmp_path)
+    (model_path / "model-Q8_0.gguf").write_bytes(b"model")
+    (model_path / "mmproj-F16.gguf").write_bytes(b"projector")
+    kwargs = {"enable_thinking": False, "reasoning_effort": "low"}
+
+    command = adapter.command(_spec(model_path, chat_template_kwargs=kwargs))
+    index = command.index("--chat-template-kwargs")
+    assert command[index + 1] == '{"enable_thinking":false,"reasoning_effort":"low"}'
+
+    no_jinja = _spec(
+        model_path,
+        chat_template_kwargs=kwargs,
+        llama_cpp={"model_file": "model-Q8_0.gguf", "jinja": False},
+    )
+    assert "--chat-template-kwargs" not in adapter.command(no_jinja)
+
+
 def test_llama_cpp_auto_selects_single_model_and_f16_projector(tmp_path):
     adapter, model_path, _ = _adapter(tmp_path)
     (model_path / "model.gguf").write_bytes(b"model")

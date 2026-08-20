@@ -78,9 +78,10 @@ CONSERVATIVE_MANIFESTS: dict[RuntimeName, dict[str, Any]] = {
         "generation_defaults": list(GENERATION_DEFAULTS),
         "quantization_methods": list(QUANTIZATION_METHODS),
         "quantization_mapping": {"nvfp4": "modelopt_fp4"},
-        "speculative_methods": ["draft_model", "eagle", "eagle3", "mtp"],
+        "speculative_methods": ["draft_model", "dspark", "eagle", "eagle3", "mtp"],
         "method_mapping": {
             "draft_model": "STANDALONE",
+            "dspark": "DSPARK",
             "eagle": "EAGLE",
             "eagle3": "EAGLE3",
             "mtp": "NEXTN",
@@ -162,6 +163,21 @@ def parse_runtime_help(
             if has_speculative_flags
             else []
         )
+        if has_speculative_flags and not choices:
+            # Newer SGLang builds describe the algorithm registry in prose
+            # ("Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH,
+            # DSPARK.") instead of argparse {choice} syntax. Parse the
+            # Builtins line so DSPARK/DFLASH draft checkpoints stay selectable.
+            builtins_match = re.search(
+                r"Builtins:\s*([A-Za-z0-9_,\s]+?)(?:\.|$)",
+                help_text,
+            )
+            if builtins_match:
+                choices = [
+                    item.strip()
+                    for item in builtins_match.group(1).split(",")
+                    if item.strip()
+                ]
         normalized_choices = {choice.upper() for choice in choices}
         speculative_methods = [
             method

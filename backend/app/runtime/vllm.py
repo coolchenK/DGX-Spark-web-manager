@@ -3,9 +3,32 @@ import json
 from app.runtime.base import (
     DeploymentSpec,
     RuntimeAdapter,
+    chat_template_text,
+    default_chat_template_kwargs_flags,
+    match_parser,
     require_draft_container_path,
     require_speculative_runtime_method,
 )
+
+# vLLM rejects tool_choice="auto" outright unless both --enable-auto-tool-choice
+# and --tool-call-parser are set, so a model whose chat template emits tool
+# calls has to declare its parser at launch. Names are vLLM's own: it calls the
+# <function=>/<parameter=> XML dialect qwen3_xml (qwen3_coder is an alias for
+# the same parser), against SGLang's qwen3_coder. Ordering matters, since the
+# XML markers are a superset of the bare-JSON ones.
+TOOL_CALL_PARSER_MARKERS = (
+    # <tool_call><function=name><parameter=key>value</parameter></function>
+    ("qwen3_xml", ("<tool_call>", "<function=", "<parameter=")),
+    # <function name="fn"><param name="k">v</param></function> -- MiniCPM5's
+    # own XML dialect. It shares no marker with the Qwen one, and its template
+    # never emits <tool_call>, so ordering against hermes does not matter; it
+    # sits above anyway to keep the table most-specific first.
+    ("minicpm5", ("<function name=", "<param name=")),
+    # bare JSON inside <tool_call> ... </tool_call>
+    ("hermes", ("<tool_call>",)),
+)
+
+REASONING_PARSER_MARKERS = (("qwen3", ("<think>",)),)
 
 
 class VllmAdapter(RuntimeAdapter):
@@ -31,8 +54,18 @@ class VllmAdapter(RuntimeAdapter):
         ]
         if spec.max_batched_tokens is not None:
             command.extend(["--max-num-batched-tokens", str(spec.max_batched_tokens)])
+        template = chat_template_text(self.validate(spec))
+        tool_call_parser = match_parser(template, TOOL_CALL_PARSER_MARKERS)
+        if tool_call_parser:
+            command.extend(
+                ["--enable-auto-tool-choice", "--tool-call-parser", tool_call_parser]
+            )
+        reasoning_parser = match_parser(template, REASONING_PARSER_MARKERS)
+        if reasoning_parser:
+            command.extend(["--reasoning-parser", reasoning_parser])
         if spec.quantization and spec.quantization != "auto":
             command.extend(["--quantization", spec.quantization])
+        command.extend(default_chat_template_kwargs_flags(spec))
         if spec.trust_remote_code:
             command.append("--trust-remote-code")
         if spec.speculative is not None:

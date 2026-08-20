@@ -59,7 +59,24 @@ def resolve_host_model_mount(
     raise ValueError("Model path is outside configured model roots")
 
 
-def _deployment_spec_fingerprint(spec: DeploymentSpec, *, include_model_path: bool) -> str:
+# Spec fields introduced after containers started carrying a spec fingerprint
+# label. The label is baked into the container at creation and can never be
+# rewritten, so hashing a newly added key would change the fingerprint of every
+# spec that predates it and make each existing container fail the label check
+# on the next in-place update. Omitting these while they are unset keeps an
+# additive schema change invisible to deployments that do not use it; setting
+# one changes the fingerprint, which is correct because the launch command
+# changes too. Add to this tuple whenever DeploymentSpec gains an optional
+# field.
+FINGERPRINT_FIELDS_OMITTED_WHEN_UNSET = ("chat_template_kwargs",)
+
+
+def _deployment_spec_fingerprint(
+    spec: DeploymentSpec,
+    *,
+    include_model_path: bool,
+    omit_unset_optional: bool = True,
+) -> str:
     public = (
         spec.public_dump()
         if isinstance(spec, ResolvedDeploymentSpec)
@@ -67,6 +84,10 @@ def _deployment_spec_fingerprint(spec: DeploymentSpec, *, include_model_path: bo
     )
     if not include_model_path:
         public.pop("model_path", None)
+    if omit_unset_optional:
+        for field in FINGERPRINT_FIELDS_OMITTED_WHEN_UNSET:
+            if public.get(field) is None:
+                public.pop(field, None)
     canonical = json.dumps(
         public,
         sort_keys=True,
@@ -476,9 +497,17 @@ class DeploymentService:
             spec = DeploymentSpec.model_validate(stored_spec)
         except (TypeError, ValueError):
             return set()
+        # A container's label is written once at creation and is immutable,
+        # so it holds whichever form was canonical back then. Accept the whole
+        # matrix -- with and without model_path, with and without the fields
+        # added later -- otherwise containers created on either side of a
+        # schema change fail the label check on their next in-place update.
         return {
-            deployment_spec_fingerprint(spec),
-            _deployment_spec_fingerprint(spec, include_model_path=True),
+            _deployment_spec_fingerprint(
+                spec, include_model_path=include_model_path, omit_unset_optional=omit
+            )
+            for include_model_path in (False, True)
+            for omit in (False, True)
         }
 
     def _adapter_for_spec(self, spec: DeploymentSpec) -> RuntimeAdapter:

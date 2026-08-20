@@ -20,7 +20,7 @@ export function LoginPage() {
   return (
     <main className="login-page">
       <section className="login-panel">
-        <div className="login-brand"><span className="brand-mark brand-mark-large">DS</span></div>
+        <div className="login-brand"><span className="brand-mark brand-mark-large">DS</span><span className="login-eyebrow">DGX SPARK · WEB MANAGER</span></div>
         <Typography.Title level={1}>DGX Spark 管理器</Typography.Title>
         <Typography.Paragraph type="secondary">登录到本机模型与推理服务管理平面</Typography.Paragraph>
         {login.error && <Alert type="error" showIcon message="登录失败" description={login.error.message} />}
@@ -35,6 +35,7 @@ export function LoginPage() {
         </Form>
       </section>
       <aside className="login-status" aria-label="产品能力">
+        <div className="login-status-kicker"><span>PRIVATE AI INFRASTRUCTURE</span></div>
         <div><span>01</span><strong>模型资产</strong><small>发现本地缓存与 Hugging Face 模型</small></div>
         <div><span>02</span><strong>推理实例</strong><small>统一管理 SGLang 与 vLLM 服务</small></div>
         <div><span>03</span><strong>受控运维</strong><small>AI 诊断经过审核后才会执行</small></div>
