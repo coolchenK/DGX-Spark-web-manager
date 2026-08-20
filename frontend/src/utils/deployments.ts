@@ -28,7 +28,7 @@ export type QuantizationMethod =
 
 export interface SpeculativeSettings {
   draft_model_id: string
-  method: 'draft_model' | 'dspark' | 'eagle' | 'eagle3' | 'mtp'
+  method: 'draft_model' | 'dflash' | 'dspark' | 'eagle' | 'eagle3' | 'mtp'
   num_speculative_tokens?: number
   num_steps?: number
   eagle_top_k?: number
@@ -134,7 +134,7 @@ function normalizeChatTemplateKwargs(
 function normalizeSpeculativeSettings(value: unknown): SpeculativeSettings | null {
   const saved = objectValue(value)
   if (!saved || typeof saved.draft_model_id !== 'string') return null
-  if (!['draft_model', 'dspark', 'eagle', 'eagle3', 'mtp'].includes(String(saved.method))) {
+  if (!['draft_model', 'dflash', 'dspark', 'eagle', 'eagle3', 'mtp'].includes(String(saved.method))) {
     return null
   }
   const normalized: SpeculativeSettings = {

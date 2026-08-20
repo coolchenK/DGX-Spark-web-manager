@@ -1017,6 +1017,38 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     expect(draftRadio).toBeChecked()
   })
 
+  it('automatically applies DFlash2 with the model-card block size', async () => {
+    const recommendation = recommendationFixture({
+      runtime: 'sglang',
+      runtime_capabilities: {
+        ...recommendationFixture().runtime_capabilities,
+        runtime: 'sglang',
+        image: 'lmsysorg/sglang:qwen38-27b',
+        speculative_methods: ['draft_model', 'dflash'],
+        method_mapping: { draft_model: 'STANDALONE', dflash: 'DFLASH' },
+        speculative_transport: 'flags',
+      },
+      speculative_defaults: {},
+      draft_candidates: [{
+        model_id: 'qwen38-dflash2',
+        name: 'z-lab/Qwen3.8-27B-DFlash2',
+        repository_id: 'z-lab/Qwen3.8-27B-DFlash2',
+        method: 'dflash',
+        status: 'compatible',
+        reasons: ['External speculative checkpoint explicitly matches the target repository'],
+        size_bytes: 3.6 * GiB,
+        estimated_total_bytes: 64 * GiB,
+      }],
+    })
+    const { user } = renderDeploymentsPage({ recommendations: async () => recommendation })
+    await openCreateAndSelectModel(user)
+    await user.click(screen.getByText('SGLang'))
+    await goToDraftStep(user)
+
+    expect(screen.getByRole('radio', { name: /Qwen3.8-27B-DFlash2/ })).toBeChecked()
+    expect(screen.getByLabelText('DFlash Block Size')).toHaveValue('8')
+  })
+
   it('requires review acknowledgement before previewing a review draft', async () => {
     const { user, postSpy } = renderDeploymentsPage()
     await openCreateAndSelectModel(user)

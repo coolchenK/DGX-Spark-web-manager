@@ -12,6 +12,7 @@ from app.runtime.base import (
 
 SGLANG_SPECULATIVE_METHODS = {
     "draft_model": "STANDALONE",
+    "dflash": "DFLASH",
     "dspark": "DSPARK",
     "eagle": "EAGLE",
     "eagle3": "EAGLE3",
@@ -269,7 +270,15 @@ class SGLangAdapter(RuntimeAdapter):
                         "unquant",
                     ]
                 )
-            if spec.speculative.num_steps is not None:
+            if spec.speculative.method == "dflash":
+                if spec.speculative.num_draft_tokens is not None:
+                    command.extend(
+                        [
+                            "--speculative-num-draft-tokens",
+                            str(spec.speculative.num_draft_tokens),
+                        ]
+                    )
+            elif spec.speculative.num_steps is not None:
                 command.extend(
                     [
                         "--speculative-num-steps",

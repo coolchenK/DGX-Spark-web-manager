@@ -115,6 +115,14 @@ export function DraftModelStep({
                 >
                   <InputNumber />
                 </Form.Item>
+              ) : selectedCandidate.method === 'dflash' ? (
+                <Form.Item
+                  name={['speculative', 'num_draft_tokens']}
+                  label="DFlash Block Size"
+                  rules={[{ required: true, type: 'number', min: 1, max: 256, message: 'DFlash Block Size 必须在 1-256 之间' }]}
+                >
+                  <InputNumber />
+                </Form.Item>
               ) : (
                 <div className="form-grid">
                   <Form.Item

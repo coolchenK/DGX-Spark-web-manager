@@ -17,11 +17,11 @@ from app.services.resource_estimator import (
 )
 from app.services.runtime_capabilities import RuntimeCapabilities
 
-SpeculativeMethod = Literal["draft_model", "dspark", "eagle", "eagle3", "mtp"]
+SpeculativeMethod = Literal["draft_model", "dflash", "dspark", "eagle", "eagle3", "mtp"]
 CandidateStatus = Literal["compatible", "review", "incompatible"]
 BoundedReason = Annotated[str, StringConstraints(min_length=1, max_length=240)]
 
-KNOWN_METHODS = {"draft_model", "dspark", "eagle", "eagle3", "mtp"}
+KNOWN_METHODS = {"draft_model", "dflash", "dspark", "eagle", "eagle3", "mtp"}
 AUXILIARY_METHODS = {"eagle", "eagle3", "mtp"}
 STATUS_ORDER: dict[CandidateStatus, int] = {
     "compatible": 0,
@@ -145,12 +145,12 @@ def classify_draft_candidate(
             resource_estimate=resource_estimate,
         )
 
-    if method in {"draft_model", "dspark"}:
+    if method in {"draft_model", "dflash", "dspark"}:
         external_draft = any(
             marker in (draft.repository_id or draft.name).casefold()
             for marker in ("-dspark", "_dspark", "-dflash", "_dflash")
         )
-        if explicit_match and (method == "dspark" or external_draft):
+        if explicit_match and (method in {"dflash", "dspark"} or external_draft):
             return _candidate(
                 draft,
                 method=method,
@@ -164,12 +164,18 @@ def classify_draft_candidate(
                 ),
                 resource_estimate=resource_estimate,
             )
-        if method == "dspark":
+        if method in {"dflash", "dspark"}:
             return _candidate(
                 draft,
                 method=method,
                 status="review",
-                reasons=["DSpark target pairing evidence is missing"],
+                reasons=[
+                    (
+                        "DFlash target pairing evidence is missing"
+                        if method == "dflash"
+                        else "DSpark target pairing evidence is missing"
+                    )
+                ],
                 resource_estimate=resource_estimate,
             )
         target_fingerprint = target_evidence.tokenizer_fingerprint

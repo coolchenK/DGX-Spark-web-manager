@@ -69,6 +69,7 @@ CONSERVATIVE_MANIFESTS: dict[RuntimeName, dict[str, Any]] = {
         "speculative_methods": ["draft_model", "eagle3", "mtp"],
         "method_mapping": {
             "draft_model": "draft_model",
+            "dflash": "dflash",
             "eagle3": "eagle3",
             "mtp": "mtp",
         },
@@ -78,9 +79,17 @@ CONSERVATIVE_MANIFESTS: dict[RuntimeName, dict[str, Any]] = {
         "generation_defaults": list(GENERATION_DEFAULTS),
         "quantization_methods": list(QUANTIZATION_METHODS),
         "quantization_mapping": {"nvfp4": "modelopt_fp4"},
-        "speculative_methods": ["draft_model", "dspark", "eagle", "eagle3", "mtp"],
+        "speculative_methods": [
+            "draft_model",
+            "dflash",
+            "dspark",
+            "eagle",
+            "eagle3",
+            "mtp",
+        ],
         "method_mapping": {
             "draft_model": "STANDALONE",
+            "dflash": "DFLASH",
             "dspark": "DSPARK",
             "eagle": "EAGLE",
             "eagle3": "EAGLE3",
@@ -139,7 +148,7 @@ def parse_runtime_help(
         )
         speculative_methods = [
             method
-            for method in ("draft_model", "eagle", "eagle3", "mtp")
+            for method in ("draft_model", "dflash", "eagle", "eagle3", "mtp")
             if method in choices
         ]
         if has_speculative_config and not choices:

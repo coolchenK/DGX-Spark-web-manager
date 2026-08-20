@@ -114,6 +114,7 @@ def test_sglang_parser_reads_dspark_from_builtins_description():
     assert capabilities.speculative_transport == "flags"
     assert capabilities.speculative_methods == [
         "draft_model",
+        "dflash",
         "dspark",
         "eagle",
         "eagle3",

@@ -153,6 +153,31 @@ describe('deploymentToFormValues', () => {
     })
   })
 
+  it('restores DFlash block-size settings', () => {
+    const dflashDeployment: Deployment = {
+      ...deployment,
+      runtime: 'sglang',
+      config: {
+        spec: {
+          ...(deployment.config.spec as Record<string, unknown>),
+          speculative: {
+            draft_model_id: 'draft-dflash2',
+            method: 'dflash',
+            num_draft_tokens: 8,
+            manual_review_acknowledged: false,
+          },
+        },
+      },
+    }
+
+    expect(deploymentToFormValues(dflashDeployment, model, 'edit').speculative).toEqual({
+      draft_model_id: 'draft-dflash2',
+      method: 'dflash',
+      num_draft_tokens: 8,
+      manual_review_acknowledged: false,
+    })
+  })
+
   it('omits Pydantic null defaults while preserving valid falsy values', () => {
     const pydanticDeployment: Deployment = {
       ...deployment,

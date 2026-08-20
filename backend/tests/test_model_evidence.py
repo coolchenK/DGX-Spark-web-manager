@@ -920,6 +920,23 @@ def test_front_matter_uses_model_card_metadata_allowlist(tmp_path):
     assert "unknown_nested" not in evidence.card_data
 
 
+def test_dflash_tag_is_normalized_to_dflash_method(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "README.md").write_text(
+        "---\n"
+        "base_model:\n  - Qwen/Qwen3.8-27B\n"
+        "tags:\n  - dflash2\n  - draft-model\n"
+        "---\n# Draft\n",
+        encoding="utf-8",
+    )
+
+    evidence = ModelEvidenceLoader(card_max_chars=100_000).load(model)
+
+    assert evidence.target_model_ids == ["Qwen/Qwen3.8-27B"]
+    assert evidence.speculative_method == "dflash"
+
+
 def test_target_model_ids_are_trimmed_deduplicated_and_strictly_validated(tmp_path):
     model = tmp_path / "model"
     model.mkdir()

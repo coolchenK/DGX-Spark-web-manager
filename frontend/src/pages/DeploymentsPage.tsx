@@ -121,7 +121,8 @@ const basicFields: Array<keyof DeploymentWizardValues> = [
 function isExternalDraftCandidate(candidate: DraftCandidate): boolean {
   const identifier = candidate.repository_id ?? candidate.name
   return candidate.method === 'dspark'
-    || (candidate.method === 'draft_model' && /[-_]dflash$/i.test(identifier))
+    || candidate.method === 'dflash'
+    || (candidate.method === 'draft_model' && /[-_]dflash2?$/i.test(identifier))
 }
 
 const recommendationValidationFields: Array<string | string[]> = [
@@ -451,6 +452,9 @@ export function DeploymentsPage() {
           num_speculative_tokens: result.runtime === 'vllm'
             ? (typeof recommendedTokens === 'number' ? recommendedTokens : currentSpeculative?.num_speculative_tokens ?? 5)
             : undefined,
+          num_draft_tokens: result.runtime === 'sglang' && autoDraft.method === 'dflash'
+            ? 8
+            : undefined,
           manual_review_acknowledged: false,
         }
       : undefined
@@ -631,7 +635,11 @@ export function DeploymentsPage() {
         ...(runtime === 'vllm' && savedSpeculative.num_speculative_tokens != null
           ? { num_speculative_tokens: savedSpeculative.num_speculative_tokens }
           : {}),
-        ...(runtime === 'sglang'
+        ...(runtime === 'sglang' && savedSpeculative.method === 'dflash'
+          && savedSpeculative.num_draft_tokens != null
+          ? { num_draft_tokens: savedSpeculative.num_draft_tokens }
+          : {}),
+        ...(runtime === 'sglang' && savedSpeculative.method !== 'dflash'
           && savedSpeculative.num_steps != null
           && savedSpeculative.eagle_top_k != null
           && savedSpeculative.num_draft_tokens != null
@@ -853,9 +861,11 @@ export function DeploymentsPage() {
               ? activeRecommendation.speculative_defaults.num_speculative_tokens.value
               : 5))
           : undefined,
-        num_steps: runtime === 'sglang' && keepRestored ? restored.num_steps : undefined,
-        eagle_top_k: runtime === 'sglang' && keepRestored ? restored.eagle_top_k : undefined,
-        num_draft_tokens: runtime === 'sglang' && keepRestored ? restored.num_draft_tokens : undefined,
+        num_steps: runtime === 'sglang' && keepRestored && candidate.method !== 'dflash' ? restored.num_steps : undefined,
+        eagle_top_k: runtime === 'sglang' && keepRestored && candidate.method !== 'dflash' ? restored.eagle_top_k : undefined,
+        num_draft_tokens: runtime === 'sglang'
+          ? (keepRestored ? restored.num_draft_tokens : candidate.method === 'dflash' ? 8 : undefined)
+          : undefined,
         manual_review_acknowledged: keepRestored
           ? restored.manual_review_acknowledged
           : false,
@@ -957,7 +967,13 @@ export function DeploymentsPage() {
           setDraftValidationError('SGLang 不支持每轮推测 Token 参数')
           return
         }
-        if (runtime === 'sglang' && grouped.some((value) => value != null) && !grouped.every((value) => value != null)) {
+        if (runtime === 'sglang' && speculative.method === 'dflash'
+          && (speculative.num_steps != null || speculative.eagle_top_k != null)) {
+          setDraftValidationError('DFlash 仅使用 Draft Token 数参数')
+          return
+        }
+        if (runtime === 'sglang' && speculative.method !== 'dflash'
+          && grouped.some((value) => value != null) && !grouped.every((value) => value != null)) {
           setDraftValidationError('SGLang 的三个推测解码参数必须全部填写或全部留空')
           return
         }

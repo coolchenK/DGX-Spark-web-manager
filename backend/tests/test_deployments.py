@@ -505,7 +505,9 @@ def test_speculative_config_rejects_invalid_draft_model_id_lengths(draft_model_i
         SpeculativeConfig(draft_model_id=draft_model_id, method="draft_model")
 
 
-@pytest.mark.parametrize("method", ["draft_model", "dspark", "eagle", "eagle3", "mtp"])
+@pytest.mark.parametrize(
+    "method", ["draft_model", "dflash", "dspark", "eagle", "eagle3", "mtp"]
+)
 def test_speculative_config_accepts_supported_methods(method):
     assert SpeculativeConfig(draft_model_id="draft-id", method=method).method == method
 
@@ -513,6 +515,24 @@ def test_speculative_config_accepts_supported_methods(method):
 def test_speculative_config_rejects_unknown_method():
     with pytest.raises(ValueError):
         SpeculativeConfig(draft_model_id="draft-id", method="unknown")
+
+
+def test_dflash_accepts_only_its_block_size_tuning():
+    config = SpeculativeConfig(
+        draft_model_id="draft-id",
+        method="dflash",
+        num_draft_tokens=8,
+    )
+
+    assert config.num_draft_tokens == 8
+    with pytest.raises(ValueError, match="DFlash tuning only accepts num_draft_tokens"):
+        SpeculativeConfig(
+            draft_model_id="draft-id",
+            method="dflash",
+            num_steps=2,
+            eagle_top_k=4,
+            num_draft_tokens=8,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1628,6 +1648,7 @@ def test_sglang_command_adds_complete_grouped_speculative_tuning(tmp_path):
     ("method", "runtime_method"),
     [
         ("draft_model", "STANDALONE"),
+        ("dflash", "DFLASH"),
         ("dspark", "DSPARK"),
         ("eagle", "EAGLE"),
         ("eagle3", "EAGLE3"),
@@ -1756,6 +1777,28 @@ def test_sglang_dspark_uses_repo_id_cache_root_and_dgx_spark_flags(tmp_path):
     assert command[command.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
     assert command[command.index("--mamba-ssm-dtype") + 1] == "float32"
     assert adapter.environment(spec)["HF_HUB_CACHE"] == "/draft-models"
+
+
+def test_sglang_dflash_uses_model_card_block_size(tmp_path):
+    adapter = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
+    spec = resolved_speculative_spec(
+        tmp_path,
+        runtime="sglang",
+        method="dflash",
+        runtime_method="DFLASH",
+        draft_container_path="/draft-models/qwen38-dflash2",
+        num_draft_tokens=8,
+    )
+
+    command = adapter.command(spec)
+
+    assert command[command.index("--speculative-algorithm") + 1] == "DFLASH"
+    assert command[command.index("--speculative-draft-model-path") + 1] == (
+        "/draft-models/qwen38-dflash2"
+    )
+    assert command[command.index("--speculative-num-draft-tokens") + 1] == "8"
+    assert "--speculative-num-steps" not in command
+    assert "--speculative-eagle-topk" not in command
 
 
 def test_runtime_commands_detect_model_specific_parsers_and_memory_flags(tmp_path):

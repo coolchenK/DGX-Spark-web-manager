@@ -143,6 +143,25 @@ def test_explicit_dspark_target_match_is_compatible() -> None:
     assert result.method == "dspark"
 
 
+def test_explicit_dflash_target_match_is_compatible() -> None:
+    target = asset("Qwen/Qwen3.8-27B", model_id="target")
+    draft = asset("z-lab/Qwen3.8-27B-DFlash2", model_id="draft")
+
+    result = classify(
+        target,
+        draft,
+        draft_evidence=evidence(
+            draft,
+            targets=["Qwen/Qwen3.8-27B"],
+            method="dflash",
+        ),
+        supported={"dflash"},
+    )
+
+    assert result.status == "compatible"
+    assert result.method == "dflash"
+
+
 def test_dspark_without_target_pairing_requires_review() -> None:
     target = asset("org/Target-NVFP4", model_id="target")
     draft = asset("org/Target-NVFP4-DSpark", model_id="draft")

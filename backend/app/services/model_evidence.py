@@ -69,7 +69,7 @@ SPECULATIVE_METHOD_KEYS = (
     "speculative_method",
     "speculative_decoding_method",
 )
-SPECULATIVE_METHODS = {"draft_model", "dspark", "eagle", "eagle3", "mtp"}
+SPECULATIVE_METHODS = {"draft_model", "dflash", "dspark", "eagle", "eagle3", "mtp"}
 SAFE_CARD_DATA_KEYS = (
     *TARGET_MODEL_KEYS,
     *SPECULATIVE_METHOD_KEYS,
@@ -781,9 +781,8 @@ def _speculative_method(card_data: dict[str, Any]) -> str | None:
             normalized = value.strip().casefold().replace("-", "_")
             if normalized in SPECULATIVE_METHODS:
                 return normalized
-    # DSpark and DFlash releases are external draft checkpoints. Their
-    # cards often describe the strategy in tags instead of a structured
-    # speculative_method field. vLLM transports both through draft_model.
+    # DSpark and DFlash releases are external draft checkpoints. Their cards
+    # often describe the strategy in tags instead of a structured field.
     hints: list[str] = []
     model_name = card_data.get("model_name")
     if isinstance(model_name, str):
@@ -795,7 +794,7 @@ def _speculative_method(card_data: dict[str, Any]) -> str | None:
     if "dspark" in hint_text:
         return "dspark"
     if "dflash" in hint_text:
-        return "draft_model"
+        return "dflash"
     return None
 
 
