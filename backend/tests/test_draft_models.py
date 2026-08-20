@@ -162,6 +162,28 @@ def test_explicit_dflash_target_match_is_compatible() -> None:
     assert result.method == "dflash"
 
 
+def test_dflash_matches_quantized_derivative_base_model() -> None:
+    target = asset("org/Target-8B-NVFP4", model_id="target")
+    draft = asset("org/Target-8B-DFlash", model_id="draft")
+
+    result = classify(
+        target,
+        draft,
+        target_evidence=evidence(target, targets=["org/Target-8B"]),
+        draft_evidence=evidence(
+            draft,
+            targets=["org/Target-8B"],
+            method="dflash",
+        ),
+        supported={"dflash"},
+    )
+
+    assert result.status == "compatible"
+    assert result.reasons == [
+        "External speculative checkpoint explicitly matches the target repository"
+    ]
+
+
 def test_dspark_without_target_pairing_requires_review() -> None:
     target = asset("org/Target-NVFP4", model_id="target")
     draft = asset("org/Target-NVFP4-DSpark", model_id="draft")

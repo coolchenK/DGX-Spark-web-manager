@@ -109,9 +109,14 @@ def classify_draft_candidate(
     explicit_match = False
     target_repository_missing = False
     if draft_evidence is not None and draft_evidence.target_model_ids:
-        if target.repository_id is None:
+        target_repository_ids = set(
+            target_evidence.target_model_ids if target_evidence is not None else []
+        )
+        if target.repository_id is not None:
+            target_repository_ids.add(target.repository_id)
+        if not target_repository_ids:
             target_repository_missing = True
-        elif target.repository_id in draft_evidence.target_model_ids:
+        elif target_repository_ids.intersection(draft_evidence.target_model_ids):
             explicit_match = True
         else:
             hard_reasons.append("Draft Model declares a different target model")
