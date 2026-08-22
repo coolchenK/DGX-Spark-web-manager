@@ -392,6 +392,17 @@ def test_fresh_database_upgrades_directly_to_head(tmp_path, monkeypatch):
             column["name"] for column in inspector.get_columns("providers")
         }
         assert {"last_test_result", "config_revision"} <= provider_columns
+        deployment_columns = {
+            column["name"] for column in inspector.get_columns("deployments")
+        }
+        assert {
+            "benchmark_status",
+            "benchmark_tps",
+            "benchmark_completion_tokens",
+            "benchmark_duration_seconds",
+            "benchmark_tested_at",
+            "benchmark_error",
+        } <= deployment_columns
         assert "ix_request_metrics_created_at" in {
             index["name"] for index in inspector.get_indexes("request_metrics")
         }
@@ -401,8 +412,39 @@ def test_fresh_database_upgrades_directly_to_head(tmp_path, monkeypatch):
             _foreign_key_ondelete(inspector, "operation_plans", "deployment_id") == "SET NULL"
         )
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260817_0002"
+            "20260823_0003"
         )
+    database.dispose()
+
+
+def test_deployment_benchmark_columns_upgrade_downgrade_cycle(tmp_path, monkeypatch):
+    database_url = f"sqlite:///{tmp_path / 'deployment-benchmarks.db'}"
+    monkeypatch.setenv("DGX_DATABASE_URL", database_url)
+    config = _alembic_config(database_url)
+    expected = {
+        "benchmark_status",
+        "benchmark_tps",
+        "benchmark_completion_tokens",
+        "benchmark_duration_seconds",
+        "benchmark_tested_at",
+        "benchmark_error",
+    }
+
+    command.upgrade(config, "20260817_0002")
+    database = _database(tmp_path / "deployment-benchmarks.db")
+    with database.engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("deployments")}
+        assert not expected & columns
+
+    command.upgrade(config, "head")
+    with database.engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("deployments")}
+        assert expected <= columns
+
+    command.downgrade(config, "20260817_0002")
+    with database.engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("deployments")}
+        assert not expected & columns
     database.dispose()
 
 

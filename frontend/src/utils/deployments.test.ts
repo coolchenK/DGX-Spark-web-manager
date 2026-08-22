@@ -18,6 +18,12 @@ const deployment: Deployment = {
   managed: true,
   image: 'vllm/vllm-openai:v0.27.1',
   port: 8100,
+  benchmark_status: null,
+  benchmark_tps: null,
+  benchmark_completion_tokens: null,
+  benchmark_duration_seconds: null,
+  benchmark_tested_at: null,
+  benchmark_error: null,
   config: {
     route_alias: 'qwen-production',
     spec: {

@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,56 @@ CONCURRENT_DEPLOYMENT_CHANGE_ERROR = "Deployment container identity changed conc
 MISSING_DEPLOYMENT_SNAPSHOT_ERROR = (
     "Deployment action is missing its container snapshot; retry the action"
 )
+TPS_BENCHMARK_PROMPT = (
+    "不要解释，不要换行，不要输出思考过程。严格输出从 1 到 200 的阿拉伯数字，"
+    "使用英文逗号分隔。"
+)
+TPS_BENCHMARK_MAX_TOKENS = 256
+
+
+def run_deployment_tps_benchmark(
+    endpoint: str,
+    api_model_name: str,
+    runtime: str,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "model": api_model_name,
+        "messages": [{"role": "user", "content": TPS_BENCHMARK_PROMPT}],
+        "temperature": 0,
+        "max_tokens": TPS_BENCHMARK_MAX_TOKENS,
+        "stream": False,
+    }
+    if runtime == "vllm":
+        request["chat_template_kwargs"] = {"enable_thinking": False}
+    warmup = {
+        **request,
+        "messages": [{"role": "user", "content": "只回答 OK"}],
+        "max_tokens": 16,
+    }
+    timeout = httpx.Timeout(connect=5, read=360, write=30, pool=5)
+    with httpx.Client(base_url=endpoint, timeout=timeout, trust_env=False) as client:
+        warmup_response = client.post("/v1/chat/completions", json=warmup)
+        warmup_response.raise_for_status()
+        started_at = time.perf_counter()
+        response = client.post("/v1/chat/completions", json=request)
+        duration_seconds = time.perf_counter() - started_at
+        response.raise_for_status()
+    payload = response.json()
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    if not isinstance(completion_tokens, int) or completion_tokens <= 0:
+        raise RuntimeError("TPS benchmark response did not include completion_tokens")
+    if duration_seconds <= 0:
+        raise RuntimeError("TPS benchmark duration is invalid")
+    choice = (payload.get("choices") or [{}])[0]
+    return {
+        "status": "succeeded",
+        "tps": round(completion_tokens / duration_seconds, 3),
+        "completion_tokens": completion_tokens,
+        "duration_seconds": round(duration_seconds, 3),
+        "finish_reason": choice.get("finish_reason") if isinstance(choice, dict) else None,
+        "max_tokens": TPS_BENCHMARK_MAX_TOKENS,
+    }
 
 
 def resolve_host_model_mount(
@@ -116,6 +167,7 @@ class DeploymentService:
         resource_estimator: ResourceEstimator | None = None,
         system_snapshot: Callable[[], Mapping[str, Any] | Any] | None = None,
         docker_client: Any | None = None,
+        benchmark_runner: Callable[[str, str, str], dict[str, Any]] | None = None,
     ):
         self.adapters = adapters
         self.session_factory = session_factory
@@ -133,6 +185,7 @@ class DeploymentService:
         )
         self.system_snapshot = system_snapshot
         self._docker_client = docker_client
+        self.benchmark_runner = benchmark_runner
 
     _port_allocation_lock = threading.Lock()
 
@@ -558,9 +611,13 @@ class DeploymentService:
         spec: DeploymentSpec,
         *,
         cleanup_backup: bool,
+        benchmark_if_missing: bool = False,
     ) -> dict[str, Any]:
         deployment_id = deployment.id
         container_id = deployment.container_id
+        needs_benchmark = (
+            benchmark_if_missing and deployment.benchmark_status != "succeeded"
+        )
         original = {
             "updated_at": deployment.updated_at,
             "status": deployment.status,
@@ -613,12 +670,23 @@ class DeploymentService:
             raise
         if cleanup_backup:
             self._cleanup_committed_backup(context, client, target, deployment_id)
-        return {
+        result = {
             "deployment_id": deployment_id,
             "container_name": target.name,
             "endpoint_url": endpoint,
             "idempotent": True,
         }
+        if needs_benchmark:
+            benchmark = self._benchmark_deployment(
+                context,
+                deployment_id=deployment_id,
+                endpoint=endpoint,
+                api_model_name=spec.api_model_name,
+                runtime=spec.runtime,
+            )
+            if benchmark is not None:
+                result["benchmark"] = benchmark
+        return result
 
     def _sync_recovered_deployment(
         self,
@@ -930,6 +998,79 @@ class DeploymentService:
         except Exception as exc:
             return f"Container logs unavailable: {exc}"
 
+    def _benchmark_deployment(
+        self,
+        context: TaskContext,
+        *,
+        deployment_id: str,
+        endpoint: str,
+        api_model_name: str,
+        runtime: str,
+    ) -> dict[str, Any] | None:
+        if self.benchmark_runner is None:
+            return None
+        with self.session_factory() as db:
+            deployment = db.get(Deployment, deployment_id)
+            if deployment is None:
+                return None
+            deployment.benchmark_status = "running"
+            deployment.benchmark_tps = None
+            deployment.benchmark_completion_tokens = None
+            deployment.benchmark_duration_seconds = None
+            deployment.benchmark_tested_at = None
+            deployment.benchmark_error = None
+            db.commit()
+        context.update(progress=94, message="Deployment healthy; running TPS benchmark")
+        tested_at = datetime.now(UTC)
+        try:
+            raw = self.benchmark_runner(endpoint, api_model_name, runtime)
+            tps = float(raw["tps"])
+            completion_tokens = int(raw["completion_tokens"])
+            duration_seconds = float(raw["duration_seconds"])
+            if tps <= 0 or completion_tokens <= 0 or duration_seconds <= 0:
+                raise ValueError("TPS benchmark returned invalid measurements")
+            benchmark = {
+                **raw,
+                "status": "succeeded",
+                "tps": round(tps, 3),
+                "completion_tokens": completion_tokens,
+                "duration_seconds": round(duration_seconds, 3),
+                "tested_at": tested_at.isoformat(),
+            }
+            with self.session_factory() as db:
+                deployment = db.get(Deployment, deployment_id)
+                if deployment is not None:
+                    deployment.benchmark_status = "succeeded"
+                    deployment.benchmark_tps = benchmark["tps"]
+                    deployment.benchmark_completion_tokens = completion_tokens
+                    deployment.benchmark_duration_seconds = benchmark["duration_seconds"]
+                    deployment.benchmark_tested_at = tested_at
+                    deployment.benchmark_error = None
+                    db.commit()
+            context.update(
+                progress=99,
+                message=f"TPS benchmark completed at {benchmark['tps']:.3f} tok/s",
+            )
+            return benchmark
+        except Exception as exc:
+            error = redact_log(str(exc)).strip()[:2000] or "TPS benchmark failed"
+            with self.session_factory() as db:
+                deployment = db.get(Deployment, deployment_id)
+                if deployment is not None:
+                    deployment.benchmark_status = "failed"
+                    deployment.benchmark_tps = None
+                    deployment.benchmark_completion_tokens = None
+                    deployment.benchmark_duration_seconds = None
+                    deployment.benchmark_tested_at = tested_at
+                    deployment.benchmark_error = error
+                    db.commit()
+            context.update(progress=99, message=f"TPS benchmark failed: {error}")
+            return {
+                "status": "failed",
+                "error": error,
+                "tested_at": tested_at.isoformat(),
+            }
+
     def create_handler(self, context: TaskContext, payload: dict[str, Any]) -> dict[str, Any]:
         with self._port_allocation_lock:
             return self._create_handler_locked(context, payload)
@@ -968,7 +1109,11 @@ class DeploymentService:
                 fingerprint = preview["spec_fingerprint"]
         if committed is not None:
             return self._recover_committed_deployment(
-                context, committed, spec, cleanup_backup=False
+                context,
+                committed,
+                spec,
+                cleanup_backup=False,
+                benchmark_if_missing=True,
             )
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
@@ -1027,6 +1172,7 @@ class DeploymentService:
                     managed=True,
                     image=resolved.image,
                     port=resolved.port,
+                    benchmark_status="pending" if self.benchmark_runner is not None else None,
                     config=preview,
                     capabilities=adapter.openai_capabilities(),
                 )
@@ -1035,11 +1181,21 @@ class DeploymentService:
                 persisted = True
                 db.refresh(deployment)
                 deployment_id = deployment.id
-            return {
+            result = {
                 "deployment_id": deployment_id,
                 "container_name": name,
                 "endpoint_url": endpoint,
             }
+            benchmark = self._benchmark_deployment(
+                context,
+                deployment_id=deployment_id,
+                endpoint=endpoint,
+                api_model_name=resolved.api_model_name,
+                runtime=resolved.runtime,
+            )
+            if benchmark is not None:
+                result["benchmark"] = benchmark
+            return result
         except BaseException:
             if created_container and not persisted and container is not None:
                 self._remove_owned_container(container)

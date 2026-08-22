@@ -279,6 +279,12 @@ const existingDeployment: Deployment = {
   managed: true,
   image: 'vllm/vllm-openai:v0.27.1',
   port: 8100,
+  benchmark_status: 'succeeded',
+  benchmark_tps: 67.084,
+  benchmark_completion_tokens: 256,
+  benchmark_duration_seconds: 3.816,
+  benchmark_tested_at: '2026-08-23T01:02:03Z',
+  benchmark_error: null,
   config: {
     route_alias: 'qwen-shared',
     spec: {
@@ -485,6 +491,24 @@ describe('DeploymentsPage deployment locator', () => {
     expect(within(table).getAllByText('qwen-production')).toHaveLength(2)
     expect(within(table).queryAllByText('draft-production')).toHaveLength(0)
     expect(screen.getByText('正在定位部署 qwen-production')).toBeInTheDocument()
+  })
+
+  it('shows the persisted TPS benchmark in the deployment table', async () => {
+    vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+      matches: query.includes('min-width'),
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }))
+    renderDeploymentsPage({ deployments: [existingDeployment] })
+
+    const table = await screen.findByRole('table')
+    expect(within(table).getAllByText('TPS').length).toBeGreaterThan(0)
+    expect(within(table).getByText('67.08 tok/s')).toBeInTheDocument()
   })
 
   it('shows a clear warning for an unknown deployment without hiding the list', async () => {

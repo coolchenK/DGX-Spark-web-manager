@@ -32,7 +32,7 @@ from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
 from app.security import PasswordManager, SecretBox, SessionManager
 from app.services.deployment_recommendations import DeploymentRecommendationService
-from app.services.deployments import DeploymentService
+from app.services.deployments import DeploymentService, run_deployment_tps_benchmark
 from app.services.diagnostics import DiagnosticService
 from app.services.discovery import DiscoveryService
 from app.services.draft_models import DraftCompatibilityService
@@ -148,6 +148,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resource_estimator=resource_estimator,
         system_snapshot=system_service.snapshot,
         docker_client=lazy_docker_client,
+        benchmark_runner=run_deployment_tps_benchmark,
     )
     deployment_recommendation_service = DeploymentRecommendationService(
         evidence_loader=evidence_loader,

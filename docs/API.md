@@ -64,6 +64,18 @@ Authorization: Bearer dgx_...
 | PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
 | DELETE | `/api/settings/alerts-diagnostics-history` | Physically clear failed-task and AI operations history |
 
+### Deployment TPS benchmarks
+
+After a newly created deployment passes its runtime health check, the same task sends one warmup
+request and one fixed non-streaming chat-completion request to the local endpoint. The measured
+completion-token throughput is persisted on the deployment. A benchmark failure does not roll back
+an otherwise healthy deployment.
+
+`GET /api/deployments` exposes `benchmark_status` (`pending`, `running`, `succeeded`, `failed`, or
+`null`), `benchmark_tps`, `benchmark_completion_tokens`, `benchmark_duration_seconds`,
+`benchmark_tested_at`, and `benchmark_error`. Historical or discovered deployments without a result
+return `null` benchmark values.
+
 ### Deployment lifecycle actions
 
 `POST /api/deployments/{id}/stop` stops an inference instance and immediately removes it from

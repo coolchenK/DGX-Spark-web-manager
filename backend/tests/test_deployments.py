@@ -251,6 +251,7 @@ def build_preflight_service(
     draft_service=None,
     estimator=None,
     snapshot=None,
+    benchmark_runner=None,
 ):
     adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=model_roots)
     return deployment_service.DeploymentService(
@@ -271,6 +272,7 @@ def build_preflight_service(
                 }
             }
         ),
+        benchmark_runner=benchmark_runner,
     )
 
 
@@ -403,6 +405,34 @@ def test_managed_deployment_actions_remain_body_optional(authenticated_client, a
     response = authenticated_client.post(f"/api/deployments/{deployment_id}/{action}")
 
     assert response.status_code == 202
+
+
+def test_deployment_inventory_serializes_tps_benchmark(authenticated_client):
+    tested_at = datetime(2026, 8, 23, 1, 2, 3, tzinfo=UTC)
+    with authenticated_client.app.state.database.session_factory() as db:
+        deployment = add_action_deployment(
+            db,
+            managed=True,
+            name="benchmarked",
+            benchmark_status="succeeded",
+            benchmark_tps=87.654,
+            benchmark_completion_tokens=256,
+            benchmark_duration_seconds=2.92,
+            benchmark_tested_at=tested_at,
+            benchmark_error=None,
+        )
+        deployment_id = deployment.id
+
+    response = authenticated_client.get("/api/deployments")
+
+    assert response.status_code == 200
+    item = next(value for value in response.json() if value["id"] == deployment_id)
+    assert item["benchmark_status"] == "succeeded"
+    assert item["benchmark_tps"] == 87.654
+    assert item["benchmark_completion_tokens"] == 256
+    assert item["benchmark_duration_seconds"] == 2.92
+    assert item["benchmark_tested_at"] == "2026-08-23T01:02:03"
+    assert item["benchmark_error"] is None
 
 
 def test_deployment_spec_serializes_recommendation_settings(tmp_path):
@@ -2321,6 +2351,204 @@ def test_create_handler_rejects_orphan_container_with_incomplete_labels(tmp_path
     result = service.create_handler(HandlerContext(), spec.model_dump(mode="json"))
 
     assert result["container_name"] == "dgx-base"
+
+
+def test_create_handler_benchmarks_and_persists_tps_after_health(tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'benchmark-success.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+    calls = []
+
+    def benchmark_runner(endpoint, api_model_name, runtime):
+        calls.append((endpoint, api_model_name, runtime))
+        return {
+            "status": "succeeded",
+            "tps": 42.1254,
+            "completion_tokens": 256,
+            "duration_seconds": 6.077,
+            "finish_reason": "length",
+            "max_tokens": 256,
+        }
+
+    service = build_preflight_service(
+        database,
+        (root,),
+        benchmark_runner=benchmark_runner,
+    )
+
+    class Container:
+        id = "benchmark-container"
+        name = "dgx-base"
+        status = "running"
+
+        def reload(self):
+            return None
+
+    container = Container()
+
+    class Containers:
+        def get(self, _name):
+            raise docker.errors.NotFound("missing")
+
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": Containers()})(),
+    )
+    monkeypatch.setattr(service, "_run_container", lambda *_args, **_kwargs: container)
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+    context = HandlerContext()
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    result = service.create_handler(context, spec.model_dump(mode="json"))
+
+    assert calls == [("http://127.0.0.1:8100", "base", "vllm")]
+    assert result["benchmark"]["status"] == "succeeded"
+    assert result["benchmark"]["tps"] == 42.125
+    assert any("42.125 tok/s" in message for message in context.messages)
+    with database.session_factory() as db:
+        deployment = db.get(Deployment, result["deployment_id"])
+        assert deployment.status == "running"
+        assert deployment.health == "healthy"
+        assert deployment.benchmark_status == "succeeded"
+        assert deployment.benchmark_tps == 42.125
+        assert deployment.benchmark_completion_tokens == 256
+        assert deployment.benchmark_duration_seconds == 6.077
+        assert deployment.benchmark_tested_at is not None
+        assert deployment.benchmark_error is None
+
+
+def test_create_handler_keeps_healthy_deployment_when_tps_benchmark_fails(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'benchmark-failure.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(db, root / "base")
+        model_id = target.id
+
+    def benchmark_runner(_endpoint, _api_model_name, _runtime):
+        raise RuntimeError("benchmark endpoint returned 500")
+
+    service = build_preflight_service(
+        database,
+        (root,),
+        benchmark_runner=benchmark_runner,
+    )
+
+    class Container:
+        id = "benchmark-container"
+        name = "dgx-base"
+        status = "running"
+
+        def reload(self):
+            return None
+
+    container = Container()
+
+    class Containers:
+        def get(self, _name):
+            raise docker.errors.NotFound("missing")
+
+    monkeypatch.setattr(
+        service,
+        "docker_client",
+        lambda: type("Client", (), {"containers": Containers()})(),
+    )
+    monkeypatch.setattr(service, "_run_container", lambda *_args, **_kwargs: container)
+    monkeypatch.setattr(service, "wait_for_health", lambda *_args, **_kwargs: True)
+    spec = DeploymentSpec(
+        name="base",
+        model_id=model_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+    )
+
+    result = service.create_handler(HandlerContext(), spec.model_dump(mode="json"))
+
+    assert result["benchmark"] == {
+        "status": "failed",
+        "error": "benchmark endpoint returned 500",
+        "tested_at": result["benchmark"]["tested_at"],
+    }
+    with database.session_factory() as db:
+        deployment = db.get(Deployment, result["deployment_id"])
+        assert deployment.status == "running"
+        assert deployment.health == "healthy"
+        assert deployment.benchmark_status == "failed"
+        assert deployment.benchmark_tps is None
+        assert deployment.benchmark_error == "benchmark endpoint returned 500"
+
+
+def test_tps_benchmark_uses_warmup_and_completion_token_throughput(monkeypatch):
+    requests = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def post(self, path, json):
+            requests.append((path, json))
+            if len(requests) == 1:
+                return Response({"usage": {"completion_tokens": 2}, "choices": [{}]})
+            return Response(
+                {
+                    "usage": {"completion_tokens": 256},
+                    "choices": [{"finish_reason": "length"}],
+                }
+            )
+
+    ticks = iter([10.0, 12.0])
+    monkeypatch.setattr(deployment_service.httpx, "Client", Client)
+    monkeypatch.setattr(deployment_service.time, "perf_counter", lambda: next(ticks))
+
+    result = deployment_service.run_deployment_tps_benchmark(
+        "http://127.0.0.1:8100", "base", "vllm"
+    )
+
+    assert result == {
+        "status": "succeeded",
+        "tps": 128.0,
+        "completion_tokens": 256,
+        "duration_seconds": 2.0,
+        "finish_reason": "length",
+        "max_tokens": 256,
+    }
+    assert len(requests) == 2
+    assert requests[0][1]["max_tokens"] == 16
+    assert requests[1][1]["max_tokens"] == 256
+    assert requests[1][1]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 @pytest.mark.parametrize("failure_stage", ["cancel", "health", "commit"])

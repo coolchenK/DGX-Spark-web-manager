@@ -14,6 +14,8 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Persistent Hugging Face search/download tasks with pause, resume, cancellation, and restart recovery.
 - Validated SGLang, vLLM, and llama.cpp deployment adapters with image and argument allowlists.
 - Deployment preview, edit, clone, health-gated replacement, automatic rollback, and retained task history.
+- Automatic post-deployment warmup and TPS benchmarking with persistent results shown in desktop
+  and mobile deployment views; benchmark failures are recorded without rolling back healthy services.
 - Automatic host-port allocation starts at `8000`, checks both Manager reservations and Docker
   bindings, reuses the lowest released gap, and keeps the Docker port, endpoint, database row,
   persisted spec, and ownership label consistent. Explicit ports are validated for conflicts.
@@ -128,9 +130,12 @@ On startup the manager scans Docker without restarting or recreating existing co
 6. Review the normalized spec, generated runtime command, mounts, current capability snapshot,
    memory estimate, provenance, and warnings. Resource warnings and review candidates require
    explicit acknowledgement. Submit only from the current preview; any form change invalidates it.
-7. Follow the queued task through runtime health checks. The same panel then provides start, stop,
-   restart, edit, clone, rollback-aware replacement, logs, task history, audit history, and gateway
-   metrics for managed models. Discovered external containers remain protected from manager delete.
+7. Follow the queued task through runtime health checks, warmup, and the automatic TPS benchmark.
+   The result remains visible on the desktop table and mobile deployment record. Benchmark failures
+   are recorded for diagnosis without rolling back a healthy deployment. The same panel then provides
+   start, stop, restart, edit, clone, rollback-aware replacement, logs, task history, audit history,
+   and gateway metrics for managed models. Discovered external containers remain protected from
+   manager delete.
 8. Leave **主机端口** empty for a new deployment when automatic allocation is preferred. The service
    chooses the lowest free port from `8000`, including ports held by stopped Manager deployments and
    existing Docker containers. Clones also receive a fresh automatically allocated port.

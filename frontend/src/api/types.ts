@@ -68,6 +68,12 @@ export interface Deployment {
   managed: boolean
   image: string | null
   port: number | null
+  benchmark_status: 'pending' | 'running' | 'succeeded' | 'failed' | null
+  benchmark_tps: number | null
+  benchmark_completion_tokens: number | null
+  benchmark_duration_seconds: number | null
+  benchmark_tested_at: string | null
+  benchmark_error: string | null
   config: Record<string, unknown>
   capabilities: string[]
   last_checked_at: string | null

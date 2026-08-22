@@ -1,9 +1,11 @@
 import {
   CopyOutlined,
+  DashboardOutlined,
   DeleteOutlined,
   EditOutlined,
   FileTextOutlined,
   LeftOutlined,
+  LoadingOutlined,
   PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -73,6 +75,40 @@ import {
 
 interface DeploymentWizardValues extends DeploymentFormValues {
   provider_id?: string
+}
+
+function benchmarkDisplay(item: Deployment) {
+  if (item.benchmark_status === 'succeeded' && item.benchmark_tps != null) {
+    const details = [
+      item.benchmark_completion_tokens != null
+        ? `${item.benchmark_completion_tokens} completion tokens`
+        : null,
+      item.benchmark_duration_seconds != null
+        ? `${item.benchmark_duration_seconds.toFixed(3)} 秒`
+        : null,
+      item.benchmark_tested_at
+        ? new Date(item.benchmark_tested_at).toLocaleString('zh-CN')
+        : null,
+    ].filter(Boolean).join(' · ')
+    return (
+      <Tooltip title={details || '部署后自动 TPS 测试'}>
+        <Typography.Text strong>
+          <DashboardOutlined /> {item.benchmark_tps.toFixed(2)} tok/s
+        </Typography.Text>
+      </Tooltip>
+    )
+  }
+  if (item.benchmark_status === 'pending' || item.benchmark_status === 'running') {
+    return <Typography.Text type="secondary"><LoadingOutlined spin /> 测试中</Typography.Text>
+  }
+  if (item.benchmark_status === 'failed') {
+    return (
+      <Tooltip title={item.benchmark_error || 'TPS 测试未返回有效结果'}>
+        <Typography.Text type="danger">测试失败</Typography.Text>
+      </Tooltip>
+    )
+  }
+  return <Typography.Text type="secondary">未测试</Typography.Text>
 }
 
 const defaultValues: Partial<DeploymentWizardValues> = {
@@ -1258,12 +1294,13 @@ export function DeploymentsPage() {
           { title: '端点', dataIndex: 'endpoint_url' },
           { title: '所有权', dataIndex: 'managed', width: 90, render: (value) => value ? '管理器' : '已发现' },
           { title: '状态', dataIndex: 'health', width: 100, render: (value) => <StatusBadge status={value} /> },
+          { title: 'TPS', dataIndex: 'benchmark_tps', width: 140, render: (_, item) => benchmarkDisplay(item) },
           { title: '操作', width: 400, render: (_, item) => operationButtons(item) },
         ]} renderMobile={(item) => (
           <div className="mobile-record">
             <Flex justify="space-between"><strong>{item.name}</strong><StatusBadge status={item.health} /></Flex>
             <Typography.Text type="secondary">{item.api_model_name}</Typography.Text>
-            <dl><div><dt>运行时</dt><dd>{item.runtime}</dd></div><div><dt>端点</dt><dd>{item.endpoint_url}</dd></div></dl>
+            <dl><div><dt>运行时</dt><dd>{item.runtime}</dd></div><div><dt>端点</dt><dd>{item.endpoint_url}</dd></div><div><dt>TPS</dt><dd>{benchmarkDisplay(item)}</dd></div></dl>
             {operationButtons(item, true)}
           </div>
         )} />
