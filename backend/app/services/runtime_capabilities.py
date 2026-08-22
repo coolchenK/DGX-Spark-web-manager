@@ -66,10 +66,17 @@ CONSERVATIVE_MANIFESTS: dict[RuntimeName, dict[str, Any]] = {
         "generation_defaults": list(GENERATION_DEFAULTS),
         "quantization_methods": list(QUANTIZATION_METHODS),
         "quantization_mapping": {"nvfp4": "modelopt_fp4"},
-        "speculative_methods": ["draft_model", "eagle3", "mtp"],
+        "speculative_methods": [
+            "draft_model",
+            "dflash",
+            "dspark",
+            "eagle3",
+            "mtp",
+        ],
         "method_mapping": {
             "draft_model": "draft_model",
             "dflash": "dflash",
+            "dspark": "dspark",
             "eagle3": "eagle3",
             "mtp": "mtp",
         },
@@ -148,7 +155,14 @@ def parse_runtime_help(
         )
         speculative_methods = [
             method
-            for method in ("draft_model", "dflash", "eagle", "eagle3", "mtp")
+            for method in (
+                "draft_model",
+                "dflash",
+                "dspark",
+                "eagle",
+                "eagle3",
+                "mtp",
+            )
             if method in choices
         ]
         if has_speculative_config and not choices:
@@ -157,7 +171,14 @@ def parse_runtime_help(
             # bounded runtime manifest so model-card draft checkpoints remain
             # selectable instead of being marked incompatible solely because
             # the help formatter hid the enum.
-            speculative_methods = ["draft_model", "eagle", "eagle3", "mtp"]
+            speculative_methods = [
+                "draft_model",
+                "dflash",
+                "dspark",
+                "eagle",
+                "eagle3",
+                "mtp",
+            ]
             warnings.append(
                 "Runtime help did not expose speculative method choices; using the "
                 "bounded vLLM manifest"

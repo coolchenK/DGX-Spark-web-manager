@@ -128,7 +128,9 @@ On startup the manager scans Docker without restarting or recreating existing co
    tuning fields. `review` candidates require explicit acknowledgement; incompatible candidates are
    not deployable. Native SGLang DFlash and DSpark use the `DFLASH` and `DSPARK` algorithms and resolve
    repositories from the mounted local Hugging Face cache, including when the Draft Model comes from
-   a different configured model root.
+   a different configured model root. vLLM 0.27.x also exposes NVIDIA Nemotron-H DSpark checkpoints;
+   the Manager applies the model card's Marlin MoE, FP8 KV, FlashInfer Mamba, prefix-cache, reasoning,
+   and tool-parser profile only when the local checkpoint identifies itself as Nemotron-H.
 6. Review the normalized spec, generated runtime command, mounts, current capability snapshot,
    memory estimate, provenance, and warnings. Resource warnings and review candidates require
    explicit acknowledgement. Submit only from the current preview; any form change invalidates it.

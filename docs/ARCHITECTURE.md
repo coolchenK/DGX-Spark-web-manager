@@ -150,7 +150,9 @@ backend performs these stages in order:
 Runtime command generation then reads only local bounded model files. Chat-template markers select
 known tool-call and reasoning parsers. SGLang hybrid GDN/NVFP4 models receive bounded Mamba-state and
 MoE backend flags, while DSpark Draft Models are translated from mounted Hub cache paths to repository
-IDs and resolved offline inside the runtime container.
+IDs and resolved offline inside the runtime container. vLLM Nemotron-H deployments receive the
+model-card DGX Spark execution profile and can attach native DSpark draft checkpoints through the
+resolved JSON speculative configuration.
 
 The AI cache defaults to 900 seconds and is keyed by model revision, evidence hash, runtime, image
 digest, provider ID, and recommendation schema version. `refresh_ai=true` bypasses a cache hit. A

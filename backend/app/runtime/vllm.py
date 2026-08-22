@@ -35,12 +35,45 @@ REASONING_PARSER_MARKERS = (
     ("qwen3", ("<think>",)),
 )
 
+NEMOTRON_H_FLAGS = (
+    "--moe-backend",
+    "marlin",
+    "--kv-cache-dtype",
+    "fp8",
+    "--enable-prefix-caching",
+    "--mamba-backend",
+    "flashinfer",
+    "--mamba-cache-mode",
+    "align",
+    "--mamba-ssm-cache-dtype",
+    "float16",
+)
+
+
+def _is_nemotron_h(model_path) -> bool:
+    """Detect NVIDIA Nemotron-H checkpoints from bounded local metadata."""
+    config = model_path / "config.json"
+    if not config.is_file():
+        return False
+    try:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    architectures = payload.get("architectures") or []
+    return payload.get("model_type") == "nemotron_h" or any(
+        str(name).lower().startswith("nemotronh") for name in architectures
+    )
+
 
 class VllmAdapter(RuntimeAdapter):
     runtime = "vllm"
 
     def command(self, spec: DeploymentSpec) -> list[str]:
+        validated_model_path = self.validate(spec)
         model_path = self.container_model_path(spec)
+        is_nemotron_h = _is_nemotron_h(validated_model_path)
         command = [
             "--model",
             model_path,
@@ -59,13 +92,23 @@ class VllmAdapter(RuntimeAdapter):
         ]
         if spec.max_batched_tokens is not None:
             command.extend(["--max-num-batched-tokens", str(spec.max_batched_tokens)])
-        template = chat_template_text(self.validate(spec))
-        tool_call_parser = match_parser(template, TOOL_CALL_PARSER_MARKERS)
+        if is_nemotron_h:
+            command.extend(NEMOTRON_H_FLAGS)
+        template = chat_template_text(validated_model_path)
+        tool_call_parser = (
+            "qwen3_coder"
+            if is_nemotron_h
+            else match_parser(template, TOOL_CALL_PARSER_MARKERS)
+        )
         if tool_call_parser:
             command.extend(
                 ["--enable-auto-tool-choice", "--tool-call-parser", tool_call_parser]
             )
-        reasoning_parser = match_parser(template, REASONING_PARSER_MARKERS)
+        reasoning_parser = (
+            "nemotron_v3"
+            if is_nemotron_h
+            else match_parser(template, REASONING_PARSER_MARKERS)
+        )
         if reasoning_parser:
             command.extend(["--reasoning-parser", reasoning_parser])
         if spec.quantization and spec.quantization != "auto":

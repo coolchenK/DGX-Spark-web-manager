@@ -74,7 +74,14 @@ def test_vllm_parser_keeps_transport_without_inventing_methods():
     )
 
     assert capabilities.speculative_transport == "json"
-    assert capabilities.speculative_methods == ["draft_model", "eagle", "eagle3", "mtp"]
+    assert capabilities.speculative_methods == [
+        "draft_model",
+        "dflash",
+        "dspark",
+        "eagle",
+        "eagle3",
+        "mtp",
+    ]
     assert capabilities.warnings
 
 

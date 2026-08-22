@@ -1923,6 +1923,63 @@ def test_vllm_detects_muse_glimmer_parsers(tmp_path):
     assert command[command.index("--reasoning-parser") + 1] == "muse_glimmer"
 
 
+def test_vllm_applies_nemotron_h_dgx_spark_profile(tmp_path):
+    model_path = tmp_path / "models" / "nemotron"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_path / "chat_template.jinja").write_text(
+        "<think><tool_call><function=name><parameter=key>", encoding="utf-8"
+    )
+    adapter = VllmAdapter(
+        allowed_images={"vllm/vllm-openai:v0.27.1"},
+        model_roots=(tmp_path / "models",),
+    )
+    spec = ResolvedDeploymentSpec(
+        name="NVIDIA Nemotron 3.5 Lightning",
+        model_path=str(model_path),
+        api_model_name="nemotron-3.5-lightning-30b",
+        runtime="vllm",
+        image="vllm/vllm-openai:v0.27.1",
+        context_length=1_048_576,
+        max_batched_tokens=16_384,
+        speculative={
+            "draft_model_id": "nvidia/nemotron-dspark",
+            "method": "dspark",
+            "num_speculative_tokens": 3,
+        },
+        resolved_draft_model_path=str(tmp_path / "models" / "nemotron-dspark"),
+        draft_container_model_path="/draft-models/nemotron-dspark",
+        speculative_runtime_method="dspark",
+    )
+
+    command = adapter.command(spec)
+
+    assert command[command.index("--max-model-len") + 1] == "1048576"
+    assert command[command.index("--max-num-batched-tokens") + 1] == "16384"
+    assert command[command.index("--moe-backend") + 1] == "marlin"
+    assert command[command.index("--kv-cache-dtype") + 1] == "fp8"
+    assert "--enable-prefix-caching" in command
+    assert command[command.index("--mamba-backend") + 1] == "flashinfer"
+    assert command[command.index("--mamba-cache-mode") + 1] == "align"
+    assert command[command.index("--mamba-ssm-cache-dtype") + 1] == "float16"
+    assert command[command.index("--tool-call-parser") + 1] == "qwen3_coder"
+    assert command[command.index("--reasoning-parser") + 1] == "nemotron_v3"
+    speculative = json.loads(command[command.index("--speculative-config") + 1])
+    assert speculative == {
+        "method": "dspark",
+        "model": "/draft-models/nemotron-dspark",
+        "num_speculative_tokens": 3,
+    }
+
+
 def test_runtime_commands_without_speculative_config_remain_unchanged(tmp_path):
     model_path = tmp_path / "models" / "qwen"
     model_path.mkdir(parents=True)

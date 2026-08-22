@@ -96,9 +96,9 @@ repository/image combination will pass capability and resource preflight.
 ## Speculative and Draft Model Support
 
 Both runtimes accept only methods present in the selected image capability snapshot. The common
-methods are `draft_model`, `eagle`, `eagle3`, and `mtp`; SGLang additionally supports `dflash` and
-`dspark` when its help output or bounded manifest exposes `DFLASH` or `DSPARK`. Transport and tuning
-differ:
+methods are `draft_model`, `eagle`, `eagle3`, and `mtp`; SGLang supports `dflash` and `dspark` when
+its help output or bounded manifest exposes `DFLASH` or `DSPARK`, while the bounded vLLM 0.27.x
+manifest exposes its native `dflash` and `dspark` loaders. Transport and tuning differ:
 
 | Runtime | Transport | Tuning accepted by the adapter |
 | --- | --- | --- |
@@ -115,6 +115,9 @@ SGLang also sizes hybrid GDN/Mamba state slots from deployment concurrency, sele
 `flashinfer_cutlass` for NVFP4 MoE checkpoints, and detects tool-call/reasoning parsers from local chat
 templates. vLLM performs the corresponding parser detection, including Muse Glimmer's `ATEM`
 tool-call format and `muse_glimmer` reasoning protocol when the dedicated ARM64 image is selected.
+Nemotron-H checkpoints additionally receive the official DGX Spark Marlin MoE, FP8 KV cache,
+FlashInfer Mamba, aligned Mamba cache, prefix-cache, `nemotron_v3` reasoning, and `qwen3_coder`
+tool-call settings.
 Deployment-level
 `chat_template_kwargs` can set template defaults such as thinking mode and reasoning effort.
 
