@@ -435,6 +435,27 @@ def test_deployment_inventory_serializes_tps_benchmark(authenticated_client):
     assert item["benchmark_error"] is None
 
 
+def test_model_inventory_serializes_latest_successful_tps(authenticated_client):
+    tested_at = datetime(2026, 8, 23, 2, 3, 4, tzinfo=UTC)
+    with authenticated_client.app.state.database.session_factory() as db:
+        model = ModelAsset(
+            name="Benchmarked model",
+            local_path="/models/benchmarked-model",
+            benchmark_tps=123.456,
+            benchmark_tested_at=tested_at,
+        )
+        db.add(model)
+        db.commit()
+        model_id = model.id
+
+    response = authenticated_client.get("/api/models")
+
+    assert response.status_code == 200
+    item = next(value for value in response.json() if value["id"] == model_id)
+    assert item["benchmark_tps"] == 123.456
+    assert item["benchmark_tested_at"] == "2026-08-23T02:03:04"
+
+
 def test_deployment_spec_serializes_recommendation_settings(tmp_path):
     spec = DeploymentSpec.model_validate(valid_spec_payload(tmp_path))
 
@@ -2427,6 +2448,10 @@ def test_create_handler_benchmarks_and_persists_tps_after_health(tmp_path, monke
         assert deployment.benchmark_duration_seconds == 6.077
         assert deployment.benchmark_tested_at is not None
         assert deployment.benchmark_error is None
+        model = db.get(ModelAsset, model_id)
+        assert model is not None
+        assert model.benchmark_tps == 42.125
+        assert model.benchmark_tested_at == deployment.benchmark_tested_at
 
 
 def test_create_handler_keeps_healthy_deployment_when_tps_benchmark_fails(
@@ -2435,8 +2460,14 @@ def test_create_handler_keeps_healthy_deployment_when_tps_benchmark_fails(
     root = tmp_path / "models"
     database = Database(f"sqlite:///{tmp_path / 'benchmark-failure.db'}")
     database.create_schema()
+    previous_tested_at = datetime(2026, 8, 22, 1, 2, 3, tzinfo=UTC)
     with database.session_factory() as db:
-        target = add_model_asset(db, root / "base")
+        target = add_model_asset(
+            db,
+            root / "base",
+            benchmark_tps=12.5,
+            benchmark_tested_at=previous_tested_at,
+        )
         model_id = target.id
 
     def benchmark_runner(_endpoint, _api_model_name, _runtime):
@@ -2493,6 +2524,10 @@ def test_create_handler_keeps_healthy_deployment_when_tps_benchmark_fails(
         assert deployment.benchmark_status == "failed"
         assert deployment.benchmark_tps is None
         assert deployment.benchmark_error == "benchmark endpoint returned 500"
+        model = db.get(ModelAsset, model_id)
+        assert model is not None
+        assert model.benchmark_tps == 12.5
+        assert model.benchmark_tested_at == previous_tested_at.replace(tzinfo=None)
 
 
 def test_tps_benchmark_uses_warmup_and_completion_token_throughput(monkeypatch):

@@ -44,6 +44,8 @@ class ModelAsset(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="available", index=True)
     capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    benchmark_tps: Mapped[float | None] = mapped_column(Float)
+    benchmark_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     deployments: Mapped[list[Deployment]] = relationship(back_populates="model")
 

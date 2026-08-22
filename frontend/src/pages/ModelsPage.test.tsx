@@ -28,6 +28,8 @@ const models: ModelAsset[] = [
     size_bytes: 7 * GiB,
     status: 'available',
     capabilities: ['chat'],
+    benchmark_tps: 42.125,
+    benchmark_tested_at: '2026-08-23T01:02:03Z',
     created_at: '2026-08-16T00:00:00Z',
     updated_at: '2026-08-16T00:00:00Z',
   },
@@ -46,6 +48,8 @@ const models: ModelAsset[] = [
     size_bytes: 3 * GiB,
     status: 'available',
     capabilities: ['generate'],
+    benchmark_tps: null,
+    benchmark_tested_at: null,
     created_at: '2026-08-16T00:00:00Z',
     updated_at: '2026-08-16T00:00:00Z',
   },
@@ -161,6 +165,34 @@ describe('ModelsPage permanent deletion', () => {
     expect(within(record as HTMLElement).getByRole('button', { name: `删除模型 ${draft.name}` })).toBeInTheDocument()
   })
 
+  it('attaches a DSpark repository to its quantized base lineage', async () => {
+    const stem = 'RadixArk/Qwen3.8-27B'
+    const base: ModelAsset = {
+      ...models[0],
+      id: 'radix-base',
+      name: `${stem}-NVFP4`,
+      repository_id: `${stem}-NVFP4`,
+      benchmark_tps: 67.08,
+    }
+    const draft: ModelAsset = {
+      ...models[0],
+      id: 'radix-draft',
+      name: `${stem}-DSpark`,
+      repository_id: `${stem}-DSpark`,
+      benchmark_tps: null,
+      benchmark_tested_at: null,
+      capabilities: [],
+    }
+    renderModelsPage([base, draft])
+
+    const record = (await screen.findByText(`${stem}-NVFP4`, { selector: 'strong' })).closest('.mobile-record')
+    expect(record).not.toBeNull()
+    expect(within(record as HTMLElement).getByText('Draft · DSpark')).toBeInTheDocument()
+    expect(within(record as HTMLElement).getByText('67.08 tok/s')).toBeInTheDocument()
+    expect(within(record as HTMLElement).getAllByRole('button', { name: /部署模型/ })).toHaveLength(1)
+    expect(screen.queryByText(`${stem}-DSpark`, { selector: 'strong' })).not.toBeInTheDocument()
+  })
+
   it('distinguishes a local variant from an incomplete Hub cache with the same repository', async () => {
     const repository = 'DavidAU/Qwen3.5-9B-Cold-Fusion-GAIN-v1.0-Uncensored-Heretic-NEO-MAX-Imatrix-GGUF'
     const hubCache: ModelAsset = {
@@ -200,6 +232,10 @@ describe('ModelsPage permanent deletion', () => {
     expect(await screen.findByRole('button', { name: '删除模型 Qwen/Qwen-Test' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '删除模型 Local Model' })).toBeInTheDocument()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
+    const tested = screen.getByText('Qwen/Qwen-Test', { selector: 'strong' }).closest('.mobile-record')
+    const untested = screen.getByText('Local Model', { selector: 'strong' }).closest('.mobile-record')
+    expect(within(tested as HTMLElement).getByText('42.13 tok/s')).toBeInTheDocument()
+    expect(within(untested as HTMLElement).getByText('未测试')).toBeInTheDocument()
   })
 
   it('offers delete actions in the desktop model table', async () => {
@@ -216,6 +252,8 @@ describe('ModelsPage permanent deletion', () => {
     renderModelsPage()
 
     const table = await screen.findByRole('table')
+    expect(within(table).getByRole('columnheader', { name: 'TPS' })).toBeInTheDocument()
+    expect(within(table).getByText('42.13 tok/s')).toBeInTheDocument()
     expect(within(table).getByRole('button', { name: '删除模型 Qwen/Qwen-Test' })).toBeInTheDocument()
     expect(within(table).getByRole('button', { name: '删除模型 Local Model' })).toBeInTheDocument()
   })

@@ -15,7 +15,9 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Validated SGLang, vLLM, and llama.cpp deployment adapters with image and argument allowlists.
 - Deployment preview, edit, clone, health-gated replacement, automatic rollback, and retained task history.
 - Automatic post-deployment warmup and TPS benchmarking with persistent results shown in desktop
-  and mobile deployment views; benchmark failures are recorded without rolling back healthy services.
+  and mobile deployment views. The latest successful result is also retained on the model asset and
+  shown in the model library after a deployment is uninstalled; benchmark failures are recorded
+  without rolling back healthy services or replacing the last successful model result.
 - Automatic host-port allocation starts at `8000`, checks both Manager reservations and Docker
   bindings, reuses the lowest released gap, and keeps the Docker port, endpoint, database row,
   persisted spec, and ownership label consistent. Explicit ports are validated for conflicts.

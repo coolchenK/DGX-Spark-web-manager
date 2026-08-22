@@ -36,6 +36,8 @@ def list_models(db: DbSession, _: Admin) -> list[dict[str, Any]]:
             "size_bytes": item.size_bytes,
             "status": item.status,
             "capabilities": item.capabilities,
+            "benchmark_tps": item.benchmark_tps,
+            "benchmark_tested_at": item.benchmark_tested_at,
             "created_at": item.created_at,
             "updated_at": item.updated_at,
         }

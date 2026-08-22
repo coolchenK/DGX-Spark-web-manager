@@ -1046,6 +1046,11 @@ class DeploymentService:
                     deployment.benchmark_duration_seconds = benchmark["duration_seconds"]
                     deployment.benchmark_tested_at = tested_at
                     deployment.benchmark_error = None
+                    if deployment.model_id is not None:
+                        model = db.get(ModelAsset, deployment.model_id)
+                        if model is not None:
+                            model.benchmark_tps = benchmark["tps"]
+                            model.benchmark_tested_at = tested_at
                     db.commit()
             context.update(
                 progress=99,

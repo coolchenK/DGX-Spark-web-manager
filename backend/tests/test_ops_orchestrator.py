@@ -403,6 +403,10 @@ def test_fresh_database_upgrades_directly_to_head(tmp_path, monkeypatch):
             "benchmark_tested_at",
             "benchmark_error",
         } <= deployment_columns
+        model_columns = {
+            column["name"] for column in inspector.get_columns("model_assets")
+        }
+        assert {"benchmark_tps", "benchmark_tested_at"} <= model_columns
         assert "ix_request_metrics_created_at" in {
             index["name"] for index in inspector.get_indexes("request_metrics")
         }
@@ -412,7 +416,7 @@ def test_fresh_database_upgrades_directly_to_head(tmp_path, monkeypatch):
             _foreign_key_ondelete(inspector, "operation_plans", "deployment_id") == "SET NULL"
         )
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260823_0003"
+            "20260823_0004"
         )
     database.dispose()
 
@@ -444,6 +448,62 @@ def test_deployment_benchmark_columns_upgrade_downgrade_cycle(tmp_path, monkeypa
     command.downgrade(config, "20260817_0002")
     with database.engine.connect() as connection:
         columns = {column["name"] for column in inspect(connection).get_columns("deployments")}
+        assert not expected & columns
+    database.dispose()
+
+
+def test_model_benchmark_columns_backfill_latest_success_and_downgrade(
+    tmp_path, monkeypatch
+):
+    database_url = f"sqlite:///{tmp_path / 'model-benchmarks.db'}"
+    monkeypatch.setenv("DGX_DATABASE_URL", database_url)
+    config = _alembic_config(database_url)
+    expected = {"benchmark_tps", "benchmark_tested_at"}
+
+    command.upgrade(config, "20260823_0003")
+    database = _database(tmp_path / "model-benchmarks.db")
+    with database.engine.begin() as connection:
+        _insert_legacy_model(connection, "benchmarked-model")
+        _insert_legacy_deployment(connection, "older-benchmark", "benchmarked-model")
+        _insert_legacy_deployment(connection, "newer-benchmark", "benchmarked-model")
+        connection.execute(
+            text(
+                "UPDATE deployments SET benchmark_status = 'succeeded', "
+                "benchmark_tps = :tps, benchmark_tested_at = :tested_at "
+                "WHERE id = :id"
+            ),
+            [
+                {
+                    "id": "older-benchmark",
+                    "tps": 45.0,
+                    "tested_at": "2026-08-22 01:00:00",
+                },
+                {
+                    "id": "newer-benchmark",
+                    "tps": 78.5,
+                    "tested_at": "2026-08-23 01:00:00",
+                },
+            ],
+        )
+        columns = {column["name"] for column in inspect(connection).get_columns("model_assets")}
+        assert not expected & columns
+
+    command.upgrade(config, "head")
+    with database.engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("model_assets")}
+        assert expected <= columns
+        result = connection.execute(
+            text(
+                "SELECT benchmark_tps, benchmark_tested_at FROM model_assets "
+                "WHERE id = 'benchmarked-model'"
+            )
+        ).one()
+        assert result.benchmark_tps == 78.5
+        assert str(result.benchmark_tested_at) == "2026-08-23 01:00:00"
+
+    command.downgrade(config, "20260823_0003")
+    with database.engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("model_assets")}
         assert not expected & columns
     database.dispose()
 

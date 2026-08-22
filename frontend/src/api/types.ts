@@ -39,6 +39,8 @@ export interface ModelAsset {
   size_bytes: number
   status: string
   capabilities: string[]
+  benchmark_tps: number | null
+  benchmark_tested_at: string | null
   created_at: string
   updated_at: string
 }

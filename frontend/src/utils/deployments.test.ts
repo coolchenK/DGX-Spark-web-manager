@@ -74,7 +74,8 @@ const model: ModelAsset = {
   repository_id: 'Qwen/Qwen2.5', revision: 'main', commit_hash: 'abc',
   local_path: '/models/qwen', format: 'safetensors', quantization: null,
   parameter_count: '0.5B', size_bytes: 1, status: 'available',
-  capabilities: ['chat'], created_at: '', updated_at: '',
+  capabilities: ['chat'], benchmark_tps: null, benchmark_tested_at: null,
+  created_at: '', updated_at: '',
 }
 
 

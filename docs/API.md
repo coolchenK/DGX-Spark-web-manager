@@ -76,6 +76,10 @@ an otherwise healthy deployment.
 `benchmark_tested_at`, and `benchmark_error`. Historical or discovered deployments without a result
 return `null` benchmark values.
 
+`GET /api/models` exposes the latest successful result as `benchmark_tps` and
+`benchmark_tested_at`. A successful later benchmark replaces these model-level values. Failed tests
+leave the previous successful result unchanged, and uninstalling a deployment does not erase it.
+
 ### Deployment lifecycle actions
 
 `POST /api/deployments/{id}/stop` stops an inference instance and immediately removes it from

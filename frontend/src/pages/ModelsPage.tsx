@@ -1,4 +1,4 @@
-import { AppstoreAddOutlined, DeleteOutlined, ReloadOutlined, RocketOutlined } from '@ant-design/icons'
+import { AppstoreAddOutlined, DashboardOutlined, DeleteOutlined, ReloadOutlined, RocketOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Alert, Button, Descriptions, Flex, Input, Modal, Space, Tag, Tooltip, Typography, message } from 'antd'
 import { useMemo, useRef, useState } from 'react'
@@ -21,15 +21,20 @@ interface ModelFamily {
   primary: ModelAsset
 }
 
-const DRAFT_ASSET_SUFFIX = /[-_]d(?:spark|flash)$/i
+const DRAFT_ASSET_SUFFIX = /[-_](d(?:spark|flash))$/i
+const BASE_VARIANT_SUFFIX = /[-_](?:nvfp4|fp8|fp4|awq)$/i
 
 function isDraftAsset(model: ModelAsset): boolean {
   return DRAFT_ASSET_SUFFIX.test(model.repository_id ?? model.name)
 }
 
 function modelFamilyKey(model: ModelAsset): string {
+  return modelFamilyStem(model).toLowerCase()
+}
+
+function modelFamilyStem(model: ModelAsset): string {
   const identity = model.repository_id ?? model.name
-  return identity.trim().replace(DRAFT_ASSET_SUFFIX, '').toLowerCase()
+  return identity.trim().replace(DRAFT_ASSET_SUFFIX, '').replace(BASE_VARIANT_SUFFIX, '')
 }
 
 function modelFamilyName(model: ModelAsset): string {
@@ -43,7 +48,35 @@ function variantLabel(model: ModelAsset, familyName: string): string {
     if (model.name !== familyName) return model.name.split('/').pop() || model.name
     return model.status === 'unavailable' ? 'HF 缓存' : '基础模型'
   }
-  return identity.slice(familyName.length).replace(/^[-_]/, '') || '变体'
+  const draftSuffix = identity.match(DRAFT_ASSET_SUFFIX)?.[1]
+  if (draftSuffix) return draftSuffix.replace(/^d/i, 'D')
+  return identity.slice(modelFamilyStem(model).length).replace(/^[-_]/, '') || '变体'
+}
+
+function modelBenchmark(model: ModelAsset) {
+  if (model.benchmark_tps == null) {
+    return <Typography.Text type="secondary">未测试</Typography.Text>
+  }
+  return (
+    <Tooltip title={model.benchmark_tested_at ? `最近测试：${formatDate(model.benchmark_tested_at)}` : '最近一次成功测试'}>
+      <Typography.Text strong><DashboardOutlined /> {model.benchmark_tps.toFixed(2)} tok/s</Typography.Text>
+    </Tooltip>
+  )
+}
+
+function familyBenchmark(family: ModelFamily) {
+  if (family.baseVariants.length <= 1) {
+    return family.baseVariants[0]
+      ? modelBenchmark(family.baseVariants[0])
+      : <Typography.Text type="secondary">未测试</Typography.Text>
+  }
+  return (
+    <Space direction="vertical" size={0}>
+      {family.baseVariants.map((variant) => (
+        <span key={variant.id}>{variantLabel(variant, family.name)}: {modelBenchmark(variant)}</span>
+      ))}
+    </Space>
+  )
 }
 
 
@@ -141,9 +174,10 @@ export function ModelsPage() {
           { title: '来源', dataIndex: 'source', width: 120, render: (_, item) => <Tag>{item.primary.source}</Tag> },
           { title: '大小', dataIndex: 'size_bytes', width: 140, render: (_, item) => <Space direction="vertical" size={0}>{item.baseVariants.map((variant) => <span key={variant.id}>{variantLabel(variant, item.name)}: {sizeLabel(variant)}</span>)}{item.draftVariants.map((variant) => <Typography.Text type="secondary" key={variant.id}>Draft: {sizeLabel(variant)}</Typography.Text>)}</Space> },
           { title: '能力', dataIndex: 'capabilities', render: (_, item) => <Space size={[2, 4]} wrap>{[...new Set(item.variants.flatMap((variant) => variant.capabilities))].map((value) => <Tag key={value}>{value}</Tag>)}</Space> },
+          { title: 'TPS', dataIndex: 'benchmark_tps', width: 180, render: (_, item) => familyBenchmark(item) },
           { title: '状态', dataIndex: 'status', width: 100, render: (_, item) => <StatusBadge status={item.primary.status} /> },
           { title: '', width: 180, render: (_, item) => <Space direction="vertical" size="small">{item.baseVariants.map((variant) => <Space size="small" key={variant.id}><Button size="small" icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Space>)}{item.draftVariants.map((variant) => <Space size="small" key={variant.id}><Tag color="blue">Draft · {variantLabel(variant, item.name)}</Tag>{deleteButton(variant)}</Space>)}</Space> },
-        ]} renderMobile={(item) => <div className="mobile-record"><Flex justify="space-between"><Space><AppstoreAddOutlined /><strong>{item.name}</strong></Space><StatusBadge status={item.primary.status} /></Flex><Typography.Text type="secondary">{item.variants.length > 1 ? `${item.variants.length} 个相关变体已合并` : (item.primary.repository_id ?? item.primary.local_path)}</Typography.Text><dl><div><dt>大小</dt><dd><Space direction="vertical" size={0}>{item.baseVariants.map((variant) => <span key={variant.id}>{variantLabel(variant, item.name)}: {sizeLabel(variant)}</span>)}{item.draftVariants.map((variant) => <Typography.Text type="secondary" key={variant.id}>Draft: {sizeLabel(variant)}</Typography.Text>)}</Space></dd></div><div><dt>更新</dt><dd>{formatDate(item.primary.updated_at)}</dd></div></dl><Space direction="vertical" style={{ width: '100%' }}>{item.baseVariants.map((variant) => <Flex gap="small" key={variant.id}><Button block icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署模型 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Flex>)}{item.draftVariants.map((variant) => <Flex align="center" justify="space-between" key={variant.id}><Tag color="blue">Draft · {variantLabel(variant, item.name)}</Tag>{deleteButton(variant)}</Flex>)}</Space></div>} />
+        ]} renderMobile={(item) => <div className="mobile-record"><Flex justify="space-between"><Space><AppstoreAddOutlined /><strong>{item.name}</strong></Space><StatusBadge status={item.primary.status} /></Flex><Typography.Text type="secondary">{item.variants.length > 1 ? `${item.variants.length} 个相关变体已合并` : (item.primary.repository_id ?? item.primary.local_path)}</Typography.Text><dl><div><dt>大小</dt><dd><Space direction="vertical" size={0}>{item.baseVariants.map((variant) => <span key={variant.id}>{variantLabel(variant, item.name)}: {sizeLabel(variant)}</span>)}{item.draftVariants.map((variant) => <Typography.Text type="secondary" key={variant.id}>Draft: {sizeLabel(variant)}</Typography.Text>)}</Space></dd></div><div><dt>TPS</dt><dd>{familyBenchmark(item)}</dd></div><div><dt>更新</dt><dd>{formatDate(item.primary.updated_at)}</dd></div></dl><Space direction="vertical" style={{ width: '100%' }}>{item.baseVariants.map((variant) => <Flex gap="small" key={variant.id}><Button block icon={<RocketOutlined />} disabled={variant.status !== 'available'} onClick={() => navigate(`/deployments?model=${variant.id}`)}>部署模型 {variantLabel(variant, item.name)}</Button>{deleteButton(variant)}</Flex>)}{item.draftVariants.map((variant) => <Flex align="center" justify="space-between" key={variant.id}><Tag color="blue">Draft · {variantLabel(variant, item.name)}</Tag>{deleteButton(variant)}</Flex>)}</Space></div>} />
       </QueryState>
       <Modal
         title="永久删除模型"
