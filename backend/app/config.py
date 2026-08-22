@@ -39,7 +39,9 @@ class Settings(BaseSettings):
     recommendation_card_max_chars: int = Field(default=100_000, ge=10_000, le=500_000)
     memory_reserve_fraction: float = Field(default=0.10, ge=0.05, le=0.30)
     memory_reserve_min_bytes: int = Field(default=8 * 1024**3, ge=1024**3)
-    allowed_vllm_images: str = "vllm/vllm-openai:v0.27.1"
+    allowed_vllm_images: str = (
+        "vllm/vllm-openai:v0.27.1,vllm/vllm-openai:muse-glimmer"
+    )
     allowed_sglang_images: str = (
         "dgx-local/sglang-qwen38-dflash2:61fa64a,lmsysorg/sglang:qwen38-27b,"
         "sglang-inkling:specforge,"

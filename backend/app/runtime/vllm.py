@@ -17,6 +17,8 @@ from app.runtime.base import (
 # the same parser), against SGLang's qwen3_coder. Ordering matters, since the
 # XML markers are a superset of the bare-JSON ones.
 TOOL_CALL_PARSER_MARKERS = (
+    # Onyx ATEM function-call blocks used by Muse Glimmer.
+    ("muse_glimmer", ("<atem:function_calls>", "<atem:invoke name=")),
     # <tool_call><function=name><parameter=key>value</parameter></function>
     ("qwen3_xml", ("<tool_call>", "<function=", "<parameter=")),
     # <function name="fn"><param name="k">v</param></function> -- MiniCPM5's
@@ -28,7 +30,10 @@ TOOL_CALL_PARSER_MARKERS = (
     ("hermes", ("<tool_call>",)),
 )
 
-REASONING_PARSER_MARKERS = (("qwen3", ("<think>",)),)
+REASONING_PARSER_MARKERS = (
+    ("muse_glimmer", ("<|start|>assistant to=self<|message|>",)),
+    ("qwen3", ("<think>",)),
+)
 
 
 class VllmAdapter(RuntimeAdapter):

@@ -1896,6 +1896,33 @@ def test_runtime_commands_detect_model_specific_parsers_and_memory_flags(tmp_pat
     assert vllm_command[vllm_command.index("--reasoning-parser") + 1] == "qwen3"
 
 
+def test_vllm_detects_muse_glimmer_parsers(tmp_path):
+    model_path = tmp_path / "models" / "muse"
+    model_path.mkdir(parents=True)
+    (model_path / "chat_template.jinja").write_text(
+        "<atem:function_calls><atem:invoke name=\"tool\">"
+        "<|start|>assistant to=self<|message|>",
+        encoding="utf-8",
+    )
+    adapter = VllmAdapter(
+        allowed_images={"vllm/vllm-openai:muse-glimmer"},
+        model_roots=(tmp_path / "models",),
+    )
+    spec = DeploymentSpec(
+        name="Muse Glimmer",
+        model_path=str(model_path),
+        api_model_name="muse-glimmer",
+        runtime="vllm",
+        image="vllm/vllm-openai:muse-glimmer",
+    )
+
+    command = adapter.command(spec)
+
+    assert "--enable-auto-tool-choice" in command
+    assert command[command.index("--tool-call-parser") + 1] == "muse_glimmer"
+    assert command[command.index("--reasoning-parser") + 1] == "muse_glimmer"
+
+
 def test_runtime_commands_without_speculative_config_remain_unchanged(tmp_path):
     model_path = tmp_path / "models" / "qwen"
     model_path.mkdir(parents=True)

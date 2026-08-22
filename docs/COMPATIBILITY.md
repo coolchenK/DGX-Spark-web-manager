@@ -39,6 +39,7 @@ Only verified adapters are offered in the deployment wizard. Upstream availabili
 is not treated as DGX Spark compatibility evidence.
 
 The current allowlist defaults include `vllm/vllm-openai:v0.27.1`,
+`vllm/vllm-openai:muse-glimmer`,
 `dgx-local/sglang-qwen38-dflash2:61fa64a`, `lmsysorg/sglang:qwen38-27b`, `sglang-inkling:specforge`,
 `lmsysorg/sglang:dev-cu13-inkling-dspark`, and the CUDA 12.9 development image used with the
 server-managed llama.cpp runtime mount. An image must be locally available, ARM64/CUDA compatible,
@@ -112,7 +113,9 @@ mounted local Hugging Face cache, so offline runtime containers do not redownloa
 
 SGLang also sizes hybrid GDN/Mamba state slots from deployment concurrency, selects
 `flashinfer_cutlass` for NVFP4 MoE checkpoints, and detects tool-call/reasoning parsers from local chat
-templates. vLLM performs the corresponding parser detection. Deployment-level
+templates. vLLM performs the corresponding parser detection, including Muse Glimmer's `ATEM`
+tool-call format and `muse_glimmer` reasoning protocol when the dedicated ARM64 image is selected.
+Deployment-level
 `chat_template_kwargs` can set template defaults such as thinking mode and reasoning effort.
 
 Draft candidates must be separate available local assets with readable evidence and paths. Explicit
