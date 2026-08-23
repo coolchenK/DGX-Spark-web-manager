@@ -555,6 +555,19 @@ def _read_json_dict(model_root: Path, filename: str, warnings: list[str]) -> dic
     return value
 
 
+def _safe_nonempty_model_file_exists(
+    model_root: Path, filename: str, warnings: list[str]
+) -> bool:
+    try:
+        with _open_model_file(model_root, filename) as stream:
+            return os.fstat(stream.fileno()).st_size > 0
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        warnings.append(f"{filename} is not a safe regular file")
+        return False
+
+
 def _read_card(model_root: Path, max_chars: int, warnings: list[str]) -> str:
     payload, status = _read_model_file(model_root, "README.md", max_chars * 4 + 1)
     if status == "missing":
@@ -898,8 +911,11 @@ class ModelEvidenceLoader:
         targets = _target_model_ids(card_data)
         method = _speculative_method(card_data)
         weight_map = weight_index.get("weight_map")
-        embedded_mtp_available = isinstance(weight_map, dict) and any(
-            isinstance(key, str) and key.startswith("mtp.") for key in weight_map
+        embedded_mtp_available = (
+            isinstance(weight_map, dict)
+            and any(isinstance(key, str) and key.startswith("mtp.") for key in weight_map)
+        ) or _safe_nonempty_model_file_exists(
+            evidence_root, "model-mtp.safetensors", warnings
         )
         hash_payload = {
             "config": config,

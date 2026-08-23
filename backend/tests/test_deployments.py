@@ -1616,6 +1616,42 @@ def test_vllm_command_includes_batch_and_quantization_settings(tmp_path):
     assert command[command.index("--quantization") + 1] == "fp8"
 
 
+def test_vllm_qwen35_nvfp4_uses_model_card_blackwell_settings(tmp_path):
+    model_path = tmp_path / "models" / "ornith"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "format": "nvfp4-pack-quantized",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter = VllmAdapter(
+        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
+    )
+    spec = DeploymentSpec(
+        name="Ornith",
+        model_path=str(model_path),
+        api_model_name="ornith",
+        runtime="vllm",
+        image="vllm:test",
+    )
+
+    command = adapter.command(spec)
+
+    assert command[command.index("--generation-config") + 1] == "auto"
+    assert adapter.environment(spec) == {
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        "VLLM_USE_TRITON_FP8_GEMM": "1",
+    }
+
+
 def test_chat_template_kwargs_are_bounded_and_serialized_canonically(tmp_path):
     model_path = tmp_path / "models" / "qwen"
     model_path.mkdir(parents=True)

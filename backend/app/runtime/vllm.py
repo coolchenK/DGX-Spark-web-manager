@@ -67,13 +67,49 @@ def _is_nemotron_h(model_path) -> bool:
     )
 
 
+def _is_qwen35_nvfp4(model_path) -> bool:
+    """Detect the Qwen3.5 compressed-tensors NVFP4 builds that need the
+    Blackwell launch settings documented by their model cards."""
+    config = model_path / "config.json"
+    if not config.is_file():
+        return False
+    try:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    architectures = payload.get("architectures") or []
+    is_qwen35 = payload.get("model_type") == "qwen3_5" or any(
+        str(name).lower().startswith("qwen3_5") for name in architectures
+    )
+    quantization = payload.get("quantization_config") or {}
+    if not is_qwen35 or not isinstance(quantization, dict):
+        return False
+    quantization_text = json.dumps(quantization, sort_keys=True).lower()
+    return (
+        quantization.get("quant_method") == "compressed-tensors"
+        and "nvfp4" in quantization_text
+    )
+
+
 class VllmAdapter(RuntimeAdapter):
     runtime = "vllm"
+
+    def environment(self, spec: DeploymentSpec) -> dict[str, str]:
+        model_path = self.validate(spec)
+        if not _is_qwen35_nvfp4(model_path):
+            return {}
+        return {
+            "VLLM_USE_FLASHINFER_SAMPLER": "0",
+            "VLLM_USE_TRITON_FP8_GEMM": "1",
+        }
 
     def command(self, spec: DeploymentSpec) -> list[str]:
         validated_model_path = self.validate(spec)
         model_path = self.container_model_path(spec)
         is_nemotron_h = _is_nemotron_h(validated_model_path)
+        is_qwen35_nvfp4 = _is_qwen35_nvfp4(validated_model_path)
         command = [
             "--model",
             model_path,
@@ -92,6 +128,8 @@ class VllmAdapter(RuntimeAdapter):
         ]
         if spec.max_batched_tokens is not None:
             command.extend(["--max-num-batched-tokens", str(spec.max_batched_tokens)])
+        if is_qwen35_nvfp4:
+            command.extend(["--generation-config", "auto"])
         if is_nemotron_h:
             command.extend(NEMOTRON_H_FLAGS)
         template = chat_template_text(validated_model_path)

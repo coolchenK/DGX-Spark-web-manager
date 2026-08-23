@@ -129,6 +129,17 @@ def test_model_evidence_detects_embedded_mtp_weights(tmp_path):
     assert evidence.embedded_mtp_available is True
 
 
+def test_model_evidence_detects_embedded_mtp_sidecar(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    (model / "model-mtp.safetensors").write_bytes(b"mtp-weights")
+
+    evidence = ModelEvidenceLoader().load(model)
+
+    assert evidence.embedded_mtp_available is True
+
+
 def test_model_card_commands_never_return_unknown_flags_or_values(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
