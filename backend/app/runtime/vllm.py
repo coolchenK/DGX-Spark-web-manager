@@ -131,10 +131,9 @@ class VllmAdapter(RuntimeAdapter):
                 raise ValueError(
                     "resolved runtime method does not match speculative method"
                 )
-            payload: dict[str, str | int] = {
-                "method": runtime_method,
-                "model": require_draft_container_path(spec),
-            }
+            payload: dict[str, str | int] = {"method": runtime_method}
+            if spec.speculative.draft_model_id is not None:
+                payload["model"] = require_draft_container_path(spec)
             if spec.speculative.num_speculative_tokens is not None:
                 payload["num_speculative_tokens"] = (
                     spec.speculative.num_speculative_tokens

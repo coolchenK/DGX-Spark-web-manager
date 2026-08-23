@@ -27,7 +27,7 @@ export type QuantizationMethod =
   | 'compressed-tensors'
 
 export interface SpeculativeSettings {
-  draft_model_id: string
+  draft_model_id?: string
   method: 'draft_model' | 'dflash' | 'dspark' | 'eagle' | 'eagle3' | 'mtp'
   num_speculative_tokens?: number
   num_steps?: number
@@ -133,12 +133,15 @@ function normalizeChatTemplateKwargs(
 
 function normalizeSpeculativeSettings(value: unknown): SpeculativeSettings | null {
   const saved = objectValue(value)
-  if (!saved || typeof saved.draft_model_id !== 'string') return null
+  if (!saved) return null
   if (!['draft_model', 'dflash', 'dspark', 'eagle', 'eagle3', 'mtp'].includes(String(saved.method))) {
     return null
   }
+  if (saved.method !== 'mtp' && typeof saved.draft_model_id !== 'string') return null
   const normalized: SpeculativeSettings = {
-    draft_model_id: saved.draft_model_id,
+    ...(typeof saved.draft_model_id === 'string'
+      ? { draft_model_id: saved.draft_model_id }
+      : {}),
     method: saved.method as SpeculativeSettings['method'],
     manual_review_acknowledged: saved.manual_review_acknowledged === true,
   }

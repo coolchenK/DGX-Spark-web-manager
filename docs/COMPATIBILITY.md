@@ -102,7 +102,7 @@ manifest exposes its native `dflash` and `dspark` loaders. Transport and tuning 
 
 | Runtime | Transport | Tuning accepted by the adapter |
 | --- | --- | --- |
-| vLLM | One JSON value passed to `--speculative-config` | Optional `num_speculative_tokens` (1-64); SGLang grouped fields are rejected |
+| vLLM | One JSON value passed to `--speculative-config` | Optional `num_speculative_tokens` (1-64); embedded `mtp.*` heads omit the external model path; SGLang grouped fields are rejected |
 | SGLang | `--speculative-algorithm` and `--speculative-draft-model-path` flags | DFlash uses `num_draft_tokens` alone; EAGLE-style methods use `num_steps` (1-32), `eagle_top_k` (1-32), and `num_draft_tokens` (1-256), set together or all omitted; `num_speculative_tokens` is rejected; DSpark adds its validated DGX Spark flags |
 | llama.cpp | Dedicated GGUF settings | Optional same-model `draft-mtp` with `mtp_tokens` (1-64); external Draft Model settings are rejected |
 
@@ -110,6 +110,9 @@ Method mappings are resolved from the capability snapshot. The SGLang adapter ma
 `STANDALONE`, `dflash` to `DFLASH`, `dspark` to `DSPARK`, `eagle` to `EAGLE`, `eagle3` to `EAGLE3`, and `mtp` to `NEXTN`;
 a missing or mismatched mapping fails preview. DSpark repository IDs are resolved against the
 mounted local Hugging Face cache, so offline runtime containers do not redownload the Draft Model.
+For vLLM embedded MTP, the Manager verifies `mtp.*` entries in the local safetensors index before
+preview and reuses the base model mount; an arbitrary browser request cannot enable MTP for a model
+that does not carry the required head.
 
 SGLang also sizes hybrid GDN/Mamba state slots from deployment concurrency, selects
 `flashinfer_cutlass` for NVFP4 MoE checkpoints, and detects tool-call/reasoning parsers from local chat

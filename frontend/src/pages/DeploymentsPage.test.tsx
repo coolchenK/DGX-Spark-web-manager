@@ -1303,6 +1303,46 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     })
   })
 
+  it('submits an embedded MTP configuration without an external Draft Model', async () => {
+    const { user, postSpy } = renderDeploymentsPage({
+      recommendations: async (_path, body) => recommendationFixture({
+        model_id: String(body.model_id),
+        embedded_mtp_available: true,
+        speculative_defaults: {
+          num_speculative_tokens: {
+            value: 6,
+            source: 'model_card',
+            confidence: 'high',
+            reason: '模型卡推荐 MTP n=6',
+            warning: null,
+          },
+        },
+        draft_candidates: [],
+        runtime_capabilities: {
+          ...recommendationFixture().runtime_capabilities,
+          speculative_methods: ['mtp'],
+          method_mapping: { mtp: 'mtp' },
+        },
+      }),
+    })
+    await openCreateAndSelectModel(user)
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /内置 MTP Head/ }))
+
+    expect(screen.getByLabelText('每轮推测 Token')).toHaveValue('6')
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await screen.findByRole('heading', { name: '部署预览' })
+
+    const payload = postSpy.mock.calls.find(
+      ([path]) => String(path).startsWith('/api/deployments/preview'),
+    )?.[1] as Record<string, unknown>
+    expect(payload.speculative).toEqual({
+      method: 'mtp',
+      num_speculative_tokens: 6,
+      manual_review_acknowledged: false,
+    })
+  })
+
   it('rejects an out-of-range vLLM speculative token value before preview', async () => {
     const { user, postSpy } = renderDeploymentsPage()
     await openCreateAndSelectModel(user)

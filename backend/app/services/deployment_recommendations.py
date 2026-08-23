@@ -197,6 +197,7 @@ class DeploymentRecommendation(BaseModel):
     fields: dict[str, RecommendedValue]
     generation_defaults: dict[str, RecommendedValue]
     speculative_defaults: dict[str, RecommendedValue] = Field(default_factory=dict)
+    embedded_mtp_available: bool = False
     resource_snapshot: dict[str, Any]
     resource_estimate: dict[str, Any]
     runtime_capabilities: dict[str, Any]
@@ -1511,6 +1512,11 @@ class DeploymentRecommendationService:
             fields=fields,
             generation_defaults=generation,
             speculative_defaults=speculative_defaults,
+            embedded_mtp_available=(
+                evidence.embedded_mtp_available
+                and request.runtime == "vllm"
+                and "mtp" in capabilities.speculative_methods
+            ),
             resource_snapshot=resource_snapshot,
             resource_estimate=(estimate.model_dump(mode="json") if estimate else {}),
             runtime_capabilities=capabilities.model_dump(mode="json"),

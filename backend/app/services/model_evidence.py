@@ -115,6 +115,7 @@ class ModelEvidence(BaseModel):
     local_generation_values: dict[str, Any]
     target_model_ids: list[str]
     speculative_method: str | None
+    embedded_mtp_available: bool = False
     evidence_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     warnings: list[str]
 
@@ -876,6 +877,9 @@ class ModelEvidenceLoader:
         evidence_root = Path(os.path.abspath(supplied_path))
         warnings: list[str] = []
         config = _read_json_dict(evidence_root, "config.json", warnings)
+        weight_index = _read_json_dict(
+            evidence_root, "model.safetensors.index.json", warnings
+        )
         generation_config = _read_json_dict(
             evidence_root, "generation_config.json", warnings
         )
@@ -893,6 +897,10 @@ class ModelEvidenceLoader:
         warnings.extend(tokenizer_warnings)
         targets = _target_model_ids(card_data)
         method = _speculative_method(card_data)
+        weight_map = weight_index.get("weight_map")
+        embedded_mtp_available = isinstance(weight_map, dict) and any(
+            isinstance(key, str) and key.startswith("mtp.") for key in weight_map
+        )
         hash_payload = {
             "config": config,
             "generation_config": generation_config,
@@ -904,6 +912,7 @@ class ModelEvidenceLoader:
             "local_generation_values": local_generation_values,
             "target_model_ids": targets,
             "speculative_method": method,
+            "embedded_mtp_available": embedded_mtp_available,
         }
         evidence_hash = hashlib.sha256(
             json.dumps(
@@ -925,6 +934,7 @@ class ModelEvidenceLoader:
             local_generation_values=local_generation_values,
             target_model_ids=targets,
             speculative_method=method,
+            embedded_mtp_available=embedded_mtp_available,
             evidence_hash=evidence_hash,
             warnings=warnings,
         )

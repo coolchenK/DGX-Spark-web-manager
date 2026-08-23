@@ -100,7 +100,7 @@ class GenerationDefaults(BaseModel):
 class SpeculativeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    draft_model_id: str = Field(min_length=1, max_length=64)
+    draft_model_id: str | None = Field(default=None, min_length=1, max_length=64)
     method: Literal["draft_model", "dflash", "dspark", "eagle", "eagle3", "mtp"]
     num_speculative_tokens: int | None = Field(default=None, ge=1, le=64)
     num_steps: int | None = Field(default=None, ge=1, le=32)
@@ -110,6 +110,8 @@ class SpeculativeConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_tuning_group(self):
+        if self.method != "mtp" and self.draft_model_id is None:
+            raise ValueError("draft_model_id is required for external Draft Models")
         if self.method == "dflash":
             if self.num_steps is not None or self.eagle_top_k is not None:
                 raise ValueError("DFlash tuning only accepts num_draft_tokens")

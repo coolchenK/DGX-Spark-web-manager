@@ -563,6 +563,17 @@ def test_speculative_config_accepts_supported_methods(method):
     assert SpeculativeConfig(draft_model_id="draft-id", method=method).method == method
 
 
+def test_speculative_config_accepts_embedded_mtp_without_draft_model():
+    spec = SpeculativeConfig(method="mtp", num_speculative_tokens=6)
+
+    assert spec.draft_model_id is None
+
+
+def test_speculative_config_requires_external_draft_model_id():
+    with pytest.raises(ValueError, match="draft_model_id is required"):
+        SpeculativeConfig(method="draft_model")
+
+
 def test_speculative_config_rejects_unknown_method():
     with pytest.raises(ValueError):
         SpeculativeConfig(draft_model_id="draft-id", method="unknown")
@@ -856,6 +867,60 @@ def test_resolve_spec_reuses_base_mount_for_same_root_draft(tmp_path):
     )
 
     assert resolved.draft_container_model_path == "/models/draft"
+    assert captured["volumes"] == {str(host_root): {"bind": "/models", "mode": "ro"}}
+
+
+def test_resolve_spec_uses_embedded_mtp_without_a_draft_mount(tmp_path):
+    root = tmp_path / "models"
+    host_root = Path("/srv/models")
+    database = Database(f"sqlite:///{tmp_path / 'embedded-mtp.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        base = add_model_asset(db, root / "base", name="Base")
+        (root / "base" / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"mtp.fc.weight": "model.safetensors"}}),
+            encoding="utf-8",
+        )
+        base_id = base.id
+    service = build_preflight_service(
+        database,
+        (root,),
+        host_model_roots=(host_root,),
+        capabilities=StaticRuntimeCapabilities(
+            methods=["mtp"],
+            mapping={"mtp": "mtp"},
+        ),
+    )
+    spec = DeploymentSpec(
+        name="Base",
+        model_id=base_id,
+        model_path="ignored",
+        api_model_name="base",
+        runtime="vllm",
+        image="vllm:test",
+        port=8100,
+        speculative={"method": "mtp", "num_speculative_tokens": 6},
+    )
+    with database.session_factory() as db:
+        resolved = service.resolve_spec(db, spec)
+
+    captured = {}
+    containers = type(
+        "Containers",
+        (),
+        {"run": lambda _self, _image, **kwargs: captured.update(kwargs) or object()},
+    )()
+    service._run_container(
+        type("Client", (), {"containers": containers})(),
+        resolved,
+        service.adapter("vllm"),
+        "dgx-base",
+    )
+
+    command = captured["command"]
+    speculative = json.loads(command[command.index("--speculative-config") + 1])
+    assert speculative == {"method": "mtp", "num_speculative_tokens": 6}
+    assert resolved.resolved_draft_model_path is None
     assert captured["volumes"] == {str(host_root): {"bind": "/models", "mode": "ro"}}
 
 
@@ -4339,6 +4404,16 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
         deployment_id, model_id = deployment.id, target.id
 
     adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(model_root,))
+    benchmark_calls = []
+
+    def benchmark_runner(endpoint, api_model_name, runtime):
+        benchmark_calls.append((endpoint, api_model_name, runtime))
+        return {
+            "tps": 42.5,
+            "completion_tokens": 256,
+            "duration_seconds": 6.024,
+        }
+
     service = deployment_service.DeploymentService(
         adapters={"vllm": adapter},
         session_factory=database.session_factory,
@@ -4349,6 +4424,7 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
         system_snapshot=lambda: {
             "memory": {"total_bytes": 64 * 1024**3, "available_bytes": 64 * 1024**3}
         },
+        benchmark_runner=benchmark_runner,
     )
 
     class FakeContainer:
@@ -4418,12 +4494,16 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
     )
 
     assert result["deployment_id"] == deployment_id
+    assert result["benchmark"]["tps"] == 42.5
+    assert benchmark_calls == [("http://127.0.0.1:8100", "managed", "vllm")]
     assert old.removed is True
     with database.session_factory() as db:
         updated = db.get(Deployment, deployment_id)
         assert updated.container_id == "new-container"
         assert updated.config["spec"]["context_length"] == 8192
         assert updated.config["route_alias"] == "managed-route"
+        assert updated.benchmark_tps == 42.5
+        assert db.get(ModelAsset, model_id).benchmark_tps == 42.5
 
 
 def test_update_handler_restores_old_container_when_replacement_is_unhealthy(tmp_path, monkeypatch):

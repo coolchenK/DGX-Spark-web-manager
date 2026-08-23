@@ -384,6 +384,7 @@ export function DeploymentsPage() {
   const image = Form.useWatch('image', watchOptions)
   const providerId = Form.useWatch('provider_id', watchOptions)
   const selectedDraftId = Form.useWatch(['speculative', 'draft_model_id'], watchOptions)
+  const selectedSpeculativeMethod = Form.useWatch(['speculative', 'method'], watchOptions)
   const currentTupleKey = useMemo(
     () => recommendationTupleKey(modelId, runtime, image, providerId),
     [image, modelId, providerId, runtime],
@@ -663,9 +664,13 @@ export function DeploymentsPage() {
     }
     const savedSpeculative = deploymentValues.speculative
     let speculative: SpeculativeSettings | null = null
-    if (savedSpeculative?.draft_model_id) {
+    if (savedSpeculative && (
+      savedSpeculative.draft_model_id || savedSpeculative.method === 'mtp'
+    )) {
       speculative = {
-        draft_model_id: savedSpeculative.draft_model_id,
+        ...(savedSpeculative.draft_model_id
+          ? { draft_model_id: savedSpeculative.draft_model_id }
+          : {}),
         method: savedSpeculative.method,
         manual_review_acknowledged: savedSpeculative.manual_review_acknowledged === true,
         ...(runtime === 'vllm' && savedSpeculative.num_speculative_tokens != null
@@ -879,11 +884,20 @@ export function DeploymentsPage() {
     }
   }
 
-  const handleDraftSelect = (candidate?: DraftCandidate) => {
+  const handleDraftSelect = (candidate?: DraftCandidate | 'embedded-mtp') => {
     invalidatePreview(2)
     applyingRecommendation.current = true
     if (!candidate) {
       form.setFieldValue('speculative', null)
+    } else if (candidate === 'embedded-mtp') {
+      const restored = form.getFieldValue('speculative')
+      form.setFieldValue('speculative', {
+        method: 'mtp',
+        num_speculative_tokens: restored?.method === 'mtp'
+          ? restored.num_speculative_tokens ?? 6
+          : 6,
+        manual_review_acknowledged: false,
+      })
     } else {
       const restored = form.getFieldValue('speculative')
       const keepRestored = restored?.draft_model_id === candidate.model_id
@@ -912,7 +926,9 @@ export function DeploymentsPage() {
     applyingRecommendation.current = false
     replaceEditedFields(new Set([
       ...[...editedFieldsRef.current].filter((path) => path !== 'resource_warning_acknowledged'),
-      'speculative.draft_model_id',
+      candidate === 'embedded-mtp'
+        ? 'speculative.method'
+        : 'speculative.draft_model_id',
     ]))
     setDraftValidationError(null)
   }
@@ -1251,6 +1267,8 @@ export function DeploymentsPage() {
           key="draft"
           candidates={activeRecommendation?.draft_candidates ?? []}
           selectedId={selectedDraftId}
+          selectedMethod={selectedSpeculativeMethod}
+          embeddedMtpAvailable={activeRecommendation?.embedded_mtp_available === true}
           runtime={runtime}
           advanced={advancedDrafts}
           resourceEstimate={draftResources.estimate}

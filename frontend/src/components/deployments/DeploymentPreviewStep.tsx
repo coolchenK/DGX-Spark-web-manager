@@ -100,7 +100,14 @@ export function DeploymentPreviewStep({
         <Typography.Title level={5}>Draft Model 配置</Typography.Title>
         {preview.speculative ? (
           <Descriptions bordered size="small" column={1} items={[
-            { key: 'draft', label: '候选模型', children: preview.draft_candidate?.name ?? preview.speculative.draft_model_id },
+            {
+              key: 'draft',
+              label: '候选模型',
+              children: preview.draft_candidate?.name
+                ?? (preview.speculative.method === 'mtp' && !preview.speculative.draft_model_id
+                  ? '内置 MTP Head'
+                  : preview.speculative.draft_model_id),
+            },
             { key: 'method', label: '推测方法', children: preview.speculative.method },
             { key: 'tuning', label: '运行时参数', children: <pre><code>{jsonPreview(preview.speculative)}</code></pre> },
           ]} />

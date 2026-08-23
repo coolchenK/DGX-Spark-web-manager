@@ -108,6 +108,27 @@ def test_model_evidence_loads_structured_files_and_allowlisted_card_values(tmp_p
     assert len(evidence.evidence_hash) == 64
 
 
+def test_model_evidence_detects_embedded_mtp_weights(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.weight": "model.safetensors",
+                    "mtp.fc.weight": "model-mtp-bf16.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = ModelEvidenceLoader().load(model)
+
+    assert evidence.embedded_mtp_available is True
+
+
 def test_model_card_commands_never_return_unknown_flags_or_values(tmp_path):
     model = tmp_path / "model"
     model.mkdir()
@@ -403,7 +424,7 @@ def test_loader_keeps_the_unresolved_absolute_root_for_evidence_boundary_checks(
     evidence = ModelEvidenceLoader(card_max_chars=100_000).load(original)
 
     assert evidence.model_path == str(replacement)
-    assert evidence_roots == [original.absolute()] * 4
+    assert evidence_roots == [original.absolute()] * 5
 
 
 def test_windows_blob_resolve_runtime_error_is_converted_to_value_error(

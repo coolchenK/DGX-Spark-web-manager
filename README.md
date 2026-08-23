@@ -25,8 +25,9 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Model-card and device-aware deployment recommendations with per-field source, confidence, and
   warnings; optional bounded AI fallback for unresolved fields.
 - Optional compatible/reviewed Draft Model selection with runtime-specific speculative settings and
-  combined base-plus-Draft resource checks. SGLang DSpark checkpoints are detected, paired with the
-  base model, and launched with the DGX Spark cache, attention, and Mamba settings.
+  combined base-plus-Draft resource checks. vLLM models with indexed `mtp.*` weights can use their
+  embedded MTP head without a duplicate model asset or mount. SGLang DSpark checkpoints are detected,
+  paired with the base model, and launched with the DGX Spark cache, attention, and Mamba settings.
 - Model-aware SGLang/vLLM launch flags detect tool-call and reasoning parsers from the chat template;
   optional deployment defaults control template thinking behavior without overriding each request.
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
@@ -130,7 +131,9 @@ On startup the manager scans Docker without restarting or recreating existing co
    repositories from the mounted local Hugging Face cache, including when the Draft Model comes from
    a different configured model root. vLLM 0.27.x also exposes NVIDIA Nemotron-H DSpark checkpoints;
    the Manager applies the model card's Marlin MoE, FP8 KV, FlashInfer Mamba, prefix-cache, reasoning,
-   and tool-parser profile only when the local checkpoint identifies itself as Nemotron-H.
+   and tool-parser profile only when the local checkpoint identifies itself as Nemotron-H. When the
+   base checkpoint itself contains indexed `mtp.*` weights, the Draft Model step also offers an
+   `Embedded MTP Head` option and emits a path-free vLLM `mtp` speculative configuration.
 6. Review the normalized spec, generated runtime command, mounts, current capability snapshot,
    memory estimate, provenance, and warnings. Resource warnings and review candidates require
    explicit acknowledgement. Submit only from the current preview; any form change invalidates it.

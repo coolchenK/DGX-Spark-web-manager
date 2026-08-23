@@ -7,13 +7,15 @@ import { formatBytes } from '../../utils/format'
 interface DraftModelStepProps {
   candidates: DraftCandidate[]
   selectedId?: string
+  selectedMethod?: string
+  embeddedMtpAvailable?: boolean
   runtime: Exclude<RuntimeName, 'llama_cpp'>
   advanced: boolean
   resourceEstimate?: Partial<ResourceEstimate>
   resourceUnverified?: boolean
   validationError?: string | null
   onAdvancedChange: (value: boolean) => void
-  onSelect: (candidate?: DraftCandidate) => void
+  onSelect: (candidate?: DraftCandidate | 'embedded-mtp') => void
 }
 
 const statusPresentation = {
@@ -26,6 +28,8 @@ const statusPresentation = {
 export function DraftModelStep({
   candidates,
   selectedId,
+  selectedMethod,
+  embeddedMtpAvailable = false,
   runtime,
   advanced,
   resourceEstimate,
@@ -38,6 +42,7 @@ export function DraftModelStep({
     ? candidates
     : candidates.filter((candidate) => candidate.status === 'compatible')
   const selectedCandidate = candidates.find((candidate) => candidate.model_id === selectedId)
+  const embeddedMtpSelected = !selectedId && selectedMethod === 'mtp'
   const resourceDecision = resourceEstimate?.decision
 
   return (
@@ -55,8 +60,12 @@ export function DraftModelStep({
       {validationError && <Alert type="error" showIcon message={validationError} />}
       <Radio.Group
         className="draft-candidate-list"
-        value={selectedId ?? ''}
+        value={embeddedMtpSelected ? 'embedded-mtp' : selectedId ?? ''}
         onChange={(event) => {
+          if (event.target.value === 'embedded-mtp') {
+            onSelect('embedded-mtp')
+            return
+          }
           const candidate = candidates.find((item) => item.model_id === event.target.value)
           onSelect(candidate)
         }}
@@ -64,6 +73,20 @@ export function DraftModelStep({
         <div className="draft-candidate draft-candidate-none">
           <Radio value="">不使用 Draft Model</Radio>
         </div>
+        {embeddedMtpAvailable && (
+          <div className="draft-candidate">
+            <Radio value="embedded-mtp">
+              <span className="draft-candidate-label">
+                <strong className="draft-candidate-name">内置 MTP Head</strong>
+                <Tag color="success">兼容</Tag>
+                <Tag>mtp</Tag>
+              </span>
+              <span className="draft-candidate-details">
+                使用当前模型自带的 MTP 权重，无需外挂 Draft Model
+              </span>
+            </Radio>
+          </div>
+        )}
         {visibleCandidates.map((candidate) => {
           const [label, color] = statusPresentation[candidate.status]
           return (
@@ -100,7 +123,7 @@ export function DraftModelStep({
           )}
         />
       )}
-      {selectedCandidate && (
+      {(selectedCandidate || embeddedMtpSelected) && (
         <Collapse
           defaultActiveKey={['speculative-tuning']}
           items={[{
@@ -115,7 +138,7 @@ export function DraftModelStep({
                 >
                   <InputNumber />
                 </Form.Item>
-              ) : selectedCandidate.method === 'dflash' ? (
+              ) : selectedCandidate?.method === 'dflash' ? (
                 <Form.Item
                   name={['speculative', 'num_draft_tokens']}
                   label="DFlash Block Size"

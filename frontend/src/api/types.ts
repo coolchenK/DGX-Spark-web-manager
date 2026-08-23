@@ -378,6 +378,7 @@ export interface DeploymentRecommendation {
   fields: Record<string, RecommendedValue>
   generation_defaults: Record<string, RecommendedValue>
   speculative_defaults?: Record<string, RecommendedValue>
+  embedded_mtp_available?: boolean
   resource_snapshot: Partial<ResourceSnapshot>
   resource_estimate: Partial<ResourceEstimate>
   runtime_capabilities: Partial<RuntimeCapabilities>

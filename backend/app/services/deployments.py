@@ -333,32 +333,45 @@ class DeploymentService:
             "base_container_model_path": self._container_path("/models", base_relative),
         }
         if spec.speculative is not None:
-            draft = db.get(ModelAsset, spec.speculative.draft_model_id)
-            if draft is None or draft.status != "available" or not draft.local_path:
-                raise ValueError("Draft Model is missing or unavailable")
-            if draft.id == target.id:
-                raise ValueError("Base model and Draft Model must be different")
-            try:
-                draft_path = validate_model_path(Path(draft.local_path), self.model_roots)
-                draft_root, draft_host_root, draft_relative = self._root_details(draft_path)
-            except ValueError as exc:
-                raise ValueError("Draft Model path is unavailable") from exc
             method = spec.speculative.method
             if method not in capabilities.speculative_methods:
                 raise ValueError("Speculative method is unsupported by the runtime")
             runtime_method = capabilities.method_mapping.get(method)
             if not runtime_method:
                 raise ValueError("Speculative method mapping is unavailable")
-            draft_bind = "/models" if draft_root == base_root else "/draft-models"
-            internal.update(
-                {
-                    "resolved_draft_model_path": str(draft_path),
-                    "draft_model_root": str(draft_root),
-                    "draft_host_model_root": str(draft_host_root),
-                    "draft_container_model_path": self._container_path(draft_bind, draft_relative),
-                    "speculative_runtime_method": runtime_method,
-                }
-            )
+            if method == "mtp" and spec.speculative.draft_model_id is None:
+                if spec.runtime != "vllm":
+                    raise ValueError("Embedded MTP is only supported by vLLM")
+                try:
+                    evidence = self.evidence_loader.load(base_path)
+                except Exception as exc:
+                    raise ValueError("Embedded MTP evidence could not be verified") from exc
+                if not evidence.embedded_mtp_available:
+                    raise ValueError("Base model does not contain an embedded MTP head")
+                internal["speculative_runtime_method"] = runtime_method
+            else:
+                draft = db.get(ModelAsset, spec.speculative.draft_model_id)
+                if draft is None or draft.status != "available" or not draft.local_path:
+                    raise ValueError("Draft Model is missing or unavailable")
+                if draft.id == target.id:
+                    raise ValueError("Base model and Draft Model must be different")
+                try:
+                    draft_path = validate_model_path(Path(draft.local_path), self.model_roots)
+                    draft_root, draft_host_root, draft_relative = self._root_details(draft_path)
+                except ValueError as exc:
+                    raise ValueError("Draft Model path is unavailable") from exc
+                draft_bind = "/models" if draft_root == base_root else "/draft-models"
+                internal.update(
+                    {
+                        "resolved_draft_model_path": str(draft_path),
+                        "draft_model_root": str(draft_root),
+                        "draft_host_model_root": str(draft_host_root),
+                        "draft_container_model_path": self._container_path(
+                            draft_bind, draft_relative
+                        ),
+                        "speculative_runtime_method": runtime_method,
+                    }
+                )
         resolved = ResolvedDeploymentSpec.model_validate(
             {**spec.model_dump(mode="json"), **internal}
         )
@@ -452,7 +465,10 @@ class DeploymentService:
                 "mode": "ro",
             }
         }
-        if resolved.speculative is not None:
+        if (
+            resolved.speculative is not None
+            and resolved.speculative.draft_model_id is not None
+        ):
             mounts["draft"] = {
                 "host_root": resolved.draft_host_model_root,
                 "container_bind": (
@@ -612,10 +628,11 @@ class DeploymentService:
         *,
         cleanup_backup: bool,
         benchmark_if_missing: bool = False,
+        force_benchmark: bool = False,
     ) -> dict[str, Any]:
         deployment_id = deployment.id
         container_id = deployment.container_id
-        needs_benchmark = (
+        needs_benchmark = force_benchmark or (
             benchmark_if_missing and deployment.benchmark_status != "succeeded"
         )
         original = {
@@ -820,7 +837,10 @@ class DeploymentService:
             raise ValueError("Base model is missing or unavailable")
         draft = None
         selected_candidate = None
-        if resolved.speculative is not None:
+        if (
+            resolved.speculative is not None
+            and resolved.speculative.draft_model_id is not None
+        ):
             draft = db.get(ModelAsset, resolved.speculative.draft_model_id)
             candidates = self.draft_service.list_candidates(db, target, capabilities, snapshot)
             selected_candidate = next(
@@ -954,7 +974,11 @@ class DeploymentService:
         if not spec.base_host_model_root or not spec.base_container_model_path:
             raise ValueError("Resolved base model mount is required")
         volumes = {spec.base_host_model_root: {"bind": "/models", "mode": "ro"}}
-        if spec.speculative is not None and spec.draft_model_root != spec.base_model_root:
+        if (
+            spec.speculative is not None
+            and spec.draft_model_root is not None
+            and spec.draft_model_root != spec.base_model_root
+        ):
             if not spec.draft_host_model_root:
                 raise ValueError("Resolved Draft Model mount is required")
             volumes[spec.draft_host_model_root] = {
@@ -1250,7 +1274,13 @@ class DeploymentService:
                 current_status = deployment.status
 
         if committed is not None:
-            return self._recover_committed_deployment(context, committed, spec, cleanup_backup=True)
+            return self._recover_committed_deployment(
+                context,
+                committed,
+                spec,
+                cleanup_backup=True,
+                force_benchmark=True,
+            )
 
         adapter = self.adapter(resolved.runtime)
         client = self.docker_client()
@@ -1340,11 +1370,21 @@ class DeploymentService:
                 old_container.remove(force=True)
             except Exception as exc:
                 context.update(message=f"Old stopped container cleanup deferred: {exc}")
-            return {
+            result = {
                 "deployment_id": deployment_id,
                 "container_name": new_name,
                 "endpoint_url": endpoint,
             }
+            benchmark = self._benchmark_deployment(
+                context,
+                deployment_id=deployment_id,
+                endpoint=endpoint,
+                api_model_name=resolved.api_model_name,
+                runtime=resolved.runtime,
+            )
+            if benchmark is not None:
+                result["benchmark"] = benchmark
+            return result
         except BaseException:
             if not record_updated:
                 if new_container is not None:

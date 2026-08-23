@@ -233,6 +233,29 @@ describe('deploymentToFormValues', () => {
     })
   })
 
+  it('restores an embedded MTP configuration without a Draft Model id', () => {
+    const mtpDeployment: Deployment = {
+      ...deployment,
+      config: {
+        ...deployment.config,
+        spec: {
+          ...(deployment.config.spec as Record<string, unknown>),
+          speculative: {
+            method: 'mtp',
+            num_speculative_tokens: 6,
+            manual_review_acknowledged: false,
+          },
+        },
+      },
+    }
+
+    expect(deploymentToFormValues(mtpDeployment, model, 'edit').speculative).toEqual({
+      method: 'mtp',
+      num_speculative_tokens: 6,
+      manual_review_acknowledged: false,
+    })
+  })
+
   it('does not share saved nested objects with editable form values', () => {
     const saved = deployment.config.spec as {
       generation_defaults: { stop: string[] }
