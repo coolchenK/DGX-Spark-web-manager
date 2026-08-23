@@ -24,9 +24,9 @@ import { type ThemeMode, useThemeStore } from '../stores/theme'
 
 const items = [
   { key: '/', icon: <DashboardOutlined />, label: '系统概览' },
-  { key: '/models', icon: <AppstoreOutlined />, label: '模型库' },
-  { key: '/huggingface', icon: <CloudDownloadOutlined />, label: 'Hugging Face' },
   { key: '/deployments', icon: <DeploymentUnitOutlined />, label: '部署实例' },
+  { key: '/huggingface', icon: <CloudDownloadOutlined />, label: 'Hugging Face' },
+  { key: '/models', icon: <AppstoreOutlined />, label: '模型库' },
   { key: '/gateway', icon: <ApiOutlined />, label: 'API 网关' },
   { key: '/providers', icon: <RobotOutlined />, label: '在线 AI 服务' },
   { key: '/diagnostics', icon: <RobotOutlined />, label: 'AI 运维助手' },
