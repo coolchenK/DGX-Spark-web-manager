@@ -1646,10 +1646,18 @@ def test_vllm_qwen35_nvfp4_uses_model_card_blackwell_settings(tmp_path):
     command = adapter.command(spec)
 
     assert command[command.index("--generation-config") + 1] == "auto"
+    assert "--kv-cache-dtype" not in command
     assert adapter.environment(spec) == {
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
         "VLLM_USE_TRITON_FP8_GEMM": "1",
     }
+
+    long_context_command = adapter.command(
+        spec.model_copy(update={"context_length": 131_072})
+    )
+    assert long_context_command[
+        long_context_command.index("--kv-cache-dtype") + 1
+    ] == "fp8"
 
 
 def test_chat_template_kwargs_are_bounded_and_serialized_canonically(tmp_path):

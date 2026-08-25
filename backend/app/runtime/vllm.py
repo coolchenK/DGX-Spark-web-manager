@@ -49,6 +49,8 @@ NEMOTRON_H_FLAGS = (
     "float16",
 )
 
+LONG_CONTEXT_FP8_KV_THRESHOLD = 131_072
+
 
 def _is_nemotron_h(model_path) -> bool:
     """Detect NVIDIA Nemotron-H checkpoints from bounded local metadata."""
@@ -130,6 +132,8 @@ class VllmAdapter(RuntimeAdapter):
             command.extend(["--max-num-batched-tokens", str(spec.max_batched_tokens)])
         if is_qwen35_nvfp4:
             command.extend(["--generation-config", "auto"])
+            if spec.context_length >= LONG_CONTEXT_FP8_KV_THRESHOLD:
+                command.extend(["--kv-cache-dtype", "fp8"])
         if is_nemotron_h:
             command.extend(NEMOTRON_H_FLAGS)
         template = chat_template_text(validated_model_path)
