@@ -1,6 +1,7 @@
 import {
   CopyOutlined,
   DashboardOutlined,
+  DatabaseOutlined,
   DeleteOutlined,
   EditOutlined,
   FileTextOutlined,
@@ -71,6 +72,7 @@ import {
   type DeploymentFormValues,
   type SpeculativeSettings,
 } from '../utils/deployments'
+import { formatBytes } from '../utils/format'
 
 
 interface DeploymentWizardValues extends DeploymentFormValues {
@@ -109,6 +111,27 @@ function benchmarkDisplay(item: Deployment) {
     )
   }
   return <Typography.Text type="secondary">未测试</Typography.Text>
+}
+
+function memoryDisplay(item: Deployment) {
+  if (item.memory_used_bytes == null) {
+    return <Typography.Text type="secondary">不可用</Typography.Text>
+  }
+  const source = item.memory_source === 'nvidia_smi'
+    ? 'NVIDIA 推理进程的实际统一内存占用'
+    : item.memory_source === 'container'
+      ? '未检测到 NVIDIA 推理进程，显示容器内存占用'
+      : '实例已停止，当前不占用推理内存'
+  const measured = item.memory_measured_at
+    ? ` · ${new Date(item.memory_measured_at).toLocaleString('zh-CN')}`
+    : ''
+  return (
+    <Tooltip title={`${source}${measured}`}>
+      <Typography.Text strong={item.memory_used_bytes > 0}>
+        <DatabaseOutlined /> {formatBytes(item.memory_used_bytes)}
+      </Typography.Text>
+    </Tooltip>
+  )
 }
 
 const defaultValues: Partial<DeploymentWizardValues> = {
@@ -356,7 +379,16 @@ export function DeploymentsPage() {
     refetchOnMount: deploymentTargetId ? 'always' : undefined,
   })
   const locatedDeployment = deployments.data?.find((item) => item.id === deploymentTargetId)
-  const visibleDeployments = locatedDeployment ? [locatedDeployment] : deployments.data ?? []
+  const visibleDeployments = useMemo(() => {
+    const items = locatedDeployment ? [locatedDeployment] : deployments.data ?? []
+    return [...items].sort((left, right) => {
+      const leftMemory = left.memory_used_bytes
+      const rightMemory = right.memory_used_bytes
+      if (leftMemory == null) return rightMemory == null ? left.name.localeCompare(right.name) : 1
+      if (rightMemory == null) return -1
+      return leftMemory - rightMemory || left.name.localeCompare(right.name)
+    })
+  }, [deployments.data, locatedDeployment])
   const locatorValidated = deployments.isFetchedAfterMount && !deployments.error
   const clearDeploymentLocator = () => {
     const next = new URLSearchParams(searchParams)
@@ -1312,13 +1344,14 @@ export function DeploymentsPage() {
           { title: '端点', dataIndex: 'endpoint_url' },
           { title: '所有权', dataIndex: 'managed', width: 90, render: (value) => value ? '管理器' : '已发现' },
           { title: '状态', dataIndex: 'health', width: 100, render: (value) => <StatusBadge status={value} /> },
+          { title: '实际内存', dataIndex: 'memory_used_bytes', width: 140, render: (_, item) => memoryDisplay(item) },
           { title: 'TPS', dataIndex: 'benchmark_tps', width: 140, render: (_, item) => benchmarkDisplay(item) },
           { title: '操作', width: 400, render: (_, item) => operationButtons(item) },
         ]} renderMobile={(item) => (
           <div className="mobile-record">
             <Flex justify="space-between"><strong>{item.name}</strong><StatusBadge status={item.health} /></Flex>
             <Typography.Text type="secondary">{item.api_model_name}</Typography.Text>
-            <dl><div><dt>运行时</dt><dd>{item.runtime}</dd></div><div><dt>端点</dt><dd>{item.endpoint_url}</dd></div><div><dt>TPS</dt><dd>{benchmarkDisplay(item)}</dd></div></dl>
+            <dl><div><dt>运行时</dt><dd>{item.runtime}</dd></div><div><dt>端点</dt><dd>{item.endpoint_url}</dd></div><div><dt>实际内存</dt><dd>{memoryDisplay(item)}</dd></div><div><dt>TPS</dt><dd>{benchmarkDisplay(item)}</dd></div></dl>
             {operationButtons(item, true)}
           </div>
         )} />

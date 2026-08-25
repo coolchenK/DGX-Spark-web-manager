@@ -14,6 +14,8 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Persistent Hugging Face search/download tasks with pause, resume, cancellation, and restart recovery.
 - Validated SGLang, vLLM, and llama.cpp deployment adapters with image and argument allowlists.
 - Deployment preview, edit, clone, health-gated replacement, automatic rollback, and retained task history.
+- Per-deployment live unified-memory usage attributed from NVIDIA compute processes, with a bounded
+  Docker-memory fallback, stopped-instance zero state, mobile rendering, and low-to-high ordering.
 - Automatic post-deployment warmup and TPS benchmarking with persistent results shown in desktop
   and mobile deployment views. The latest successful result is also retained on the model asset and
   shown in the model library after a deployment is uninstalled; benchmark failures are recorded

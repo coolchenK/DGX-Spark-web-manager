@@ -289,6 +289,9 @@ const existingDeployment: Deployment = {
   benchmark_duration_seconds: 3.816,
   benchmark_tested_at: '2026-08-23T01:02:03Z',
   benchmark_error: null,
+  memory_used_bytes: 91 * GiB,
+  memory_source: 'nvidia_smi',
+  memory_measured_at: '2026-08-23T01:02:04Z',
   config: {
     route_alias: 'qwen-shared',
     spec: {
@@ -513,6 +516,7 @@ describe('DeploymentsPage deployment locator', () => {
     const table = await screen.findByRole('table')
     expect(within(table).getAllByText('TPS').length).toBeGreaterThan(0)
     expect(within(table).getByText('67.08 tok/s')).toBeInTheDocument()
+    expect(within(table).getByText('91.0 GiB')).toBeInTheDocument()
   })
 
   it('shows a clear warning for an unknown deployment without hiding the list', async () => {

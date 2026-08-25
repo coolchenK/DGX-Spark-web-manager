@@ -31,6 +31,7 @@ from app.runtime.llama_cpp import LlamaCppAdapter
 from app.runtime.sglang import SGLangAdapter
 from app.runtime.vllm import VllmAdapter
 from app.security import PasswordManager, SecretBox, SessionManager
+from app.services.deployment_memory import DeploymentMemoryService
 from app.services.deployment_recommendations import DeploymentRecommendationService
 from app.services.deployments import DeploymentService, run_deployment_tps_benchmark
 from app.services.diagnostics import DiagnosticService
@@ -150,6 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docker_client=lazy_docker_client,
         benchmark_runner=run_deployment_tps_benchmark,
     )
+    deployment_memory_service = DeploymentMemoryService(lazy_docker_client)
     deployment_recommendation_service = DeploymentRecommendationService(
         evidence_loader=evidence_loader,
         runtime_capability_service=runtime_capability_service,
@@ -249,6 +251,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.huggingface_service = huggingface_service
     app.state.task_engine = task_engine
     app.state.deployment_service = deployment_service
+    app.state.deployment_memory_service = deployment_memory_service
     app.state.provider_service = provider_service
     app.state.ops_provider_client = ops_provider_client
     app.state.deployment_recommendation_service = deployment_recommendation_service

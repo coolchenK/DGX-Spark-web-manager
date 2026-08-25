@@ -76,6 +76,9 @@ export interface Deployment {
   benchmark_duration_seconds: number | null
   benchmark_tested_at: string | null
   benchmark_error: string | null
+  memory_used_bytes?: number | null
+  memory_source?: 'nvidia_smi' | 'container' | 'stopped' | 'unavailable'
+  memory_measured_at?: string | null
   config: Record<string, unknown>
   capabilities: string[]
   last_checked_at: string | null

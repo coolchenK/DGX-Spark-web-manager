@@ -423,6 +423,14 @@ def test_deployment_inventory_serializes_tps_benchmark(authenticated_client):
         )
         deployment_id = deployment.id
 
+    authenticated_client.app.state.deployment_memory_service.snapshot = lambda items: {
+        item.id: {
+            "memory_used_bytes": 12_345,
+            "memory_source": "nvidia_smi",
+            "memory_measured_at": "2026-08-23T01:02:04+00:00",
+        }
+        for item in items
+    }
     response = authenticated_client.get("/api/deployments")
 
     assert response.status_code == 200
@@ -433,6 +441,9 @@ def test_deployment_inventory_serializes_tps_benchmark(authenticated_client):
     assert item["benchmark_duration_seconds"] == 2.92
     assert item["benchmark_tested_at"] == "2026-08-23T01:02:03"
     assert item["benchmark_error"] is None
+    assert item["memory_used_bytes"] == 12_345
+    assert item["memory_source"] == "nvidia_smi"
+    assert item["memory_measured_at"] == "2026-08-23T01:02:04+00:00"
 
 
 def test_model_inventory_serializes_latest_successful_tps(authenticated_client):

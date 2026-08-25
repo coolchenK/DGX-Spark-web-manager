@@ -110,8 +110,9 @@ def delete_model(
 
 
 @router.get("/deployments")
-def list_deployments(db: DbSession, _: Admin) -> list[dict[str, Any]]:
-    items = db.scalars(select(Deployment).order_by(Deployment.name))
+def list_deployments(request: Request, db: DbSession, _: Admin) -> list[dict[str, Any]]:
+    items = list(db.scalars(select(Deployment).order_by(Deployment.name)))
+    memory = request.app.state.deployment_memory_service.snapshot(items)
     return [
         {
             "id": item.id,
@@ -133,6 +134,14 @@ def list_deployments(db: DbSession, _: Admin) -> list[dict[str, Any]]:
             "benchmark_duration_seconds": item.benchmark_duration_seconds,
             "benchmark_tested_at": item.benchmark_tested_at,
             "benchmark_error": item.benchmark_error,
+            **memory.get(
+                item.id,
+                {
+                    "memory_used_bytes": None,
+                    "memory_source": "unavailable",
+                    "memory_measured_at": None,
+                },
+            ),
             "config": item.config,
             "capabilities": item.capabilities,
             "last_checked_at": item.last_checked_at,
