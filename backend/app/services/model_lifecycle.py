@@ -22,6 +22,9 @@ from app.tasks.huggingface import cache_repository_path, validate_repository_id
 
 COMMAND_TIMEOUT_SECONDS = 120
 OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+RMTREE_AVOIDS_SYMLINK_ATTACKS = bool(
+    getattr(shutil.rmtree, "avoids_symlink_attacks", False)
+)
 HF_TARGET_ID_KEYS = {"repository_id", "repo_id", "id", "target"}
 HF_TARGET_LIST_KEYS = {
     "targets",
@@ -97,7 +100,7 @@ class ModelLifecycleService:
     def _secure_rmtree(root_lexical: Path, target_lexical: Path) -> None:
         if (
             os.name != "posix"
-            or not getattr(shutil.rmtree, "avoids_symlink_attacks", False)
+            or not RMTREE_AVOIDS_SYMLINK_ATTACKS
             or not hasattr(os, "O_DIRECTORY")
             or not hasattr(os, "O_NOFOLLOW")
             or not OPEN_SUPPORTS_DIR_FD
@@ -133,9 +136,7 @@ class ModelLifecycleService:
                 )
             else:
                 hint = exc.strerror or str(exc)
-            raise RuntimeError(
-                f"Secure local model deletion failed: {hint}"
-            ) from exc
+            raise RuntimeError(f"Secure local model deletion failed: {hint}") from exc
         finally:
             for descriptor in reversed(opened):
                 os.close(descriptor)
@@ -162,6 +163,18 @@ class ModelLifecycleService:
             normalized_roots: list[tuple[Path, Path]] = []
             for lexical_root in lexical_roots:
                 target_within_root = lexical_target.is_relative_to(lexical_root)
+                if target_within_root:
+                    current = lexical_root
+                    components = [current]
+                    for part in lexical_target.relative_to(lexical_root).parts:
+                        current /= part
+                        components.append(current)
+                    if any(
+                        self._is_link_or_reparse(component) for component in components
+                    ):
+                        raise ValueError(
+                            "Local model path cannot contain a symbolic link or reparse point"
+                        )
                 inspection_error: Exception | None = None
                 try:
                     invalid_root = self._is_link_or_reparse(lexical_root)
@@ -214,7 +227,6 @@ class ModelLifecycleService:
             ]
             candidates.sort(key=lambda item: len(item[0].parts), reverse=True)
             for lexical_root, _resolved_root in candidates:
-
                 relative_target = lexical_target.relative_to(lexical_root)
                 components = [lexical_root]
                 current = lexical_root
@@ -304,18 +316,16 @@ class ModelLifecycleService:
         try:
             payload = json.loads(stdout)
         except (json.JSONDecodeError, RecursionError) as exc:
-            raise RuntimeError("Hugging Face cache command returned invalid JSON") from exc
+            raise RuntimeError(
+                "Hugging Face cache command returned invalid JSON"
+            ) from exc
         if not isinstance(payload, dict):
             raise RuntimeError("Hugging Face cache command returned invalid JSON")
         return payload
 
     @staticmethod
     def _is_non_negative_int(value: Any) -> bool:
-        return (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 0
-        )
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
     @staticmethod
     def _normalize_hf_target(value: Any) -> str:
@@ -345,7 +355,9 @@ class ModelLifecycleService:
                 elif key in HF_TARGET_LIST_KEYS:
                     present = True
                     if not isinstance(item, list):
-                        raise RuntimeError("Hugging Face cache preview target was invalid")
+                        raise RuntimeError(
+                            "Hugging Face cache preview target was invalid"
+                        )
                     for target in item:
                         if isinstance(target, dict):
                             nested_present, nested_targets = cls._collect_hf_targets(
@@ -582,9 +594,7 @@ class ModelLifecycleService:
             if model.status == "deleting":
                 if metadata.get("_delete_task_id") != task_id:
                     raise ValueError("Model deletion is owned by another task")
-                original_status = metadata.get(
-                    "_delete_original_status", "available"
-                )
+                original_status = metadata.get("_delete_original_status", "available")
             references = self.references(db, model_id)
             if references:
                 if reentry:
@@ -687,16 +697,16 @@ class ModelLifecycleService:
                         "--cache-dir",
                         str(self.hf_cache_dir),
                     ]
-                    preview = self._run_hf_json(
-                        [*base_argv, "--dry-run", "--json"]
-                    )
+                    preview = self._run_hf_json([*base_argv, "--dry-run", "--json"])
                     self._validate_hf_preview(preview, f"model/{repository_id}")
                     context.check_control()
                     destructive_started = True
                     result = self._run_hf_json([*base_argv, "--yes", "--json"])
                     self._validate_hf_result(result)
                     if not self._path_is_absent(target):
-                        raise RuntimeError("Hugging Face cache deletion did not remove the target")
+                        raise RuntimeError(
+                            "Hugging Face cache deletion did not remove the target"
+                        )
             else:
                 target = Path(local_path)
                 trusted_target = target
@@ -722,7 +732,9 @@ class ModelLifecycleService:
                     except OSError as exc:
                         raise RuntimeError("Local model deletion failed") from exc
                     if not self._path_is_absent(target_lexical):
-                        raise RuntimeError("Local model deletion did not remove the target")
+                        raise RuntimeError(
+                            "Local model deletion did not remove the target"
+                        )
 
             self._remove_database_record(model_id)
             measure_released()

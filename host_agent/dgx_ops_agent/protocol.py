@@ -22,6 +22,7 @@ _MAX_REQUEST_ID_LENGTH = 128
 _MAX_NONCE_LENGTH = 256
 _MAX_TIMESTAMP = (1 << 63) - 1
 _MAX_AGE = 24 * 60 * 60
+_MAX_JSON_DEPTH = 256
 _DEFAULT_NONCE_CAPACITY = 4096
 _SIGNATURE_LENGTH = hashlib.sha256().digest_size * 2
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -54,7 +55,11 @@ def _validate_bounded_string(value: Any, name: str, maximum: int) -> None:
 
 
 def _validate_timestamp(value: Any, name: str = "timestamp") -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_TIMESTAMP:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= _MAX_TIMESTAMP
+    ):
         raise ProtocolError(f"invalid {name}")
 
 
@@ -69,30 +74,32 @@ def _validate_max_age(max_age: Any) -> None:
 
 def _validate_json_tree(value: Any) -> None:
     active_containers: set[int] = set()
-    stack = [(value, False)]
+    stack = [(value, False, 0)]
     while stack:
-        current, leaving = stack.pop()
+        current, leaving, depth = stack.pop()
         if leaving:
             active_containers.remove(id(current))
             continue
+        if depth > _MAX_JSON_DEPTH:
+            raise ValueError("JSON value is nested too deeply")
 
         if isinstance(current, dict):
             identifier = id(current)
             if identifier in active_containers:
                 raise ValueError("circular JSON value")
             active_containers.add(identifier)
-            stack.append((current, True))
+            stack.append((current, True, depth))
             for key, item in current.items():
                 if not isinstance(key, str):
                     raise TypeError("JSON object keys must be strings")
-                stack.append((item, False))
+                stack.append((item, False, depth + 1))
         elif isinstance(current, list):
             identifier = id(current)
             if identifier in active_containers:
                 raise ValueError("circular JSON value")
             active_containers.add(identifier)
-            stack.append((current, True))
-            stack.extend((item, False) for item in current)
+            stack.append((current, True, depth))
+            stack.extend((item, False, depth + 1) for item in current)
         elif isinstance(current, float):
             if not math.isfinite(current):
                 raise ValueError("non-finite JSON number")
@@ -161,7 +168,9 @@ def sign_message(message: dict[str, Any], secret: bytes) -> dict[str, Any]:
     if not isinstance(message, dict):
         raise ProtocolError("message must be a JSON object")
     result = dict(message)
-    result["signature"] = hmac.new(secret, canonical_bytes(result), hashlib.sha256).hexdigest()
+    result["signature"] = hmac.new(
+        secret, canonical_bytes(result), hashlib.sha256
+    ).hexdigest()
     return result
 
 
@@ -176,7 +185,11 @@ def _is_valid_signature(signature: Any) -> bool:
 
 def _validate_request_schema(message: dict[str, Any]) -> None:
     version = message.get("protocol_version")
-    if isinstance(version, bool) or not isinstance(version, int) or version != PROTOCOL_VERSION:
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != PROTOCOL_VERSION
+    ):
         raise ProtocolError("unsupported protocol version")
 
     fields = frozenset(message)
@@ -186,7 +199,9 @@ def _validate_request_schema(message: dict[str, Any]) -> None:
         raise ProtocolError("invalid request schema")
 
     try:
-        _validate_bounded_string(message["request_id"], "request_id", _MAX_REQUEST_ID_LENGTH)
+        _validate_bounded_string(
+            message["request_id"], "request_id", _MAX_REQUEST_ID_LENGTH
+        )
         _validate_bounded_string(message["action"], "action", _MAX_ACTION_LENGTH)
         if not isinstance(message["parameters"], dict):
             raise ProtocolError("invalid parameters")
@@ -202,13 +217,19 @@ class NonceCache:
     """Thread-safe, bounded cache of nonces that remain inside the replay window."""
 
     def __init__(self, max_entries: int = _DEFAULT_NONCE_CAPACITY) -> None:
-        if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries <= 0:
+        if (
+            isinstance(max_entries, bool)
+            or not isinstance(max_entries, int)
+            or max_entries <= 0
+        ):
             raise ProtocolError("invalid nonce cache capacity")
         self._max_entries = max_entries
         self._entries: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def consume(self, nonce: str, timestamp: int, *, now: int, max_age: int = 30) -> None:
+    def consume(
+        self, nonce: str, timestamp: int, *, now: int, max_age: int = 30
+    ) -> None:
         """Atomically record a nonce or reject it if it is live or capacity is exhausted."""
         _validate_bounded_string(nonce, "nonce", _MAX_NONCE_LENGTH)
         _validate_timestamp(timestamp)
@@ -216,7 +237,9 @@ class NonceCache:
         _validate_max_age(max_age)
 
         with self._lock:
-            expired = [key for key, expires_at in self._entries.items() if expires_at < now]
+            expired = [
+                key for key, expires_at in self._entries.items() if expires_at < now
+            ]
             for key in expired:
                 del self._entries[key]
 
@@ -244,7 +267,9 @@ def verify_message(
     if not _is_valid_signature(signature):
         raise ProtocolError("invalid signature")
     try:
-        expected = hmac.new(secret, canonical_bytes(message), hashlib.sha256).hexdigest()
+        expected = hmac.new(
+            secret, canonical_bytes(message), hashlib.sha256
+        ).hexdigest()
     except ProtocolError as exc:
         raise ProtocolError("invalid signature") from exc
     if not hmac.compare_digest(signature, expected):
@@ -356,6 +381,7 @@ def read_frame(reader: BinaryIO) -> dict[str, Any]:
             parse_float=_parse_finite_float,
             object_pairs_hook=_reject_duplicate_keys,
         )
+        _validate_json_tree(message)
     except (UnicodeDecodeError, ValueError, OverflowError, RecursionError):
         raise ProtocolError("invalid frame JSON") from None
     if not isinstance(message, dict):

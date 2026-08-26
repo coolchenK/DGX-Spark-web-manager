@@ -179,16 +179,12 @@ def test_server_dispatches_health_read_and_shell_as_signed_jobs():
     runner = _FakeRunner()
     server = AgentServer(SECRET, runner, clock=lambda: 1000)
 
-    health = server.handle(
-        _server_request("agent.health", {}, nonce="health")
-    )
+    health = server.handle(_server_request("agent.health", {}, nonce="health"))
     _assert_signed_response(health, request_id="request-health")
     assert health["result"] == {"status": "ok", "protocol_version": 1}
     assert runner.started == []
 
-    read = server.handle(
-        _server_request("host.memory", {}, nonce="read")
-    )
+    read = server.handle(_server_request("host.memory", {}, nonce="read"))
     _assert_signed_response(read, request_id="request-read")
     assert read["result"]["status"] == "succeeded"
     assert read["result"]["output"] == "succeeded output"
@@ -313,17 +309,13 @@ def test_server_bounds_read_job_polling_by_action_timeout():
         sleeper=lambda _seconds: pytest.fail("deadline should already be exceeded"),
     )
 
-    response = server.handle(
-        _server_request("host.memory", {}, nonce="read-deadline")
-    )
+    response = server.handle(_server_request("host.memory", {}, nonce="read-deadline"))
 
     assert response["error"] == {
         "code": "operation_timeout",
         "message": "operation did not finish before the server deadline",
     }
-    assert response["result"] == {
-        "job_id": "00000000-0000-4000-8000-000000000001"
-    }
+    assert response["result"] == {"job_id": "00000000-0000-4000-8000-000000000001"}
     assert runner.jobs["00000000-0000-4000-8000-000000000001"]["status"] == "queued"
 
 
@@ -360,9 +352,7 @@ def test_server_returns_terminal_snapshot_from_deadline_cancel_race():
         sleeper=lambda _seconds: pytest.fail("deadline should already be exceeded"),
     )
 
-    response = server.handle(
-        _server_request("host.memory", {}, nonce="cancel-race")
-    )
+    response = server.handle(_server_request("host.memory", {}, nonce="cancel-race"))
 
     assert response["ok"] is True
     assert response["result"]["status"] == "succeeded"
@@ -435,14 +425,10 @@ def test_server_gets_output_and_cancels_jobs_idempotently():
     server = AgentServer(SECRET, runner, clock=lambda: 1000)
     created = server.handle(_server_request("host.memory", {}, nonce="create"))
     job_id = created["result"]["job_id"]
-    runner.jobs[job_id].update(
-        status="running", output="abcdef", output_offset=6
-    )
+    runner.jobs[job_id].update(status="running", output="abcdef", output_offset=6)
 
     fetched = server.handle(
-        _server_request(
-            "job.get", {"job_id": job_id, "offset": 2}, nonce="get"
-        )
+        _server_request("job.get", {"job_id": job_id, "offset": 2}, nonce="get")
     )
     _assert_signed_response(fetched, request_id="request-get")
     assert fetched["result"]["output"] == "cdef"
@@ -458,9 +444,7 @@ def test_server_gets_output_and_cancels_jobs_idempotently():
     assert second["result"] == first["result"]
 
     beyond = server.handle(
-        _server_request(
-            "job.get", {"job_id": job_id, "offset": 7}, nonce="beyond"
-        )
+        _server_request("job.get", {"job_id": job_id, "offset": 7}, nonce="beyond")
     )
     assert beyond["error"] == {
         "code": "invalid_parameters",
@@ -515,9 +499,7 @@ def test_server_maps_missing_jobs_and_runner_failures_without_internal_details()
     assert missing["error"] == {"code": "job_not_found", "message": "job not found"}
 
     broken_server = AgentServer(SECRET, BrokenRunner(), clock=lambda: 1000)
-    broken = broken_server.handle(
-        _server_request("host.memory", {}, nonce="broken")
-    )
+    broken = broken_server.handle(_server_request("host.memory", {}, nonce="broken"))
     assert broken["error"] == {
         "code": "operation_failed",
         "message": "operation failed",
@@ -893,7 +875,9 @@ def test_server_cli_standalone_mode_ignores_activation_environment(
         "_read_secret_file",
         lambda _path, *, expected_gid: SECRET,
     )
-    monkeypatch.setattr(server_module, "_resolve_key_group", lambda _name: 4242, raising=False)
+    monkeypatch.setattr(
+        server_module, "_resolve_key_group", lambda _name: 4242, raising=False
+    )
     monkeypatch.setattr(server_module, "JobRunner", lambda path: _FakeRunner())
     monkeypatch.setattr(server_module, "UnixSocketAgentServer", FakeTransport)
     socket_path = tmp_path / "standalone.sock"
@@ -936,9 +920,7 @@ def _mock_posix_key_metadata(monkeypatch, *, mode, uid=1000, gid=2000):
 
 
 @pytest.mark.parametrize("mode", [0o600, 0o640])
-def test_server_key_reader_accepts_secure_posix_modes(
-    tmp_path, monkeypatch, mode
-):
+def test_server_key_reader_accepts_secure_posix_modes(tmp_path, monkeypatch, mode):
     key_path = tmp_path / "secure.key"
     key_path.write_bytes(SECRET)
     _mock_posix_key_metadata(
@@ -983,9 +965,7 @@ def test_server_key_reader_rejects_unsafe_posix_metadata(
 
 
 @pytest.mark.parametrize("file_type", [stat.S_IFDIR, stat.S_IFLNK])
-def test_server_key_reader_rejects_non_regular_files(
-    tmp_path, monkeypatch, file_type
-):
+def test_server_key_reader_rejects_non_regular_files(tmp_path, monkeypatch, file_type):
     key_path = tmp_path / "not-regular.key"
     key_path.write_bytes(SECRET)
     _mock_posix_key_metadata(
@@ -1262,10 +1242,7 @@ def test_unix_socket_chmod_refuses_replacement_paths(
         "chmod",
         lambda *_args, **_kwargs: pytest.fail("replacement must not be chmodded"),
     )
-    assert (
-        UnixSocketAgentServer._chmod_if_same_socket(path, (10, 22), 0o660)
-        is False
-    )
+    assert UnixSocketAgentServer._chmod_if_same_socket(path, (10, 22), 0o660) is False
 
 
 def test_unix_socket_operations_fail_closed_after_ancestor_replacement(
@@ -2023,7 +2000,9 @@ def test_rejects_tampering_expiration_future_timestamp_and_replay():
         verify_message(signed, SECRET, now=1002, nonces=cache)
 
     with pytest.raises(ProtocolError, match="expired"):
-        verify_message(_signed_request(timestamp=1), SECRET, now=1000, nonces=NonceCache())
+        verify_message(
+            _signed_request(timestamp=1), SECRET, now=1000, nonces=NonceCache()
+        )
 
     with pytest.raises(ProtocolError, match="future"):
         verify_message(
@@ -2319,7 +2298,9 @@ def test_outbound_json_rejects_nonstandard_constants(value):
         encode_frame({"value": value})
     assert frame_error.value.__cause__ is None
 
-    with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
+    with pytest.raises(
+        ProtocolError, match="^message is not valid JSON$"
+    ) as canonical_error:
         canonical_bytes({"value": value})
     assert canonical_error.value.__cause__ is None
 
@@ -2333,7 +2314,9 @@ def test_outbound_json_normalizes_excessive_nesting():
         encode_frame(value)
     assert frame_error.value.__cause__ is None
 
-    with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
+    with pytest.raises(
+        ProtocolError, match="^message is not valid JSON$"
+    ) as canonical_error:
         canonical_bytes(value)
     assert canonical_error.value.__cause__ is None
 
@@ -2353,7 +2336,9 @@ def test_outbound_json_rejects_values_that_cannot_round_trip(message):
         encode_frame(message)
     assert frame_error.value.__cause__ is None
 
-    with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
+    with pytest.raises(
+        ProtocolError, match="^message is not valid JSON$"
+    ) as canonical_error:
         canonical_bytes(message)
     assert canonical_error.value.__cause__ is None
 
@@ -2380,7 +2365,9 @@ def test_outbound_json_normalizes_circular_references():
         encode_frame(message)
     assert frame_error.value.__cause__ is None
 
-    with pytest.raises(ProtocolError, match="^message is not valid JSON$") as canonical_error:
+    with pytest.raises(
+        ProtocolError, match="^message is not valid JSON$"
+    ) as canonical_error:
         canonical_bytes(message)
     assert canonical_error.value.__cause__ is None
 
@@ -2456,9 +2443,7 @@ def test_streaming_redactor_handles_split_and_invalid_utf8_without_leaking():
 
 def _redact_chunks(chunks):
     redactor = StreamingRedactor()
-    return b"".join(
-        [*(redactor.feed(chunk) for chunk in chunks), redactor.finish()]
-    )
+    return b"".join([*(redactor.feed(chunk) for chunk in chunks), redactor.finish()])
 
 
 @pytest.mark.parametrize(
@@ -2587,9 +2572,7 @@ def test_streaming_redactor_json_key_mixed_whitespace_is_byte_exact(
 
 def test_streaming_redactor_bounds_direct_key_and_whitespace_decisions():
     long_key_payload = b'{"DGX_' + b"A" * 1024 + b'": "long-key-secret"}'
-    long_key_output = _redact_chunks(
-        [bytes((byte,)) for byte in long_key_payload]
-    )
+    long_key_output = _redact_chunks([bytes((byte,)) for byte in long_key_payload])
     assert b"long-key-secret" not in long_key_output
     assert long_key_output == b'{"[REDACTED]": "[REDACTED]"}'
 
@@ -2667,9 +2650,7 @@ def test_streaming_redactor_json_key_wait_state_is_strictly_bounded():
     released = redactor.feed(prefix)
 
     string_state_size = sum(
-        len(value)
-        for value in vars(redactor).values()
-        if isinstance(value, str)
+        len(value) for value in vars(redactor).values() if isinstance(value, str)
     )
     assert released == b'{"[REDACTED]"' + whitespace
     assert redactor._buffer == ""
@@ -2826,11 +2807,15 @@ def test_runner_uses_clean_environment_devnull_and_merged_output(tmp_path, monke
     lines = result.output.splitlines()
     assert lines[:2] == ["stderr", "stdin=''"]
     environment = json.loads(lines[-2])
-    assert environment == {
+    expected_environment = {
         "DGX_OPS_RECOVERY_TOKEN": "[REDACTED]",
         "LANG": "runner-test",
         "PATH": SAFE_PATH,
     }
+    coerced_locale = environment.pop("LC_CTYPE", None)
+    assert environment == expected_environment
+    if coerced_locale is not None:
+        assert coerced_locale == "C.UTF-8"
     assert lines[-1] == "[REDACTED]"
     assert "inherited-secret" not in result.output
 
@@ -2973,11 +2958,7 @@ def test_cancel_sets_event_when_leader_exited_but_output_reader_is_active(
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
 def test_cancel_terminates_the_entire_posix_process_group(tmp_path):
     child_pid = tmp_path / "child.pid"
-    child_code = (
-        "import signal, time; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "time.sleep(10)"
-    )
+    child_code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)"
     code = (
         "import pathlib, subprocess, sys, time; "
         f"p=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
@@ -3018,9 +2999,7 @@ def test_timeout_covers_background_group_after_leader_exits(tmp_path):
     runner = JobRunner(tmp_path, termination_grace=0.05)
 
     started_at = time.monotonic()
-    job = runner.start(
-        [sys.executable, "-c", parent_code], cwd=tmp_path, timeout=0.2
-    )
+    job = runner.start([sys.executable, "-c", parent_code], cwd=tmp_path, timeout=0.2)
     result = _wait_for_terminal(runner, job.id)
 
     assert result.status == "timed_out"
@@ -3028,9 +3007,7 @@ def test_timeout_covers_background_group_after_leader_exits(tmp_path):
     assert time.monotonic() - started_at < 1.5
 
 
-def test_timeout_tracks_injected_process_group_after_leader_exit(
-    tmp_path, monkeypatch
-):
+def test_timeout_tracks_injected_process_group_after_leader_exit(tmp_path, monkeypatch):
     class ExitedLeader:
         pid = 4242
         stdout = io.BytesIO()
@@ -3053,6 +3030,17 @@ def test_timeout_tracks_injected_process_group_after_leader_exit(
             group_alive = False
 
     runner = JobRunner(tmp_path, termination_grace=0)
+
+    def capture_identity(_pid, recovery_token):
+        return runner_module._ProcessIdentity(
+            pid=ExitedLeader.pid,
+            process_group=ExitedLeader.pid,
+            session_id=ExitedLeader.pid,
+            start_time_ticks=1,
+            boot_id="boot-id",
+            recovery_token=recovery_token,
+        )
+
     monkeypatch.setattr(runner_module, "_HAS_PROCESS_GROUPS", True)
     monkeypatch.setattr(runner_module.signal, "SIGKILL", 9, raising=False)
     monkeypatch.setattr(runner_module.os, "killpg", fake_killpg, raising=False)
@@ -3066,10 +3054,9 @@ def test_timeout_tracks_injected_process_group_after_leader_exit(
         "_spawn_process",
         lambda *_args, **_kwargs: (ExitedLeader(), None),
     )
+    monkeypatch.setattr(runner, "_capture_process_identity", capture_identity)
 
-    job = runner.start(
-        [sys.executable, "-c", "unused"], cwd=tmp_path, timeout=0.05
-    )
+    job = runner.start([sys.executable, "-c", "unused"], cwd=tmp_path, timeout=0.05)
     result = _wait_for_terminal(runner, job.id)
 
     assert result.status == "timed_out"
@@ -3226,9 +3213,7 @@ def test_runner_rejects_oversized_launcher_request_before_creating_job(tmp_path)
     assert runner._jobs == {}
 
 
-def test_spawn_closes_first_pipe_when_second_pipe_creation_fails(
-    tmp_path, monkeypatch
-):
+def test_spawn_closes_first_pipe_when_second_pipe_creation_fails(tmp_path, monkeypatch):
     runner = JobRunner(tmp_path)
     real_pipe = os.pipe
     created_descriptors = []
@@ -3260,9 +3245,7 @@ def test_spawn_closes_first_pipe_when_second_pipe_creation_fails(
             os.fstat(descriptor)
 
 
-def test_spawn_closes_all_pipes_when_launcher_resolution_fails(
-    tmp_path, monkeypatch
-):
+def test_spawn_closes_all_pipes_when_launcher_resolution_fails(tmp_path, monkeypatch):
     runner = JobRunner(tmp_path)
     real_pipe = os.pipe
     created_descriptors = []
@@ -3293,9 +3276,7 @@ def test_spawn_closes_all_pipes_when_launcher_resolution_fails(
             os.fstat(descriptor)
 
 
-def test_cancel_before_launcher_go_never_executes_and_reaps(
-    tmp_path, monkeypatch
-):
+def test_cancel_before_launcher_go_never_executes_and_reaps(tmp_path, monkeypatch):
     marker = tmp_path / "must-not-run"
     ready_persisted = threading.Event()
     release_worker = threading.Event()
@@ -3409,9 +3390,7 @@ def test_runner_persists_pre_spawn_recovery_token(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_module, "_HAS_PROCESS_GROUPS", True)
     monkeypatch.setattr(runner_module.subprocess, "Popen", refuse_spawn)
 
-    job = runner.start(
-        [sys.executable, "-c", "unused"], cwd=tmp_path, timeout=1
-    )
+    job = runner.start([sys.executable, "-c", "unused"], cwd=tmp_path, timeout=1)
     result = _wait_for_terminal(runner, job.id)
 
     assert result.status == "failed"
@@ -3437,7 +3416,11 @@ def test_launcher_persist_failure_before_go_never_executes_command(
 
     monkeypatch.setattr(runner, "_persist", fail_ready_identity)
     job = runner.start(
-        [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"],
+        [
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        ],
         cwd=tmp_path,
         timeout=2,
     )
@@ -3471,9 +3454,7 @@ def test_cancel_covers_background_group_after_leader_exits(tmp_path):
         f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))"
     )
     runner = JobRunner(tmp_path, termination_grace=0.05)
-    job = runner.start(
-        [sys.executable, "-c", parent_code], cwd=tmp_path, timeout=2
-    )
+    job = runner.start([sys.executable, "-c", parent_code], cwd=tmp_path, timeout=2)
     deadline = time.monotonic() + 1
     while not child_pid.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -3693,7 +3674,9 @@ def test_restart_kills_only_exact_fake_proc_identity_match(tmp_path, monkeypatch
         fake_pidfd_send_signal,
         raising=False,
     )
-    monkeypatch.setattr(runner_module.os, "killpg", forbid_recovery_killpg, raising=False)
+    monkeypatch.setattr(
+        runner_module.os, "killpg", forbid_recovery_killpg, raising=False
+    )
 
     runner = JobRunner(jobs, termination_grace=0)
 
@@ -3751,14 +3734,21 @@ def test_runner_rejects_invalid_limits_offsets_environment_and_job_ids(tmp_path)
 def test_runner_job_directory_chmod_failure_is_fatal(tmp_path, monkeypatch):
     job_dir = tmp_path / "jobs"
     job_dir.mkdir()
-    original_chmod = Path.chmod
+    if os.name == "posix":
 
-    def deny_job_directory_chmod(path, mode):
-        if path == job_dir:
+        def deny_job_directory_fchmod(_descriptor, _mode):
             raise PermissionError("chmod denied")
-        return original_chmod(path, mode)
 
-    monkeypatch.setattr(Path, "chmod", deny_job_directory_chmod)
+        monkeypatch.setattr(runner_module.os, "fchmod", deny_job_directory_fchmod)
+    else:
+        original_chmod = Path.chmod
+
+        def deny_job_directory_chmod(path, mode):
+            if path == job_dir:
+                raise PermissionError("chmod denied")
+            return original_chmod(path, mode)
+
+        monkeypatch.setattr(Path, "chmod", deny_job_directory_chmod)
 
     with pytest.raises(PermissionError, match="chmod denied"):
         JobRunner(job_dir)
@@ -3802,9 +3792,7 @@ def test_runner_enforces_private_directory_and_regular_metadata_modes(tmp_path):
 
     result = _wait_for_terminal(
         runner,
-        runner.start(
-            [sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout=1
-        ).id,
+        runner.start([sys.executable, "-c", "print('ok')"], cwd=tmp_path, timeout=1).id,
     )
     metadata_stat = (job_dir / f"{result.id}.json").lstat()
     assert stat.S_ISREG(metadata_stat.st_mode)

@@ -605,7 +605,9 @@ describe('DeploymentsPage lifecycle actions', () => {
     expect(uninstall).toHaveTextContent('卸载服务')
     await user.click(uninstall)
 
-    expect(await screen.findByText('卸载服务 qwen-production')).toBeInTheDocument()
+    expect(await screen.findByText('卸载服务 qwen-production', {
+      selector: '.ant-popconfirm-title',
+    })).toBeInTheDocument()
     expect(screen.getByText(
       '将删除服务容器、部署记录和网关路由，但保留模型文件。',
     )).toBeInTheDocument()
