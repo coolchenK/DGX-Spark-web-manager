@@ -8,9 +8,13 @@ from app.services.deployment_memory import (
 
 
 class FakeContainer:
-    def __init__(self, pids, memory=0):
+    def __init__(self, pids, memory=0, status="running"):
         self.pids = pids
         self.memory = memory
+        self.attrs = {"State": {"Status": status}}
+
+    def reload(self):
+        return None
 
     def top(self, **_kwargs):
         return {"Titles": ["UID", "PID"], "Processes": [["1000", str(pid)] for pid in self.pids]}
@@ -85,3 +89,37 @@ def test_snapshot_falls_back_to_container_memory_without_gpu_process():
 
     assert result["running"]["memory_used_bytes"] == 987654
     assert result["running"]["memory_source"] == "container"
+
+
+
+def test_snapshot_measures_live_container_even_when_database_status_is_stale():
+    docker_client = SimpleNamespace(
+        containers=FakeContainers({"container-1": FakeContainer([101], memory=1234)})
+    )
+    service = DeploymentMemoryService(
+        docker_client,
+        command_runner=successful_runner("101, 4096\n"),
+    )
+
+    result = service.snapshot(
+        [deployment("live", status="stopped", container_id="container-1")]
+    )
+
+    assert result["live"]["memory_used_bytes"] == 4096 * 1024 * 1024
+    assert result["live"]["memory_source"] == "nvidia_smi"
+
+
+def test_snapshot_reports_zero_when_database_says_running_but_container_is_not_live():
+    stopped = FakeContainer([], memory=1234, status="exited")
+    docker_client = SimpleNamespace(
+        containers=FakeContainers({"container-1": stopped, "deployment": stopped})
+    )
+    service = DeploymentMemoryService(
+        docker_client,
+        command_runner=successful_runner("101, 4096\n"),
+    )
+
+    result = service.snapshot([deployment("stale-running")])
+
+    assert result["stale-running"]["memory_used_bytes"] == 0
+    assert result["stale-running"]["memory_source"] == "stopped"

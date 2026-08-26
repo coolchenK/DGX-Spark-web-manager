@@ -1781,6 +1781,7 @@ class DeploymentService:
                 if old_was_running:
                     adapter.stop(old_container, timeout=30)
                 old_container.rename(backup_name)
+                old_container.reload()
             context.update(
                 progress=20,
                 message=f"Rebuilding drifted container {expected_container_name}",
@@ -1840,6 +1841,7 @@ class DeploymentService:
                 try:
                     if old_container.name == backup_name:
                         old_container.rename(expected_container_name)
+                        old_container.reload()
                     if old_was_running and old_container.status != "running":
                         adapter.start(old_container)
                 except BaseException:

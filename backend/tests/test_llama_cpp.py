@@ -70,16 +70,16 @@ def test_llama_cpp_command_preserves_gguf_mmproj_and_mtp_settings(tmp_path):
 
     command = adapter.command(_spec(model_path))
 
-    assert command[:3] == [
-        "/opt/llamacpp/llama-server",
+    assert command[:2] == [
         "--model",
         "/models/qwen/model-Q8_0.gguf",
     ]
+    assert "/opt/llamacpp/llama-server" not in command
     assert command[command.index("--alias") + 1] == "qwen-gguf"
     assert command[command.index("--mmproj") + 1] == "/models/qwen/mmproj-F16.gguf"
     assert command[command.index("--ctx-size") + 1] == "262144"
     assert command[command.index("--spec-type") + 1] == "draft-mtp"
-    assert command[command.index("--spec-draft-model") + 1] == command[2]
+    assert command[command.index("--spec-draft-model") + 1] == command[1]
     assert command[command.index("--spec-draft-n-max") + 1] == "3"
     assert "--jinja" in command
     assert "--cont-batching" in command

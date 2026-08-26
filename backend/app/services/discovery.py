@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.models import Deployment, ModelAsset, utc_now
 
 MODEL_PAYLOAD_SUFFIXES = (".safetensors", ".bin", ".gguf", ".pt", ".pth", ".onnx")
+DEPLOYMENT_LIFECYCLE_STATUSES = frozenset({"starting", "stopping", "deleting"})
 
 
 def parse_hf_cache_repository(directory_name: str) -> str | None:
@@ -158,6 +159,7 @@ def container_candidate(attrs: dict[str, Any]) -> dict[str, Any] | None:
         "status": state.get("Status", "unknown"),
         "health": health or ("healthy" if state.get("Status") == "running" else "unknown"),
         "managed": labels.get("com.dgx-spark-manager.managed") == "true",
+        "managed_deployment_id": labels.get("com.dgx-spark-manager.deployment-id"),
         "config": {
             "command": command,
             "model_path": model_path,
@@ -332,16 +334,36 @@ class DiscoveryService:
                 else {}
             )
             candidate.update(probe)
-            existing = db.scalar(
-                select(Deployment).where(
-                    or_(
-                        Deployment.container_id == candidate["container_id"],
-                        Deployment.container_name == candidate["container_name"],
-                    )
-                )
+            managed_deployment_id = candidate.pop("managed_deployment_id", None)
+            existing = (
+                db.get(Deployment, managed_deployment_id)
+                if candidate["managed"] and managed_deployment_id
+                else None
             )
             if existing is None:
+                existing = db.scalar(
+                    select(Deployment).where(
+                        or_(
+                            Deployment.container_id == candidate["container_id"],
+                            Deployment.container_name == candidate["container_name"],
+                        )
+                    )
+                )
+            if existing is not None and existing.managed:
+                identity_matches = (
+                    existing.container_id == candidate["container_id"]
+                    and existing.container_name == candidate["container_name"]
+                )
+                if (
+                    existing.status in DEPLOYMENT_LIFECYCLE_STATUSES
+                    or not identity_matches
+                ):
+                    if existing not in discovered:
+                        discovered.append(existing)
+                    continue
+            if existing is None:
                 existing = Deployment(
+                    id=managed_deployment_id if candidate["managed"] else None,
                     name=candidate["name"],
                     runtime=candidate["runtime"],
                     endpoint_url=candidate["endpoint_url"],

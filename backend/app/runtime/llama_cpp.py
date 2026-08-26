@@ -134,7 +134,6 @@ class LlamaCppAdapter(RuntimeAdapter):
         container_model = str(container_model_root / model_file.name)
         config = self._config(spec)
         command = [
-            str(self.container_runtime_dir / "llama-server"),
             "--model",
             container_model,
             "--alias",

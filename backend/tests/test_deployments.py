@@ -5101,7 +5101,20 @@ def test_unhealthy_launch_contract_replacement_rolls_back_and_marks_unhealthy(
     contract = launch_contract()
     drifted = launch_contract_attrs(contract)
     drifted["Config"]["Cmd"] = ["wrong"]
-    old = LaunchContractContainer("f" * 64, "dgx-managed", drifted, status="running")
+    class CachedNameContainer(LaunchContractContainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.engine_name = self.name
+
+        def rename(self, name):
+            self.renames.append(name)
+            self.engine_name = name
+
+        def reload(self):
+            super().reload()
+            self.name = self.engine_name
+
+    old = CachedNameContainer("f" * 64, "dgx-managed", drifted, status="running")
     replacement = LaunchContractContainer(
         "1" * 64,
         "dgx-managed",

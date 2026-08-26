@@ -81,27 +81,38 @@ class DeploymentMemoryService:
         gpu_usage, nvidia_available = self._nvidia_usage()
         result: dict[str, dict[str, Any]] = {}
         for deployment in deployments:
-            if deployment.status != "running":
-                result[deployment.id] = {
-                    "memory_used_bytes": 0,
-                    "memory_source": "stopped",
-                    "memory_measured_at": measured_at,
-                }
-                continue
-            reference = deployment.container_id or deployment.container_name
-            if not reference:
+            references = [deployment.container_id, deployment.container_name]
+            references = [reference for reference in references if reference]
+            if not references:
                 result[deployment.id] = {
                     "memory_used_bytes": None,
                     "memory_source": "unavailable",
                     "memory_measured_at": measured_at,
                 }
                 continue
-            try:
-                container = self.docker_client.containers.get(reference)
-                pids = container_process_ids(container)
-            except Exception:
-                container = None
-                pids = set()
+            container = None
+            pids: set[int] = set()
+            for reference in references:
+                try:
+                    candidate = self.docker_client.containers.get(reference)
+                    candidate.reload()
+                except Exception:
+                    continue
+                if (candidate.attrs.get("State") or {}).get("Status") != "running":
+                    continue
+                container = candidate
+                try:
+                    pids = container_process_ids(candidate)
+                except Exception:
+                    pids = set()
+                break
+            if container is None:
+                result[deployment.id] = {
+                    "memory_used_bytes": 0,
+                    "memory_source": "stopped",
+                    "memory_measured_at": measured_at,
+                }
+                continue
             gpu_bytes = sum(gpu_usage.get(pid, 0) for pid in pids)
             if gpu_bytes > 0:
                 memory_used = gpu_bytes

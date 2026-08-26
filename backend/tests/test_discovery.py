@@ -488,6 +488,90 @@ def test_scan_does_not_probe_stopped_container_endpoint_reused_by_live_service(
     assert stopped.health == "unknown"
 
 
+def test_scan_does_not_mutate_managed_identity_during_container_rebuild(
+    settings, monkeypatch
+):
+    deployment_id = "7bc72a18-ec87-49a9-8ad6-606d432feef9"
+
+    def attrs(container_id, name, status):
+        return {
+            "Id": container_id,
+            "Name": f"/{name}",
+            "Config": {
+                "Image": "vllm/vllm-openai:latest",
+                "Cmd": [
+                    "serve",
+                    "/model",
+                    "--served-model-name",
+                    "qwen36-35b-heretic",
+                    "--port",
+                    "8000",
+                ],
+                "Labels": {
+                    "com.dgx-spark-manager.managed": "true",
+                    "com.dgx-spark-manager.deployment-id": deployment_id,
+                },
+            },
+            "State": {"Status": status},
+            "NetworkSettings": {"Ports": {}},
+            "HostConfig": {
+                "PortBindings": {
+                    "8000/tcp": [{"HostIp": "", "HostPort": "8000"}]
+                }
+            },
+        }
+
+    class Container:
+        def __init__(self, value):
+            self.attrs = value
+
+        def reload(self):
+            return None
+
+    class Containers:
+        @staticmethod
+        def list(*, all):
+            assert all is True
+            return [
+                Container(attrs("old-id", f"dgx-backup-{deployment_id}", "created")),
+                Container(attrs("replacement-id", "qwen36-final", "running")),
+            ]
+
+    class DockerClient:
+        containers = Containers()
+
+    service = DiscoveryService(settings.model_root_paths)
+    monkeypatch.setattr(service, "_docker_client", lambda: DockerClient())
+    monkeypatch.setattr(service, "_probe", lambda _candidate: {"health": "healthy"})
+    database = Database(settings.database_url)
+    database.create_schema()
+
+    with database.session_factory() as db:
+        deployment = Deployment(
+            id=deployment_id,
+            name="Qwen3.6-35B-A3B-heretic",
+            runtime="vllm",
+            container_id="old-id",
+            container_name="qwen36-final",
+            endpoint_url="http://127.0.0.1:8000",
+            api_model_name="qwen36-35b-heretic",
+            status="starting",
+            health="unknown",
+            managed=True,
+        )
+        db.add(deployment)
+        db.commit()
+
+        discovered = service.scan_containers(db)
+        db.refresh(deployment)
+
+    assert discovered == [deployment]
+    assert deployment.container_id == "old-id"
+    assert deployment.container_name == "qwen36-final"
+    assert deployment.status == "starting"
+    assert deployment.health == "unknown"
+
+
 def test_model_metadata_is_derived_from_snapshot_and_config(tmp_path):
     snapshot = tmp_path / "models--Qwen--Qwen2.5-0.5B-Instruct" / "snapshots" / "abc123"
     snapshot.mkdir(parents=True)
