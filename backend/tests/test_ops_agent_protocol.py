@@ -2958,7 +2958,11 @@ def test_cancel_sets_event_when_leader_exited_but_output_reader_is_active(
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
 def test_cancel_terminates_the_entire_posix_process_group(tmp_path):
     child_pid = tmp_path / "child.pid"
-    child_code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)"
+    child_code = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(10)"
+    )
     code = (
         "import pathlib, subprocess, sys, time; "
         f"p=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
