@@ -145,6 +145,7 @@ def test_llama_cpp_exposes_only_server_configured_runtime_mount(tmp_path):
         "/opt/llamacpp": {"bind": "/opt/llamacpp", "mode": "ro"}
     }
     assert adapter.environment(spec) == {"LD_LIBRARY_PATH": "/opt/llamacpp/lib"}
+    assert adapter.entrypoint(spec) == ["/opt/llamacpp/llama-server"]
 
 
 def test_llama_cpp_capabilities_use_manifest_without_probe(tmp_path):

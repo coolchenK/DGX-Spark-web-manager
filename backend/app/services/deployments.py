@@ -994,6 +994,7 @@ class DeploymentService:
         fingerprint = spec_fingerprint or deployment_spec_fingerprint(spec)
         return client.containers.run(
             spec.image,
+            entrypoint=adapter.entrypoint(spec),
             command=adapter.command(spec),
             name=name,
             detach=True,

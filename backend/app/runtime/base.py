@@ -425,6 +425,10 @@ class RuntimeAdapter(ABC):
         del spec
         return {}
 
+    def entrypoint(self, spec: DeploymentSpec) -> list[str] | None:
+        del spec
+        return None
+
     def start(self, container: Any) -> None:
         container.start()
 

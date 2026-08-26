@@ -127,6 +127,10 @@ class LlamaCppAdapter(RuntimeAdapter):
         self.validate(spec)
         return {"LD_LIBRARY_PATH": f"{self.container_runtime_dir}/lib"}
 
+    def entrypoint(self, spec: DeploymentSpec) -> list[str]:
+        self.validate(spec)
+        return [str(self.container_runtime_dir / "llama-server")]
+
     def command(self, spec: DeploymentSpec) -> list[str]:
         model_path = self.validate(spec)
         model_file, mmproj_file = self._select_files(spec, model_path)
