@@ -224,13 +224,6 @@ async def proxy_openai_request(
             buffered_tool_lines: list[tuple[dict[str, Any] | None, str, bool]] = []
             tool_call_states: dict[int, dict[str, Any]] = {}
             buffering_tool_calls = False
-            promote_reasoning_to_content = any(
-                isinstance(message, dict)
-                and isinstance(message.get("content"), str)
-                and "<tool_response>" in message["content"]
-                for message in (body.get("messages") or [])
-            )
-
             def flush_tool_lines() -> str:
                 normalized = _normalize_streamed_task_calls(tool_call_states)
                 rendered = "".join(
@@ -312,9 +305,6 @@ async def proxy_openai_request(
                                     or delta.get("reasoning")
                                 )
                                 if reasoning:
-                                    if promote_reasoning_to_content and not delta.get("content"):
-                                        delta["content"] = reasoning
-                                        changed = True
                                     reasoning_buffer += reasoning
                                     # Some Qwen templates leave the requested tool call
                                     # in the reasoning channel. Promote complete tags.

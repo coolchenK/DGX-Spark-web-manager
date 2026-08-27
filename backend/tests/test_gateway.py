@@ -742,7 +742,7 @@ def test_gateway_enriches_empty_huggingface_search_result_from_live_api(client):
 
 
 @respx.mock
-def test_gateway_preserves_multi_step_continuation_after_tool_response(client):
+def test_gateway_guides_multi_step_continuation_after_tool_response(client):
     key = _create_gateway_key(client)
     _seed_deployment(
         client,
@@ -778,9 +778,9 @@ def test_gateway_preserves_multi_step_continuation_after_tool_response(client):
     assert response.status_code == 200
     forwarded = json.loads(route.calls[0].request.content)
     assert forwarded["messages"][-1]["role"] == "user"
-    assert forwarded["messages"][-1]["content"].startswith("<tool_response>")
+    assert "call the next available tool now" in forwarded["messages"][-1]["content"]
     assert "现在必须向用户给出最终回答" not in forwarded["messages"][-1]["content"]
-    assert "chat_template_kwargs" not in forwarded
+    assert forwarded["chat_template_kwargs"]["enable_thinking"] is False
 
 
 @respx.mock
@@ -840,7 +840,7 @@ def test_gateway_reexposes_failed_bash_tool_for_corrected_retry(client):
 
 
 @respx.mock
-def test_gateway_preserves_thinking_for_reasoning_only_retry_after_failed_tool(client):
+def test_gateway_does_not_duplicate_reasoning_after_failed_tool(client):
     key = _create_gateway_key(client)
     _seed_deployment(client)
     route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
@@ -879,8 +879,9 @@ def test_gateway_preserves_thinking_for_reasoning_only_retry_after_failed_tool(c
     )
     assert response.status_code == 200
     forwarded = json.loads(route.calls[0].request.content)
-    assert "chat_template_kwargs" not in forwarded
-    assert b'"content":"python failed. use curl directly."' in response.content
+    assert forwarded["chat_template_kwargs"]["enable_thinking"] is False
+    assert b'"reasoning_text":"python failed. use curl directly."' in response.content
+    assert b'"content":"python failed. use curl directly."' not in response.content
     assert b'"finish_reason":"stop"' in response.content
     assert b"[DONE]" in response.content
 

@@ -274,6 +274,40 @@ async def enrich_empty_huggingface_search(body: dict[str, Any]) -> dict[str, Any
     return normalized
 
 
+def normalize_alma_tool_continuation(body: dict[str, Any]) -> dict[str, Any]:
+    """Keep Alma moving after an XML tool result without duplicating reasoning."""
+    normalized = dict(body)
+    messages = normalized.get("messages")
+    if not isinstance(messages, list) or not any(
+        isinstance(message, Mapping)
+        and isinstance(message.get("content"), str)
+        and "<tool_response>" in message["content"]
+        for message in messages
+    ):
+        return normalized
+
+    kwargs = normalized.get("chat_template_kwargs")
+    kwargs = dict(kwargs) if isinstance(kwargs, Mapping) else {}
+    # A number of Qwen variants can finish immediately after a reasoning-only
+    # continuation. Use the direct answer/tool channel after a tool result so
+    # the client always receives an actionable next step.
+    kwargs["enable_thinking"] = False
+    normalized["chat_template_kwargs"] = kwargs
+    normalized["messages"] = [
+        *messages,
+        {
+            "role": "user",
+            "content": (
+                "Continue the original task using the tool result above. "
+                "If more information or action is needed, call the next available tool now. "
+                "Otherwise, provide the complete final answer now. "
+                "Do not stop after describing a plan, a future tool call, or a status update."
+            ),
+        },
+    ]
+    return normalized
+
+
 def normalize_reasoning_effort(
     body: dict[str, Any],
     *,
@@ -612,6 +646,7 @@ async def _proxy(
     defaults, supported = deployment_generation_settings(deployment)
     normalized_body = extract_alma_system_tools(dict(body))
     normalized_body = await enrich_empty_huggingface_search(normalized_body)
+    normalized_body = normalize_alma_tool_continuation(normalized_body)
     config = deployment.config if isinstance(deployment.config, Mapping) else {}
     spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
     normalized_body = normalize_reasoning_effort(
