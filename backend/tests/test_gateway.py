@@ -846,14 +846,24 @@ def test_gateway_does_not_duplicate_reasoning_after_failed_tool(client):
     route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
         return_value=Response(
             200,
-            content=(
-                b'data: {"choices":[{"delta":{"reasoning":'
-                b'"python failed. use curl directly."},"finish_reason":null}]}\n\n'
-                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
-                b'"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}\n\n'
-                b"data: [DONE]\n\n"
-            ),
-            headers={"content-type": "text/event-stream"},
+            json={
+                "id": "chatcmpl-reasoning",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "qwen-upstream",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "curl succeeded.",
+                            "reasoning": "python failed. use curl directly.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+            },
         )
     )
     response = client.post(
@@ -879,10 +889,158 @@ def test_gateway_does_not_duplicate_reasoning_after_failed_tool(client):
     )
     assert response.status_code == 200
     forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["stream"] is False
     assert forwarded["chat_template_kwargs"]["enable_thinking"] is False
     assert b'"reasoning_text":"python failed. use curl directly."' in response.content
     assert b'"content":"python failed. use curl directly."' not in response.content
+    assert b'"content":"curl succeeded."' in response.content
     assert b'"finish_reason":"stop"' in response.content
+    assert b"[DONE]" in response.content
+
+
+@respx.mock
+def test_gateway_retries_empty_alma_tool_continuation_before_returning(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    responses = iter(
+        [
+            Response(
+                200,
+                json={
+                    "id": "chatcmpl-empty",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "qwen-upstream",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": ""},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 1,
+                        "total_tokens": 101,
+                    },
+                },
+            ),
+            Response(
+                200,
+                json={
+                    "id": "chatcmpl-retry",
+                    "object": "chat.completion",
+                    "created": 2,
+                    "model": "qwen-upstream",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "complete answer",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 120,
+                        "completion_tokens": 10,
+                        "total_tokens": 130,
+                    },
+                },
+            ),
+        ]
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        side_effect=lambda _request: next(responses)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "messages": [
+                {"role": "user", "content": "search"},
+                {
+                    "role": "user",
+                    "content": '<tool_response>{"name":"WebFetch","content":"ok"}</tool_response>',
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert route.call_count == 2
+    first = json.loads(route.calls[0].request.content)
+    retry = json.loads(route.calls[1].request.content)
+    assert first["stream"] is False
+    assert "stream_options" not in first
+    assert retry["stream"] is False
+    assert "preceding assistant generation was empty" in retry["messages"][-1]["content"]
+    assert b'"content":"complete answer"' in response.content
+    assert b"[DONE]" in response.content
+
+    with client.app.state.database.session_factory() as db:
+        metric = db.scalars(
+            select(RequestMetric).where(RequestMetric.model == "qwen-upstream")
+        ).one()
+        assert metric.prompt_tokens == 220
+        assert metric.completion_tokens == 11
+
+
+@respx.mock
+def test_gateway_never_returns_an_empty_alma_tool_continuation(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "id": "chatcmpl-empty",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "qwen-upstream",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "stream": True,
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "result",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert route.call_count == 3
+    first = json.loads(route.calls[0].request.content)
+    final_retry = json.loads(route.calls[-1].request.content)
+    assert first["stream"] is False
+    assert first["chat_template_kwargs"]["enable_thinking"] is False
+    assert "call the next available tool now" in first["messages"][-1]["content"]
+    assert final_retry["tool_choice"] == "none"
+    assert "Do not call another tool" in final_retry["messages"][-1]["content"]
+    assert "模型在工具执行后连续返回了空结果" in response.text
     assert b"[DONE]" in response.content
 
 

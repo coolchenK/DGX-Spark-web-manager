@@ -275,13 +275,18 @@ async def enrich_empty_huggingface_search(body: dict[str, Any]) -> dict[str, Any
 
 
 def normalize_alma_tool_continuation(body: dict[str, Any]) -> dict[str, Any]:
-    """Keep Alma moving after an XML tool result without duplicating reasoning."""
+    """Keep Alma moving after a native or XML tool result without duplicating reasoning."""
     normalized = dict(body)
     messages = normalized.get("messages")
     if not isinstance(messages, list) or not any(
         isinstance(message, Mapping)
-        and isinstance(message.get("content"), str)
-        and "<tool_response>" in message["content"]
+        and (
+            message.get("role") == "tool"
+            or (
+                isinstance(message.get("content"), str)
+                and "<tool_response>" in message["content"]
+            )
+        )
         for message in messages
     ):
         return normalized

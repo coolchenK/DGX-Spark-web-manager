@@ -41,6 +41,9 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
   vLLM uses `qwen3_xml` + `qwen3`; SGLang uses `qwen3_coder` + `qwen3`; llama.cpp uses the
   template file with `--reasoning-format deepseek`. Stored Manager launch contracts are upgraded
   without starting stopped models, and running instances apply the change on their next restart.
+- Alma tool-result continuations are validated before their SSE response is released. Empty
+  continuations are retried with bounded corrective prompts, including native `role=tool` and XML
+  tool results, so a successful tool run cannot silently end with no assistant response.
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
   Model discovery exposes runtime, endpoint, context length, maximum output tokens, and saved
   generation defaults for each healthy running route; stopped deployments are hidden.
