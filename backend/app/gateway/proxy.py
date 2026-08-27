@@ -368,6 +368,15 @@ async def proxy_openai_request(
                             event,
                             tool_call_states,
                         )
+                        if tool_call_states:
+                            for choice in event.get("choices") or []:
+                                if (
+                                    isinstance(choice, dict)
+                                    and choice.get("finish_reason") == "stop"
+                                ):
+                                    choice["finish_reason"] = "tool_calls"
+                                    choice["alma_tool_step"] = True
+                                    changed = True
                         if has_tool_delta:
                             buffering_tool_calls = True
                         if buffering_tool_calls:
@@ -425,8 +434,13 @@ async def proxy_openai_request(
             changed = False
             for choice in parsed.get("choices") or []:
                 message = choice.get("message") if isinstance(choice, dict) else None
-                if isinstance(message, dict) and normalize_alma_tool_call_arguments(message):
-                    changed = True
+                if isinstance(message, dict):
+                    if normalize_alma_tool_call_arguments(message):
+                        changed = True
+                    if message.get("tool_calls") and choice.get("finish_reason") == "stop":
+                        choice["finish_reason"] = "tool_calls"
+                        choice["alma_tool_step"] = True
+                        changed = True
             if changed:
                 content = json.dumps(
                     parsed,

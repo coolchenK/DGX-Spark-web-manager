@@ -742,7 +742,7 @@ def test_gateway_enriches_empty_huggingface_search_result_from_live_api(client):
 
 
 @respx.mock
-def test_gateway_injects_final_answer_instruction_after_tool_response(client):
+def test_gateway_preserves_multi_step_continuation_after_tool_response(client):
     key = _create_gateway_key(client)
     _seed_deployment(
         client,
@@ -778,12 +778,13 @@ def test_gateway_injects_final_answer_instruction_after_tool_response(client):
     assert response.status_code == 200
     forwarded = json.loads(route.calls[0].request.content)
     assert forwarded["messages"][-1]["role"] == "user"
-    assert "现在必须向用户给出最终回答" in forwarded["messages"][-1]["content"]
-    assert "不要再调用工具" in forwarded["messages"][-1]["content"]
+    assert forwarded["messages"][-1]["content"].startswith("<tool_response>")
+    assert "现在必须向用户给出最终回答" not in forwarded["messages"][-1]["content"]
+    assert "chat_template_kwargs" not in forwarded
 
 
 @respx.mock
-def test_gateway_does_not_reexpose_failed_bash_tool_after_tool_response(client):
+def test_gateway_reexposes_failed_bash_tool_for_corrected_retry(client):
     key = _create_gateway_key(client)
     _seed_deployment(
         client,
@@ -835,11 +836,11 @@ def test_gateway_does_not_reexpose_failed_bash_tool_after_tool_response(client):
     )
     assert response.status_code == 200
     forwarded = json.loads(route.calls[0].request.content)
-    assert [t["function"]["name"] for t in forwarded["tools"]] == ["WebSearch"]
+    assert [t["function"]["name"] for t in forwarded["tools"]] == ["Bash", "WebSearch"]
 
 
 @respx.mock
-def test_gateway_promotes_reasoning_only_retry_to_content_after_failed_tool(client):
+def test_gateway_preserves_thinking_for_reasoning_only_retry_after_failed_tool(client):
     key = _create_gateway_key(client)
     _seed_deployment(client)
     route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
@@ -878,7 +879,7 @@ def test_gateway_promotes_reasoning_only_retry_to_content_after_failed_tool(clie
     )
     assert response.status_code == 200
     forwarded = json.loads(route.calls[0].request.content)
-    assert forwarded["chat_template_kwargs"]["enable_thinking"] is False
+    assert "chat_template_kwargs" not in forwarded
     assert b'"content":"python failed. use curl directly."' in response.content
     assert b'"finish_reason":"stop"' in response.content
     assert b"[DONE]" in response.content
@@ -1165,6 +1166,74 @@ def test_gateway_marks_tool_step_for_alma_without_changing_finish_reason(client)
     assert b'"alma_tool_step":true' in response.content
     assert b'"tool_calls"' in response.content
     assert b"[DONE]" in response.content
+
+
+@respx.mock
+def test_gateway_corrects_stop_finish_reason_for_streamed_tool_call(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=(
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+                b'"function":{"name":"ReadValue","arguments":"{}"}}]},'
+                b'"finish_reason":null}]}\n\n'
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert b'"finish_reason":"tool_calls"' in response.content
+    assert b'"alma_tool_step":true' in response.content
+
+
+@respx.mock
+def test_gateway_corrects_stop_finish_reason_for_nonstreamed_tool_call(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "ReadValue", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {},
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": []},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert response.json()["choices"][0]["alma_tool_step"] is True
 
 
 @respx.mock

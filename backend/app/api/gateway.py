@@ -159,7 +159,6 @@ def extract_alma_system_tools(body: dict[str, Any]) -> dict[str, Any]:
         rewritten["content"] = cleaned
         rewritten_messages.append(rewritten)
     if extracted:
-        failed_tools: set[str] = set()
         completed_meta_tools: set[str] = set()
         for message in messages:
             if not isinstance(message, Mapping):
@@ -174,19 +173,14 @@ def extract_alma_system_tools(body: dict[str, Any]) -> dict[str, Any]:
                     response = json.loads(match.group(1))
                 except json.JSONDecodeError:
                     continue
-                payload = response.get("content") if isinstance(response, dict) else None
-                exit_code = payload.get("exitCode") if isinstance(payload, dict) else None
                 response_name = response.get("name") if isinstance(response, dict) else None
-                if exit_code not in (None, 0) and isinstance(response_name, str):
-                    failed_tools.add(response_name)
                 if response_name in {"Skill", "ToolSearch"}:
                     completed_meta_tools.add(response_name)
-        excluded_tools = failed_tools | completed_meta_tools
-        if excluded_tools:
+        if completed_meta_tools:
             extracted = [
                 tool
                 for tool in extracted
-                if tool.get("function", {}).get("name") not in excluded_tools
+                if tool.get("function", {}).get("name") not in completed_meta_tools
             ]
         normalized["messages"] = rewritten_messages
         normalized["tools"] = extracted
@@ -274,50 +268,6 @@ async def enrich_empty_huggingface_search(body: dict[str, Any]) -> dict[str, Any
             "content": (
                 "实时 Hugging Face API 返回了以下量化仓库，优先采用这些证据，"
                 "不得再声称没有量化版本：\n" + json.dumps(quantized[:20], ensure_ascii=False)
-            ),
-        },
-    ]
-    return normalized
-
-
-def normalize_alma_tool_continuation(body: dict[str, Any]) -> dict[str, Any]:
-    """Force a visible action/final answer after Alma's XML tool response."""
-    normalized = dict(body)
-    messages = normalized.get("messages")
-    if not isinstance(messages, list):
-        return normalized
-    tool_responses: list[dict[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, Mapping):
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        for match in re.finditer(
-            r"<tool_response>\s*(\{.*?\})\s*</tool_response>", content, re.DOTALL
-        ):
-            try:
-                response = json.loads(match.group(1))
-            except json.JSONDecodeError:
-                continue
-            if isinstance(response, dict):
-                tool_responses.append(response)
-    if not tool_responses:
-        return normalized
-    if tool_responses[-1].get("name") in {"Skill", "ToolSearch"}:
-        return normalized
-    kwargs = normalized.get("chat_template_kwargs")
-    kwargs = dict(kwargs) if isinstance(kwargs, Mapping) else {}
-    kwargs["enable_thinking"] = False
-    normalized["chat_template_kwargs"] = kwargs
-    normalized["messages"] = [
-        *messages,
-        {
-            "role": "user",
-            "content": (
-                "工具执行阶段已经结束。现在必须向用户给出最终回答，"
-                "直接总结已有工具结果；即使结果为空或工具失败，也要明确说明结论和限制。"
-                "不要再调用工具，不要只说‘稍等’、‘让我再查’或类似过渡语。"
             ),
         },
     ]
@@ -662,7 +612,6 @@ async def _proxy(
     defaults, supported = deployment_generation_settings(deployment)
     normalized_body = extract_alma_system_tools(dict(body))
     normalized_body = await enrich_empty_huggingface_search(normalized_body)
-    normalized_body = normalize_alma_tool_continuation(normalized_body)
     config = deployment.config if isinstance(deployment.config, Mapping) else {}
     spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
     normalized_body = normalize_reasoning_effort(
