@@ -1309,3 +1309,319 @@ def test_gateway_does_not_audit_when_all_saved_defaults_fail_strict_validation(c
     with client.app.state.database.session_factory() as db:
         event = db.scalar(select(AuditEvent).where(AuditEvent.action == "gateway.defaults.apply"))
     assert event is None
+
+
+def _task_arguments(description: str) -> dict[str, str]:
+    return {
+        "description": description,
+        "prompt": "Find the requested software on Hugging Face.",
+        "agent_id": "developer",
+    }
+
+
+def _stream_payload(events: list[dict], *, done: bool = True) -> bytes:
+    payload = "".join(f"data: {json.dumps(event, separators=(',', ':'))}\n\n" for event in events)
+    if done:
+        payload += "data: [DONE]\n\n"
+    return payload.encode()
+
+
+def _streamed_calls(response) -> dict[int, dict]:
+    calls: dict[int, dict] = {}
+    for line in response.text.splitlines():
+        if not line.startswith("data: {"):
+            continue
+        event = json.loads(line.removeprefix("data: "))
+        for choice in event.get("choices") or []:
+            for tool_call in (choice.get("delta") or {}).get("tool_calls") or []:
+                current = calls.setdefault(
+                    tool_call.get("index", 0),
+                    {"name": "", "arguments": []},
+                )
+                function = tool_call.get("function") or {}
+                name = function.get("name")
+                if isinstance(name, str) and not current["name"].endswith(name):
+                    current["name"] += name
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    current["arguments"].append(arguments)
+    return calls
+
+
+@respx.mock
+def test_gateway_clamps_streaming_task_description_to_alma_schema_limit(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    overlong = "x" * 90
+    event = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_task_1",
+                            "type": "function",
+                            "function": {
+                                "name": "Task",
+                                "arguments": json.dumps(_task_arguments(overlong)),
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=_stream_payload([event]),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    calls = _streamed_calls(response)
+    arguments = json.loads("".join(calls[0]["arguments"]))
+    assert arguments == _task_arguments(overlong[:80])
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
+@respx.mock
+def test_gateway_clamps_nonstreaming_task_description_to_alma_schema_limit(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    overlong = "y" * 90
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_task_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Task",
+                                        "arguments": json.dumps(_task_arguments(overlong)),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {},
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": []},
+    )
+
+    function = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert json.loads(function["arguments"]) == _task_arguments(overlong[:80])
+
+
+@respx.mock
+def test_gateway_clamps_fragmented_streaming_task_arguments(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    overlong = "z" * 90
+    arguments = json.dumps(_task_arguments(overlong), separators=(",", ":"))
+    fragments = [arguments[:25], arguments[25:70], arguments[70:]]
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_task_1",
+                                "type": "function",
+                                "function": {"name": "Ta", "arguments": fragments[0]},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"name": "sk", "arguments": fragments[1]},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [{"index": 0, "function": {"arguments": fragments[2]}}]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=_stream_payload(events),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    calls = _streamed_calls(response)
+    assert calls[0]["name"] == "Task"
+    normalized = json.loads("".join(calls[0]["arguments"]))
+    assert normalized == _task_arguments(overlong[:80])
+    assert response.text.count("\n\ndata: ") == len(events)
+
+
+@respx.mock
+def test_gateway_preserves_fragmented_non_task_tool_calls(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_search_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "WebSearch",
+                                    "arguments": '{"query":"Qwen',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '3.8"}'}}]},
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=_stream_payload(events),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    calls = _streamed_calls(response)
+    assert calls[0]["name"] == "WebSearch"
+    assert json.loads("".join(calls[0]["arguments"])) == {"query": "Qwen3.8"}
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
+@respx.mock
+def test_gateway_flushes_task_arguments_when_stream_has_no_finish_event(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    overlong = "q" * 90
+    arguments = json.dumps(_task_arguments(overlong), separators=(",", ":"))
+    midpoint = len(arguments) // 2
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_task_tail",
+                                "type": "function",
+                                "function": {
+                                    "name": "Task",
+                                    "arguments": arguments[:midpoint],
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": arguments[midpoint:]},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+    ]
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=_stream_payload(events),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    calls = _streamed_calls(response)
+    normalized = json.loads("".join(calls[0]["arguments"]))
+    assert normalized == _task_arguments(overlong[:80])
+    assert response.text.rstrip().endswith("data: [DONE]")
