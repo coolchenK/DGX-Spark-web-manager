@@ -20,11 +20,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Deployment, ModelAsset
 from app.runtime.base import (
+    QWEN_FIXED_CHAT_TEMPLATE_PROFILE,
     DeploymentSpec,
     GenerationDefaults,
     ResolvedDeploymentSpec,
     RuntimeAdapter,
+    command_with_managed_chat_template,
     deterministic_container_name,
+    ensure_managed_chat_template,
+    recommended_chat_template_profile,
     validate_model_path,
 )
 from app.services.diagnostics import redact_log
@@ -119,7 +123,7 @@ def resolve_host_model_mount(
 # one changes the fingerprint, which is correct because the launch command
 # changes too. Add to this tuple whenever DeploymentSpec gains an optional
 # field.
-FINGERPRINT_FIELDS_OMITTED_WHEN_UNSET = ("chat_template_kwargs",)
+FINGERPRINT_FIELDS_OMITTED_WHEN_UNSET = ("chat_template", "chat_template_kwargs")
 
 
 def _deployment_spec_fingerprint(
@@ -191,6 +195,98 @@ class DeploymentService:
 
     def docker_client(self):
         return self._docker_client or docker.from_env()
+
+    def reconcile_managed_chat_templates(self, db: Session) -> dict[str, Any]:
+        """Upgrade stored Qwen3.8 launch contracts without starting containers."""
+        updated: list[str] = []
+        errors: list[dict[str, str]] = []
+        deployments = db.scalars(select(Deployment).where(Deployment.managed.is_(True))).all()
+        for deployment in deployments:
+            try:
+                original = deployment.config
+                if not isinstance(original, Mapping):
+                    continue
+                config = json.loads(json.dumps(original))
+                raw_spec = config.get("spec")
+                if not isinstance(raw_spec, Mapping):
+                    continue
+                spec = DeploymentSpec.model_validate(raw_spec)
+                target = db.get(ModelAsset, deployment.model_id) if deployment.model_id else None
+                profile = recommended_chat_template_profile(
+                    spec,
+                    deployment.name,
+                    deployment.api_model_name,
+                    target.name if target is not None else None,
+                    target.repository_id if target is not None else None,
+                    target.local_path if target is not None else None,
+                )
+                if profile != QWEN_FIXED_CHAT_TEMPLATE_PROFILE:
+                    continue
+
+                model_path_value = (
+                    target.local_path
+                    if target is not None and target.local_path
+                    else spec.model_path
+                )
+                model_path = validate_model_path(Path(model_path_value), self.model_roots)
+                fixed_spec = spec.model_copy(
+                    update={
+                        "model_path": str(model_path),
+                        "chat_template": QWEN_FIXED_CHAT_TEMPLATE_PROFILE,
+                    }
+                )
+                ensure_managed_chat_template(fixed_spec, model_path)
+
+                container_model_path = config.get("container_model_path")
+                mounts = config.get("mounts")
+                if not isinstance(container_model_path, str) and isinstance(mounts, Mapping):
+                    base_mount = mounts.get("base")
+                    if isinstance(base_mount, Mapping):
+                        candidate = base_mount.get("container_model_path")
+                        if isinstance(candidate, str):
+                            container_model_path = candidate
+                if not isinstance(container_model_path, str):
+                    raise ValueError("Stored container model path is unavailable")
+
+                launch_contract = config.get("launch_contract")
+                contract_command = (
+                    launch_contract.get("command") if isinstance(launch_contract, Mapping) else None
+                )
+                stored_command = config.get("command")
+                source_command = (
+                    stored_command if isinstance(stored_command, list) else contract_command
+                )
+                if not isinstance(source_command, list) or not all(
+                    isinstance(item, str) for item in source_command
+                ):
+                    raise ValueError("Stored runtime command is unavailable")
+                upgraded_command = command_with_managed_chat_template(
+                    deployment.runtime,
+                    source_command,
+                    container_model_path,
+                )
+
+                fingerprint = deployment_spec_fingerprint(fixed_spec)
+                config["spec"] = fixed_spec.model_dump(mode="json")
+                config["command"] = upgraded_command
+                config["spec_fingerprint"] = fingerprint
+                if isinstance(launch_contract, Mapping):
+                    contract = dict(launch_contract)
+                    contract["command"] = upgraded_command
+                    labels = contract.get("labels")
+                    if isinstance(labels, Mapping):
+                        labels = dict(labels)
+                        labels[f"{LABEL_PREFIX}spec-fingerprint"] = fingerprint
+                        contract["labels"] = labels
+                    config["launch_contract"] = contract
+                if config != original:
+                    deployment.config = config
+                    updated.append(deployment.id)
+            except (OSError, TypeError, ValueError) as exc:
+                errors.append({"deployment_id": deployment.id, "error": str(exc)})
+        if updated:
+            db.commit()
+        return {"updated": updated, "errors": errors}
 
     def _docker_reserved_ports(self, *, excluded_container_ids: set[str] | None = None) -> set[int]:
         reserved: set[int] = set()
@@ -313,6 +409,14 @@ class DeploymentService:
         target = db.get(ModelAsset, spec.model_id) if spec.model_id else None
         if target is None or target.status != "available" or not target.local_path:
             raise ValueError("Base model is missing or unavailable")
+        chat_template = recommended_chat_template_profile(
+            spec,
+            target.name,
+            target.repository_id,
+            target.local_path,
+        )
+        if chat_template != spec.chat_template:
+            spec = spec.model_copy(update={"chat_template": chat_template})
         try:
             base_path = validate_model_path(Path(target.local_path), self.model_roots)
             base_root, base_host_root, base_relative = self._root_details(base_path)

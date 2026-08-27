@@ -11,6 +11,9 @@ from app.db import Database
 from app.main import create_app
 from app.models import AuditEvent, Deployment, ModelAsset, OperationPlan, TaskRecord
 from app.runtime.base import (
+    QWEN_FIXED_CHAT_TEMPLATE_FILENAME,
+    QWEN_FIXED_CHAT_TEMPLATE_PROFILE,
+    QWEN_FIXED_CHAT_TEMPLATE_VERSION,
     DeploymentSpec,
     GenerationDefaults,
     RecommendationProvenance,
@@ -717,6 +720,7 @@ def test_stored_container_fingerprints_accept_specs_created_before_optional_fiel
         config={"spec": spec.model_dump(mode="json")},
     )
     legacy = spec.model_dump(mode="json")
+    legacy.pop("chat_template")
     legacy.pop("chat_template_kwargs")
     legacy_without_path = {key: value for key, value in legacy.items() if key != "model_path"}
 
@@ -732,6 +736,132 @@ def test_stored_container_fingerprints_accept_specs_created_before_optional_fiel
 
     assert fingerprint(legacy) in accepted
     assert fingerprint(legacy_without_path) in accepted
+
+
+@pytest.mark.parametrize(
+    ("runtime", "image", "expected_parser"),
+    [
+        ("vllm", "vllm:test", "qwen3_xml"),
+        ("sglang", "sglang:test", "qwen3_coder"),
+    ],
+)
+def test_qwen38_commands_install_and_use_fixed_chat_template(
+    tmp_path,
+    runtime,
+    image,
+    expected_parser,
+):
+    model_root = tmp_path / "models"
+    model_path = model_root / "Qwen3.8-27B-NVFP4"
+    model_path.mkdir(parents=True)
+    adapter_type = VllmAdapter if runtime == "vllm" else SGLangAdapter
+    adapter = adapter_type(allowed_images={image}, model_roots=(model_root,))
+    spec = DeploymentSpec(
+        name="Qwen3.8 27B",
+        model_path=str(model_path),
+        api_model_name="qwen38",
+        runtime=runtime,
+        image=image,
+    )
+
+    command = adapter.command(spec)
+
+    template = model_path / QWEN_FIXED_CHAT_TEMPLATE_FILENAME
+    assert template.is_file()
+    assert QWEN_FIXED_CHAT_TEMPLATE_VERSION in template.read_text(encoding="utf-8")
+    assert command[command.index("--chat-template") + 1] == (
+        f"/models/{model_path.name}/{QWEN_FIXED_CHAT_TEMPLATE_FILENAME}"
+    )
+    assert command[command.index("--tool-call-parser") + 1] == expected_parser
+    assert command[command.index("--reasoning-parser") + 1] == "qwen3"
+
+
+def test_qwen38_can_explicitly_keep_model_chat_template(tmp_path):
+    model_root = tmp_path / "models"
+    model_path = model_root / "qwen38"
+    model_path.mkdir(parents=True)
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(model_root,))
+    spec = DeploymentSpec(
+        name="Qwen3.8",
+        model_path=str(model_path),
+        api_model_name="qwen38",
+        runtime="vllm",
+        image="vllm:test",
+        chat_template="model",
+    )
+
+    command = adapter.command(spec)
+
+    assert "--chat-template" not in command
+    assert not (model_path / QWEN_FIXED_CHAT_TEMPLATE_FILENAME).exists()
+
+
+def test_reconcile_qwen38_launch_contract_without_starting_deployment(tmp_path):
+    root = tmp_path / "models"
+    database = Database(f"sqlite:///{tmp_path / 'reconcile.db'}")
+    database.create_schema()
+    with database.session_factory() as db:
+        target = add_model_asset(
+            db,
+            root / "org" / "qwen38",
+            name="Qwen3.8 27B NVFP4",
+            repository_id="org/Qwen3.8-27B-NVFP4",
+        )
+        spec = DeploymentSpec(
+            name="Qwen3.8 27B",
+            model_id=target.id,
+            model_path=target.local_path,
+            api_model_name="qwen38",
+            runtime="vllm",
+            image="vllm:test",
+            port=8100,
+        )
+        deployment = Deployment(
+            name=spec.name,
+            model_id=target.id,
+            runtime=spec.runtime,
+            container_id="container-1",
+            container_name="dgx-qwen38",
+            endpoint_url="http://127.0.0.1:8100",
+            api_model_name=spec.api_model_name,
+            status="exited",
+            health="unknown",
+            managed=True,
+            image=spec.image,
+            port=spec.port,
+            config={
+                "spec": spec.model_dump(mode="json"),
+                "container_model_path": "/models/org/qwen38",
+                "command": ["--model", "/models/org/qwen38"],
+                "launch_contract": {
+                    "command": ["--model", "/models/org/qwen38"],
+                    "labels": {
+                        "com.dgx-spark-manager.spec-fingerprint": "old",
+                    },
+                },
+            },
+        )
+        db.add(deployment)
+        db.commit()
+        deployment_id = deployment.id
+
+        first = build_preflight_service(database, (root,)).reconcile_managed_chat_templates(db)
+        db.refresh(deployment)
+        config = deployment.config
+
+        assert first == {"updated": [deployment_id], "errors": []}
+        assert deployment.status == "exited"
+        assert config["spec"]["chat_template"] == QWEN_FIXED_CHAT_TEMPLATE_PROFILE
+        assert config["command"].count("--chat-template") == 1
+        assert config["launch_contract"]["command"] == config["command"]
+        assert (
+            config["launch_contract"]["labels"]["com.dgx-spark-manager.spec-fingerprint"]
+            == config["spec_fingerprint"]
+        )
+        assert (Path(target.local_path) / QWEN_FIXED_CHAT_TEMPLATE_FILENAME).is_file()
+
+        second = build_preflight_service(database, (root,)).reconcile_managed_chat_templates(db)
+        assert second == {"updated": [], "errors": []}
 
 
 def test_resolve_spec_uses_available_database_asset_instead_of_browser_path(tmp_path):
@@ -1609,7 +1739,9 @@ def test_runtime_adapter_exposes_lifecycle_contract(tmp_path):
 def test_vllm_command_includes_batch_and_quantization_settings(tmp_path):
     model_path = tmp_path / "models" / "qwen"
     model_path.mkdir(parents=True)
-    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
+    adapter = VllmAdapter(
+        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
+    )
     spec = DeploymentSpec(
         name="Qwen",
         model_path=str(model_path),
@@ -1643,9 +1775,7 @@ def test_vllm_qwen35_nvfp4_uses_model_card_blackwell_settings(tmp_path):
         ),
         encoding="utf-8",
     )
-    adapter = VllmAdapter(
-        allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",)
-    )
+    adapter = VllmAdapter(allowed_images={"vllm:test"}, model_roots=(tmp_path / "models",))
     spec = DeploymentSpec(
         name="Ornith",
         model_path=str(model_path),

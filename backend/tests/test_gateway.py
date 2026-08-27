@@ -588,6 +588,40 @@ def test_gateway_normalizes_alma_reasoning_effort_for_nested_opencode_go_options
 
 
 @respx.mock
+def test_gateway_preserves_qwen_fixed_template_effort_levels(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {
+                "chat_template": "qwen-fixed-v22.4",
+                "generation_defaults": {},
+            },
+            "runtime_capabilities": {"generation_defaults": []},
+        },
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider_options": {"opencode-go": {"reasoningEffort": "MAX"}},
+            "chat_template_kwargs": {"reasoning_effort": "minimal"},
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["reasoning_effort"] == "xhigh"
+    assert forwarded["chat_template_kwargs"]["reasoning_effort"] == "low"
+
+
+@respx.mock
 def test_gateway_allows_data_tool_after_skill_metadata_response(client):
     key = _create_gateway_key(client)
     _seed_deployment(

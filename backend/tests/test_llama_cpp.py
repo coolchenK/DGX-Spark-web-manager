@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from app.config import Settings
-from app.runtime.base import DeploymentSpec
+from app.runtime.base import QWEN_FIXED_CHAT_TEMPLATE_FILENAME, DeploymentSpec
 from app.runtime.llama_cpp import LlamaCppAdapter
 from app.services.runtime_capabilities import RuntimeCapabilityService
 
@@ -101,6 +101,34 @@ def test_llama_cpp_passes_chat_template_kwargs_only_with_jinja(tmp_path):
         llama_cpp={"model_file": "model-Q8_0.gguf", "jinja": False},
     )
     assert "--chat-template-kwargs" not in adapter.command(no_jinja)
+
+
+def test_llama_cpp_qwen38_uses_fixed_template_and_deepseek_reasoning(tmp_path):
+    adapter, model_path, _ = _adapter(tmp_path)
+    (model_path / "model-Q8_0.gguf").write_bytes(b"model")
+    (model_path / "mmproj-F16.gguf").write_bytes(b"projector")
+
+    command = adapter.command(_spec(model_path, name="Qwen3.8 GGUF"))
+
+    assert command[command.index("--chat-template-file") + 1] == (
+        f"/models/qwen/{QWEN_FIXED_CHAT_TEMPLATE_FILENAME}"
+    )
+    assert command[command.index("--reasoning-format") + 1] == "deepseek"
+
+
+def test_llama_cpp_no_jinja_does_not_materialize_fixed_template(tmp_path):
+    adapter, model_path, _ = _adapter(tmp_path)
+    (model_path / "model-Q8_0.gguf").write_bytes(b"model")
+    spec = _spec(
+        model_path,
+        name="Qwen3.8 GGUF",
+        llama_cpp={"model_file": "model-Q8_0.gguf", "jinja": False},
+    )
+
+    command = adapter.command(spec)
+
+    assert "--chat-template-file" not in command
+    assert not (model_path / QWEN_FIXED_CHAT_TEMPLATE_FILENAME).exists()
 
 
 def test_llama_cpp_auto_selects_single_model_and_f16_projector(tmp_path):

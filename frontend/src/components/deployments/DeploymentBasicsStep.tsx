@@ -43,6 +43,7 @@ export function DeploymentBasicsStep({
         <Typography.Title level={4} id="deployment-basics-heading">基础模型</Typography.Title>
         <Typography.Text type="secondary">选择本地模型、ARM64 运行时和可选的 AI 推荐服务。</Typography.Text>
       </div>
+      <Form.Item name="chat_template" hidden><Input /></Form.Item>
       <Form.Item name="model_id" label="模型" rules={[{ required: true, message: '请选择模型' }]}>
         <Select
           showSearch

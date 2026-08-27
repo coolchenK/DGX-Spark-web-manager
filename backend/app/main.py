@@ -224,6 +224,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                 if app_settings.auto_discovery:
                     app.state.discovery_service.scan_all(db)
+                app.state.chat_template_reconciliation = (
+                    deployment_service.reconcile_managed_chat_templates(db)
+                )
             task_engine.start()
             task_engine_started = True
             yield

@@ -8,7 +8,9 @@ from app.runtime.base import (
     DeploymentSpec,
     LlamaCppConfig,
     RuntimeAdapter,
+    container_chat_template_path,
     default_chat_template_kwargs_flags,
+    effective_chat_template,
 )
 
 DEFAULT_CONTAINER_RUNTIME_DIR = PurePosixPath("/opt/llamacpp")
@@ -156,6 +158,18 @@ class LlamaCppAdapter(RuntimeAdapter):
         if mmproj_file is not None:
             command.extend(["--mmproj", str(container_model_root / mmproj_file.name)])
         command.append("--jinja" if config.jinja else "--no-jinja")
+        template_path = None
+        if config.jinja:
+            _, template_path = effective_chat_template(spec, model_path)
+        if template_path is not None:
+            command.extend(
+                [
+                    "--chat-template-file",
+                    container_chat_template_path(str(container_model_root), template_path),
+                    "--reasoning-format",
+                    "deepseek",
+                ]
+            )
         command.append(
             "--cont-batching" if config.continuous_batching else "--no-cont-batching"
         )

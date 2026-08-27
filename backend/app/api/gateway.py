@@ -20,7 +20,7 @@ from app.gateway.proxy import (
     proxy_openai_request,
 )
 from app.models import ApiKey, Deployment, RequestMetric
-from app.runtime.base import GenerationDefaults
+from app.runtime.base import QWEN_FIXED_CHAT_TEMPLATE_PROFILE, GenerationDefaults
 from app.security import hash_api_key
 
 router = APIRouter(tags=["openai-gateway"])
@@ -324,10 +324,25 @@ def normalize_alma_tool_continuation(body: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def normalize_reasoning_effort(body: dict[str, Any]) -> dict[str, Any]:
+def normalize_reasoning_effort(
+    body: dict[str, Any],
+    *,
+    chat_template: str | None = None,
+) -> dict[str, Any]:
     """Translate Alma/AI-SDK reasoning options to Qwen-compatible request fields."""
     normalized = dict(body)
-    aliases = {"high": "medium"}
+    aliases = (
+        {
+            "high": "xhigh",
+            "max": "xhigh",
+            "ultracode": "xhigh",
+            "extreme": "xhigh",
+            "minimal": "low",
+            "off": "none",
+        }
+        if chat_template == QWEN_FIXED_CHAT_TEMPLATE_PROFILE
+        else {"high": "medium"}
+    )
 
     # Alma OpenCode Go supplies effort in provider options. These client-side
     # SDK options are not OpenAI request fields, so consume them at the gateway.
@@ -350,14 +365,19 @@ def normalize_reasoning_effort(body: dict[str, Any]) -> dict[str, Any]:
         camel_effort = normalized.pop("reasoningEffort", None)
         effort = camel_effort if isinstance(camel_effort, str) else nested_effort
     if isinstance(effort, str):
-        normalized["reasoning_effort"] = aliases.get(effort, effort)
+        canonical_effort = effort.strip().lower()
+        normalized["reasoning_effort"] = aliases.get(canonical_effort, canonical_effort)
 
     template_kwargs = normalized.get("chat_template_kwargs")
     if isinstance(template_kwargs, Mapping):
         template_kwargs = dict(template_kwargs)
         template_effort = template_kwargs.get("reasoning_effort")
-        if isinstance(template_effort, str) and template_effort in aliases:
-            template_kwargs["reasoning_effort"] = aliases[template_effort]
+        if isinstance(template_effort, str):
+            canonical_effort = template_effort.strip().lower()
+            template_kwargs["reasoning_effort"] = aliases.get(
+                canonical_effort,
+                canonical_effort,
+            )
         normalized["chat_template_kwargs"] = template_kwargs
     return normalized
 
@@ -643,7 +663,12 @@ async def _proxy(
     normalized_body = extract_alma_system_tools(dict(body))
     normalized_body = await enrich_empty_huggingface_search(normalized_body)
     normalized_body = normalize_alma_tool_continuation(normalized_body)
-    normalized_body = normalize_reasoning_effort(normalized_body)
+    config = deployment.config if isinstance(deployment.config, Mapping) else {}
+    spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
+    normalized_body = normalize_reasoning_effort(
+        normalized_body,
+        chat_template=spec.get("chat_template"),
+    )
     merged_body, applied = merge_generation_defaults(
         endpoint,
         normalized_body,

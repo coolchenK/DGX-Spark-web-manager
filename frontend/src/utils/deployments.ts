@@ -26,6 +26,8 @@ export type QuantizationMethod =
   | 'nvfp4_online'
   | 'compressed-tensors'
 
+export type ChatTemplateProfile = 'model' | 'qwen-fixed-v22.4'
+
 export interface SpeculativeSettings {
   draft_model_id?: string
   method: 'draft_model' | 'dflash' | 'dspark' | 'eagle' | 'eagle3' | 'mtp'
@@ -63,6 +65,7 @@ export interface DeploymentFormValues {
   quantization?: QuantizationMethod
   trust_remote_code: boolean
   generation_defaults: GenerationDefaults
+  chat_template?: ChatTemplateProfile
   chat_template_kwargs?: Record<string, string | number | boolean>
   speculative?: SpeculativeSettings | null
   llama_cpp?: LlamaCppSettings | null
@@ -240,6 +243,7 @@ export function deploymentToFormValues(
       ?? commandValue(command, '--quantization') as DeploymentFormValues['quantization'],
     trust_remote_code: saved.trust_remote_code ?? command.includes('--trust-remote-code'),
     generation_defaults: normalizeGenerationDefaults(saved.generation_defaults),
+    chat_template: saved.chat_template as ChatTemplateProfile | undefined,
     chat_template_kwargs: normalizeChatTemplateKwargs(saved.chat_template_kwargs),
     speculative: normalizeSpeculativeSettings(saved.speculative),
     llama_cpp: normalizeLlamaCppSettings(saved.llama_cpp),

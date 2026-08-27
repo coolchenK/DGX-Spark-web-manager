@@ -34,6 +34,13 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
   paired with the base model, and launched with the DGX Spark cache, attention, and Mamba settings.
 - Model-aware SGLang/vLLM launch flags detect tool-call and reasoning parsers from the chat template;
   optional deployment defaults control template thinking behavior without overriding each request.
+- Qwen3.8 deployments automatically use the pinned
+  [`froggeric/Qwen-Fixed-Chat-Templates`](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
+  v22.4 template. It fixes empty historical thinking blocks, tool-result continuation, stringified
+  tool arguments, non-thinking mode, reasoning-effort aliases, and stable multi-turn rendering.
+  vLLM uses `qwen3_xml` + `qwen3`; SGLang uses `qwen3_coder` + `qwen3`; llama.cpp uses the
+  template file with `--reasoning-format deepseek`. Stored Manager launch contracts are upgraded
+  without starting stopped models, and running instances apply the change on their next restart.
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
   Model discovery exposes runtime, endpoint, context length, maximum output tokens, and saved
   generation defaults for each healthy running route; stopped deployments are hidden.

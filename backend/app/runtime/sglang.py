@@ -3,8 +3,9 @@ import json
 from app.runtime.base import (
     DeploymentSpec,
     RuntimeAdapter,
-    chat_template_text,
+    container_chat_template_path,
     default_chat_template_kwargs_flags,
+    effective_chat_template,
     match_parser,
     require_draft_container_path,
     require_speculative_runtime_method,
@@ -211,7 +212,11 @@ class SGLangAdapter(RuntimeAdapter):
             )
         if _is_nvfp4_moe(resolved_model_path):
             command.extend(["--moe-runner-backend", "flashinfer_cutlass"])
-        template = chat_template_text(resolved_model_path)
+        template, template_path = effective_chat_template(spec, resolved_model_path)
+        if template_path is not None:
+            command.extend(
+                ["--chat-template", container_chat_template_path(model_path, template_path)]
+            )
         tool_call_parser = match_parser(template, TOOL_CALL_PARSER_MARKERS)
         if tool_call_parser:
             command.extend(["--tool-call-parser", tool_call_parser])

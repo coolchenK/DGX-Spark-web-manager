@@ -94,6 +94,13 @@ export function DeploymentPreviewStep({
           { key: 'concurrency', label: '最大并发', children: spec?.max_concurrency ?? '未设置' },
           { key: 'batched', label: '批处理 Token 上限', children: spec?.max_batched_tokens ?? '不适用' },
           { key: 'quantization', label: '量化加载方式', children: spec?.quantization ?? 'auto' },
+          {
+            key: 'chat-template',
+            label: '对话模板',
+            children: spec?.chat_template === 'qwen-fixed-v22.4'
+              ? <Tag color="green">Qwen Fixed v22.4</Tag>
+              : '模型内置',
+          },
         ]} />
       </div>
       <div className="preview-section">

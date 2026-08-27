@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import platform
 import re
+import tempfile
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -34,6 +35,16 @@ QuantizationMethod = Literal[
     "nvfp4_online",
     "compressed-tensors",
 ]
+
+ChatTemplateProfile = Literal["model", "qwen-fixed-v22.4"]
+QWEN_FIXED_CHAT_TEMPLATE_PROFILE = "qwen-fixed-v22.4"
+QWEN_FIXED_CHAT_TEMPLATE_VERSION = "qwen3.8-froggeric-v22.4"
+QWEN_FIXED_CHAT_TEMPLATE_FILENAME = ".dgx-qwen-fixed-v22.4.jinja"
+QWEN_FIXED_CHAT_TEMPLATE_SOURCE = (
+    Path(__file__).resolve().parents[1]
+    / "chat_templates"
+    / "qwen_fixed_v22_4.jinja"
+)
 
 
 class LlamaCppConfig(BaseModel):
@@ -161,6 +172,7 @@ class DeploymentSpec(BaseModel):
     quantization: QuantizationMethod | None = None
     trust_remote_code: bool = False
     generation_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
+    chat_template: ChatTemplateProfile | None = None
     chat_template_kwargs: dict[str, str | bool | int | float] | None = None
     speculative: SpeculativeConfig | None = None
     llama_cpp: LlamaCppConfig | None = None
@@ -256,6 +268,122 @@ def require_speculative_runtime_method(spec: DeploymentSpec) -> str:
 
 
 CHAT_TEMPLATE_FILES = ("chat_template.jinja", "chat_template.json")
+
+
+def is_qwen38_identifier(value: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+    return "qwen38" in normalized
+
+
+def recommended_chat_template_profile(
+    spec: DeploymentSpec,
+    *identifiers: object,
+) -> ChatTemplateProfile | None:
+    if spec.chat_template is not None:
+        return spec.chat_template
+    candidates = (
+        spec.name,
+        spec.model_id,
+        spec.model_path,
+        spec.api_model_name,
+        spec.route_alias,
+        *identifiers,
+    )
+    if any(is_qwen38_identifier(value) for value in candidates):
+        return QWEN_FIXED_CHAT_TEMPLATE_PROFILE
+    return None
+
+
+def ensure_managed_chat_template(
+    spec: DeploymentSpec,
+    model_path: Path,
+) -> Path | None:
+    """Materialize a versioned template beside the model for read-only mounts."""
+    profile = recommended_chat_template_profile(spec)
+    if profile != QWEN_FIXED_CHAT_TEMPLATE_PROFILE:
+        return None
+    try:
+        content = QWEN_FIXED_CHAT_TEMPLATE_SOURCE.read_bytes()
+    except OSError as exc:
+        raise ValueError("Bundled Qwen fixed chat template is unavailable") from exc
+    if QWEN_FIXED_CHAT_TEMPLATE_VERSION.encode() not in content:
+        raise ValueError("Bundled Qwen fixed chat template has an unexpected version")
+
+    target = model_path / QWEN_FIXED_CHAT_TEMPLATE_FILENAME
+    try:
+        if not target.is_symlink() and target.is_file() and target.read_bytes() == content:
+            return target
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=model_path,
+                prefix=f".{QWEN_FIXED_CHAT_TEMPLATE_FILENAME}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary.write(content)
+                temporary_name = temporary.name
+            Path(temporary_name).replace(target)
+        finally:
+            if temporary_name:
+                Path(temporary_name).unlink(missing_ok=True)
+    except OSError as exc:
+        raise ValueError("Qwen fixed chat template could not be installed") from exc
+    return target
+
+
+def effective_chat_template(
+    spec: DeploymentSpec,
+    model_path: Path,
+) -> tuple[str, Path | None]:
+    managed = ensure_managed_chat_template(spec, model_path)
+    if managed is not None:
+        try:
+            return managed.read_text(encoding="utf-8"), managed
+        except OSError as exc:
+            raise ValueError("Qwen fixed chat template could not be read") from exc
+    return chat_template_text(model_path), None
+
+
+def container_chat_template_path(container_model_path: str, template_path: Path) -> str:
+    return str(PurePosixPath(container_model_path) / template_path.name)
+
+
+def command_with_managed_chat_template(
+    runtime: str,
+    command: list[str],
+    container_model_path: str,
+) -> list[str]:
+    """Return an idempotently upgraded runtime command for the managed template."""
+    template_flag = {
+        "vllm": "--chat-template",
+        "sglang": "--chat-template",
+        "llama_cpp": "--chat-template-file",
+    }.get(runtime)
+    if template_flag is None:
+        raise ValueError(f"Unsupported runtime for managed chat template: {runtime}")
+    container_root = PurePosixPath(container_model_path)
+    if not container_root.is_absolute() or "\x00" in container_model_path:
+        raise ValueError("Managed chat template requires an absolute container model path")
+
+    flags_to_replace = {"--chat-template", "--chat-template-file"}
+    if runtime == "llama_cpp":
+        flags_to_replace.add("--reasoning-format")
+    upgraded: list[str] = []
+    index = 0
+    while index < len(command):
+        item = str(command[index])
+        if item in flags_to_replace:
+            index += 2
+            continue
+        upgraded.append(item)
+        index += 1
+
+    template_path = str(container_root / QWEN_FIXED_CHAT_TEMPLATE_FILENAME)
+    upgraded.extend([template_flag, template_path])
+    if runtime == "llama_cpp":
+        upgraded.extend(["--reasoning-format", "deepseek"])
+    return upgraded
 
 
 def chat_template_text(model_path: Path) -> str:
@@ -521,4 +649,3 @@ class RuntimeAdapter(ABC):
     @abstractmethod
     def command(self, spec: DeploymentSpec) -> list[str]:
         raise NotImplementedError
-

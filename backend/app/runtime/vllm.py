@@ -3,8 +3,9 @@ import json
 from app.runtime.base import (
     DeploymentSpec,
     RuntimeAdapter,
-    chat_template_text,
+    container_chat_template_path,
     default_chat_template_kwargs_flags,
+    effective_chat_template,
     match_parser,
     require_draft_container_path,
     require_speculative_runtime_method,
@@ -136,7 +137,11 @@ class VllmAdapter(RuntimeAdapter):
                 command.extend(["--kv-cache-dtype", "fp8"])
         if is_nemotron_h:
             command.extend(NEMOTRON_H_FLAGS)
-        template = chat_template_text(validated_model_path)
+        template, template_path = effective_chat_template(spec, validated_model_path)
+        if template_path is not None:
+            command.extend(
+                ["--chat-template", container_chat_template_path(model_path, template_path)]
+            )
         tool_call_parser = (
             "qwen3_coder"
             if is_nemotron_h
@@ -187,4 +192,3 @@ class VllmAdapter(RuntimeAdapter):
                 ]
             )
         return command
-

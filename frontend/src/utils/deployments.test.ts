@@ -38,6 +38,7 @@ const deployment: Deployment = {
         top_p: 0.95,
         stop: ['END'],
       },
+      chat_template: 'qwen-fixed-v22.4',
       chat_template_kwargs: {
         enable_thinking: false,
         reasoning_effort: 'high',
@@ -95,6 +96,7 @@ describe('deploymentToFormValues', () => {
         top_p: 0.95,
         stop: ['END'],
       },
+      chat_template: 'qwen-fixed-v22.4',
       chat_template_kwargs: {
         enable_thinking: false,
         reasoning_effort: 'high',
