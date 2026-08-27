@@ -13,6 +13,8 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - Read-only discovery of existing Docker inference services and Hugging Face caches.
 - Persistent Hugging Face search/download tasks with pause, resume, cancellation, and restart recovery.
 - Validated SGLang, vLLM, and llama.cpp deployment adapters with image and argument allowlists.
+  Native llama.cpp deployments set the mounted `llama-server` binary as the container entrypoint,
+  so generic NVIDIA CUDA images receive only validated server arguments as their command.
 - Deployment preview, edit, clone, health-gated replacement, automatic rollback, and retained task history.
 - Per-deployment live unified-memory usage attributed from NVIDIA compute processes, with a bounded
   Docker-memory fallback, stopped-instance zero state, mobile rendering, and low-to-high ordering.
@@ -106,6 +108,32 @@ private by setting `DGX_LISTEN_HOST=127.0.0.1` and moving it to another port wit
 ## Existing Services
 
 On startup the manager scans Docker without restarting or recreating existing containers. Discovered SGLang/vLLM services are registered as unmanaged deployments. They can be observed and controlled, but the manager refuses to delete them. Only containers created by this project carry the `com.dgx-spark-manager.managed=true` label and can be removed from the panel.
+
+## Verified Qwen3.8 Flash Next Deployment
+
+The following profile was downloaded, deployed, health-checked, benchmarked, and called through the
+OpenAI-compatible gateway on an NVIDIA DGX Spark GB10:
+
+| Setting | Verified value |
+| --- | --- |
+| Model | [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ4_XS) |
+| Model revision | `8bdc666649440e9bdc97e16f3f75782c98478ff5` |
+| Quantization | `UD-IQ4_XS`, three split GGUF files, 93,682,584,224 bytes total |
+| Runtime | Native ARM64/CUDA llama.cpp, build 10656 |
+| Runtime revision | [`unslothai/llama.cpp@035e2273`](https://github.com/unslothai/llama.cpp/commit/035e22731a7fd70b9854b3a2d64ec68e9b1a45d3) |
+| Runtime image | `nvidia/cuda:12.9.0-devel-ubuntu24.04` |
+| Context / concurrency | `204800` tokens / `1` slot |
+| Generation defaults | `max_tokens=16384`, thinking enabled, `reasoning_effort=xhigh` |
+| API model / route alias | `qwen3.8-flash-next-iq4-xs` / `qwen38-flash-next` |
+| Measured memory | 71,876,739,072 bytes (66.94 GiB), reported from the NVIDIA compute process |
+| Automatic benchmark | 26.577 output tokens/s over 256 generated tokens |
+
+This checkpoint requires the Qwen3.8 Flash Next llama.cpp implementation tracked by
+[`ggml-org/llama.cpp#27742`](https://github.com/ggml-org/llama.cpp/pull/27742). The verified runtime
+above pins the corresponding Unsloth fork commit instead of assuming that an older system
+`llama-server` can load the model. The Manager launches all GGUF layers on the GPU, waits for
+`/v1/models`, runs its standard post-deployment benchmark, and then exposes the route through the
+gateway. A gateway chat-completion smoke test completed with `finish_reason=stop`.
 
 ## Administrator Workflow
 
