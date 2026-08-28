@@ -768,7 +768,10 @@ def test_qwen38_commands_install_and_use_fixed_chat_template(
 
     template = model_path / QWEN_FIXED_CHAT_TEMPLATE_FILENAME
     assert template.is_file()
-    assert QWEN_FIXED_CHAT_TEMPLATE_VERSION in template.read_text(encoding="utf-8")
+    template_text = template.read_text(encoding="utf-8")
+    assert QWEN_FIXED_CHAT_TEMPLATE_VERSION in template_text
+    assert "item.type == 'image_url'" in template_text or "'image_url' in item" in template_text
+    assert "item.type == 'video_url'" in template_text
     assert command[command.index("--chat-template") + 1] == (
         f"/models/{model_path.name}/{QWEN_FIXED_CHAT_TEMPLATE_FILENAME}"
     )

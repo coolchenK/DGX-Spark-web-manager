@@ -596,6 +596,63 @@ def test_model_metadata_is_derived_from_snapshot_and_config(tmp_path):
     }
 
 
+def test_model_metadata_detects_multimodal_conditional_generation(tmp_path):
+    snapshot = tmp_path / "models--Qwen--Qwen3.8-27B" / "snapshots" / "commit123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "vision_config": {"model_type": "qwen3_5_vision"},
+                "image_token_id": 248056,
+                "video_token_id": 248057,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "video_preprocessor_config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    metadata = discovery.infer_model_metadata(snapshot, "Qwen/Qwen3.8-27B")
+
+    assert metadata["capabilities"] == ["chat", "completion", "image", "video"]
+
+
+def test_deployment_capabilities_follow_model_and_saved_model_path(settings):
+    root = settings.model_root_paths[0]
+    model_path = root / "qwen38-multimodal"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "vision_config": {"model_type": "qwen3_5_vision"},
+                "image_token_id": 248056,
+                "video_token_id": 248057,
+            }
+        ),
+        encoding="utf-8",
+    )
+    database = Database(settings.database_url)
+    database.create_schema()
+    service = DiscoveryService((root,))
+
+    with database.session_factory() as db:
+        deployment = Deployment(
+            name="qwen38",
+            runtime="vllm",
+            endpoint_url="http://127.0.0.1:8001",
+            api_model_name="qwen38",
+            config={"spec": {"model_path": str(model_path)}},
+        )
+        db.add(deployment)
+        db.commit()
+
+        capabilities = service._deployment_capabilities(db, deployment)
+
+    assert capabilities == ["chat", "completion", "image", "video"]
+
+
 def test_scan_uses_commit_as_revision_when_no_named_ref_exists(settings):
     repository = settings.model_root_paths[0] / "models--org--model"
     snapshot = repository / "snapshots" / "commit123"

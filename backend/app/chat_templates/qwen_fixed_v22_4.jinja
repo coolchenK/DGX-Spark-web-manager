@@ -103,7 +103,7 @@
                         {{- 'Picture ' ~ image_count.value ~ ': ' }}
                     {%- endif %}
                     {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
-                {%- elif item.type == 'video' or 'video' in item %}
+                {%- elif item.type == 'video' or item.type == 'video_url' or 'video' in item or 'video_url' in item %}
                     {%- if is_system_content %}
                         {{- raise_exception('System message cannot contain videos.') }}
                     {%- endif %}

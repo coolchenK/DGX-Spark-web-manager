@@ -50,6 +50,11 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
   Model discovery exposes runtime, endpoint, context length, maximum output tokens, and saved
   generation defaults for each healthy running route; stopped deployments are hidden.
+- Model-card front matter, model configuration, and processor assets are scanned for image and video
+  input support. Multimodal deployments advertise `input_modalities` through `/v1/models`; the
+  gateway accepts OpenAI `image_url`, runtime-compatible `video_url`, data URLs, and common
+  `input_image`/`input_video` client aliases while preventing media requests from reaching text-only
+  routes. vLLM and SGLang processor options select a compatible instance on shared routes.
 - Hashed gateway API keys, encrypted provider/Hugging Face secrets, administrator sessions, CSRF protection, and audit history.
 - DeepSeek is the intended reasoning backend for the AI operations assistant. Local Qwen, Gemma,
   and GGUF services remain diagnosis targets, never the assistant brain. Configured OpenAI-compatible

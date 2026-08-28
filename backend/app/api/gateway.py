@@ -23,6 +23,10 @@ from app.gateway.proxy import (
 from app.models import ApiKey, Deployment, RequestMetric
 from app.runtime.base import QWEN_FIXED_CHAT_TEMPLATE_PROFILE, GenerationDefaults
 from app.security import hash_api_key
+from app.services.model_capabilities import (
+    input_modalities,
+    runtime_multimodal_parameters,
+)
 
 router = APIRouter(tags=["openai-gateway"])
 GatewayDb = Annotated[Session, Depends(get_db)]
@@ -88,8 +92,15 @@ def deployment_route_name(deployment: Deployment) -> str:
 def select_routed_deployment(
     db: Session,
     model: str,
-    required_capability: str | None = None,
+    required_capability: str | set[str] | tuple[str, ...] | None = None,
+    *,
+    runtime: str | None = None,
 ) -> Deployment | None:
+    required = (
+        {required_capability}
+        if isinstance(required_capability, str)
+        else set(required_capability or ())
+    )
     deployments = list(
         db.scalars(
             select(Deployment)
@@ -104,14 +115,117 @@ def select_routed_deployment(
         deployment
         for deployment in deployments
         if deployment_route_name(deployment) == model
-        and (required_capability is None or required_capability in deployment.capabilities)
+        and required.issubset(set(deployment.capabilities))
+        and (runtime is None or deployment.runtime == runtime)
     ]
     if not candidates:
         return None
     with _route_lock:
-        position = _route_positions[model]
-        _route_positions[model] = position + 1
+        route_key = "\0".join((model, runtime or "", *sorted(required)))
+        position = _route_positions[route_key]
+        _route_positions[route_key] = position + 1
     return candidates[position % len(candidates)]
+
+
+class MultimodalRequestError(ValueError):
+    pass
+
+
+def _normalize_media_part(
+    part: Mapping[str, Any],
+    *,
+    target_type: str,
+    field: str,
+) -> dict[str, Any]:
+    normalized = dict(part)
+    value = normalized.get(field)
+    if isinstance(value, str):
+        media = {"url": value}
+    elif isinstance(value, Mapping):
+        media = dict(value)
+    else:
+        if normalized.get("file_id"):
+            raise MultimodalRequestError(
+                "file_id media inputs are not available on this gateway; use a URL or data URL"
+            )
+        raise MultimodalRequestError(f"{field} must be a URL string or an object containing url")
+    if not isinstance(media.get("url"), str) or not str(media["url"]).strip():
+        raise MultimodalRequestError(f"{field}.url must be a non-empty string")
+    if target_type == "image_url" and "detail" in normalized and "detail" not in media:
+        media["detail"] = normalized.pop("detail")
+    normalized.pop("file_id", None)
+    normalized["type"] = target_type
+    normalized[field] = media
+    return normalized
+
+
+def normalize_multimodal_chat_body(body: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
+    normalized = dict(body)
+    messages = normalized.get("messages")
+    if not isinstance(messages, list):
+        return normalized, set()
+
+    requested: set[str] = set()
+    output_messages: list[Any] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            output_messages.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            output_messages.append(message)
+            continue
+        output_parts: list[Any] = []
+        for part in content:
+            if not isinstance(part, Mapping):
+                output_parts.append(part)
+                continue
+            part_type = str(part.get("type") or "").casefold().replace("-", "_")
+            if not part_type:
+                if "image_url" in part:
+                    part_type = "image_url"
+                elif "video_url" in part:
+                    part_type = "video_url"
+            if part_type == "input_text":
+                rewritten = dict(part)
+                rewritten["type"] = "text"
+                output_parts.append(rewritten)
+            elif part_type in {"image_url", "input_image"}:
+                requested.add("image")
+                output_parts.append(
+                    _normalize_media_part(part, target_type="image_url", field="image_url")
+                )
+            elif part_type in {"video_url", "input_video"}:
+                requested.add("video")
+                output_parts.append(
+                    _normalize_media_part(part, target_type="video_url", field="video_url")
+                )
+            else:
+                output_parts.append(part)
+        rewritten_message = dict(message)
+        rewritten_message["content"] = output_parts
+        output_messages.append(rewritten_message)
+    normalized["messages"] = output_messages
+    return normalized, requested
+
+
+def requested_multimodal_runtime(body: Mapping[str, Any]) -> str | None:
+    vllm = {"mm_processor_kwargs", "media_io_kwargs"}.intersection(body)
+    sglang = {"images_config", "use_audio_in_video"}.intersection(body)
+    if vllm and sglang:
+        raise MultimodalRequestError(
+            "vLLM and SGLang multimodal request parameters cannot be mixed"
+        )
+    for key in ("mm_processor_kwargs", "media_io_kwargs", "images_config"):
+        if key in body and body[key] is not None and not isinstance(body[key], Mapping):
+            raise MultimodalRequestError(f"{key} must be an object")
+    if "use_audio_in_video" in body and not isinstance(body["use_audio_in_video"], bool):
+        raise MultimodalRequestError("use_audio_in_video must be a boolean")
+    if vllm:
+        return "vllm"
+    if sglang:
+        return "sglang"
+    return None
 
 
 def extract_alma_system_tools(body: dict[str, Any]) -> dict[str, Any]:
@@ -404,7 +518,11 @@ def _healthy_gateway_deployments(db: Session) -> list[Deployment]:
     )
 
 
-def _alma_catalog_entry(deployment: Deployment) -> dict[str, Any]:
+def _alma_catalog_entry(
+    deployment: Deployment,
+    *,
+    capability_names: list[str] | None = None,
+) -> dict[str, Any]:
     config = deployment.config if isinstance(deployment.config, Mapping) else {}
     spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
     route_name = deployment_route_name(deployment)
@@ -420,9 +538,16 @@ def _alma_catalog_entry(deployment: Deployment) -> dict[str, Any]:
         if isinstance(context_length, int) and isinstance(max_output_tokens, int)
         else context_length
     )
-    capability_names = set(deployment.capabilities)
-    text_generation = bool(capability_names.intersection({"chat", "completion"}))
-    vision = bool(capability_names.intersection({"vision", "image", "multimodal"}))
+    capability_set = set(
+        deployment.capabilities if capability_names is None else capability_names
+    )
+    text_generation = bool(capability_set.intersection({"chat", "completion"}))
+    vision = "image" in capability_set
+    video = "video" in capability_set
+    modalities = input_modalities(capability_set)
+    multimodal_parameters = (
+        runtime_multimodal_parameters(deployment.runtime) if vision or video else []
+    )
     return {
         "id": route_name,
         # Alma OpenCode Go uses `name` as the primary label while retaining
@@ -443,16 +568,24 @@ def _alma_catalog_entry(deployment: Deployment) -> dict[str, Any]:
             "output": max_output_tokens,
         },
         "modalities": {
-            "input": ["text", "image"] if vision else ["text"],
-            "output": (["text", "image"] if "image_generation" in capability_names else ["text"]),
+            "input": modalities,
+            "output": (["text", "image"] if "image_generation" in capability_set else ["text"]),
         },
-        "attachment": vision,
+        "input_modalities": modalities,
+        "multimodal_parameters": multimodal_parameters,
+        "multimodal": {
+            "image_content_type": "image_url" if vision else None,
+            "video_content_type": "video_url" if video else None,
+            "request_parameters": multimodal_parameters,
+        },
+        "attachment": vision or video,
         "tool_call": text_generation,
         "toolCall": text_generation,
         "structured_output": text_generation,
         "reasoning": text_generation,
         "capabilities": {
             "vision": vision,
+            "video": video,
             "functionCalling": text_generation,
             "reasoning": text_generation,
             "streaming": text_generation,
@@ -534,6 +667,12 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
                 "benchmark_tps": benchmark_tps,
                 "runtime": deployment.runtime,
                 "capabilities": list(deployment.capabilities),
+                "input_modalities": input_modalities(deployment.capabilities),
+                "multimodal_parameters": (
+                    runtime_multimodal_parameters(deployment.runtime)
+                    if set(deployment.capabilities).intersection({"image", "video"})
+                    else []
+                ),
             }
             routes[route_name] = {
                 "id": route_name,
@@ -583,7 +722,10 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
             for candidate in deployments
             if deployment_route_name(candidate) == route["id"]
         )
-        route.update(_alma_catalog_entry(deployment))
+        capability_names = list(route["capabilities"])
+        route.update(
+            _alma_catalog_entry(deployment, capability_names=capability_names)
+        )
         route["object"] = "model"
         route["created"] = route.get("created", int(deployment.created_at.timestamp()))
         route["owned_by"] = "dgx-spark-manager"
@@ -610,7 +752,13 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
             "tokens_per_second": route["tokens_per_second"],
             "benchmark_tps": route["benchmark_tps"],
             "runtime": route["runtime"],
-            "capabilities": list(deployment.capabilities),
+            "capabilities": capability_names,
+            "input_modalities": input_modalities(capability_names),
+            "multimodal_parameters": (
+                runtime_multimodal_parameters(deployment.runtime)
+                if set(capability_names).intersection({"image", "video"})
+                else []
+            ),
         }
         route["limits"] = {
             "context_window": route["context_window"],
@@ -618,7 +766,7 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
             "max_output_tokens": route["max_output_tokens"],
             "max_concurrency": route["max_concurrency"],
         }
-        route["capability_names"] = list(deployment.capabilities)
+        route["capability_names"] = capability_names
     return {
         "object": "list",
         "data": list(routes.values()),
@@ -638,11 +786,36 @@ async def _proxy(
     model = body.get("model") if isinstance(body, dict) else None
     if not model:
         return openai_error("The model field is required", status_code=400)
-    deployment = select_routed_deployment(db, str(model), required_capability)
+    normalized_body = dict(body)
+    requested_modalities: set[str] = set()
+    requested_runtime: str | None = None
+    if endpoint == "/v1/chat/completions":
+        try:
+            normalized_body, requested_modalities = normalize_multimodal_chat_body(
+                normalized_body
+            )
+            requested_runtime = requested_multimodal_runtime(normalized_body)
+        except MultimodalRequestError as exc:
+            return openai_error(str(exc), status_code=400)
+    required_capabilities = {required_capability, *requested_modalities}
+    deployment = select_routed_deployment(
+        db,
+        str(model),
+        required_capabilities,
+        runtime=requested_runtime,
+    )
     if not deployment:
+        base_deployment = select_routed_deployment(db, str(model), required_capability)
+        if base_deployment is not None and (requested_modalities or requested_runtime):
+            requested = ", ".join(sorted(requested_modalities)) or requested_runtime
+            return openai_error(
+                f"Model '{model}' does not support the requested multimodal input or "
+                f"runtime parameters: {requested}",
+                status_code=400,
+            )
         return openai_error(f"Model '{model}' was not found or is not healthy", status_code=404)
     defaults, supported = deployment_generation_settings(deployment)
-    normalized_body = extract_alma_system_tools(dict(body))
+    normalized_body = extract_alma_system_tools(normalized_body)
     normalized_body = await enrich_empty_huggingface_search(normalized_body)
     normalized_body = normalize_alma_tool_continuation(normalized_body)
     config = deployment.config if isinstance(deployment.config, Mapping) else {}

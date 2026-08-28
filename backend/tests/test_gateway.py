@@ -25,12 +25,14 @@ def _seed_deployment(
     config=None,
     capabilities=None,
     api_model_name="qwen-upstream",
+    runtime="sglang",
+    endpoint_url="http://127.0.0.1:8001",
 ):
     with client.app.state.database.session_factory() as db:
         deployment = Deployment(
             name="qwen",
-            runtime="sglang",
-            endpoint_url="http://127.0.0.1:8001",
+            runtime=runtime,
+            endpoint_url=endpoint_url,
             api_model_name=api_model_name,
             status="running",
             health="healthy",
@@ -234,6 +236,35 @@ def test_models_exposes_alma_opencode_go_fields_on_standard_route(client):
     assert model["performance"]["tokens_per_second"] == 27.892
 
 
+def test_models_exposes_multimodal_inputs_and_runtime_parameters(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        runtime="vllm",
+        capabilities=["chat", "completion", "image", "video"],
+    )
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    model = response.json()["data"][0]
+    assert model["capability_names"] == ["chat", "completion", "image", "video"]
+    assert model["modalities"] == {
+        "input": ["text", "image", "video"],
+        "output": ["text"],
+    }
+    assert model["input_modalities"] == ["text", "image", "video"]
+    assert model["attachment"] is True
+    assert model["capabilities"]["vision"] is True
+    assert model["capabilities"]["video"] is True
+    assert model["multimodal"] == {
+        "image_content_type": "image_url",
+        "video_content_type": "video_url",
+        "request_parameters": ["mm_processor_kwargs", "media_io_kwargs"],
+    }
+    assert model["metadata"]["input_modalities"] == ["text", "image", "video"]
+
+
 def test_models_reports_null_performance_when_no_benchmark_exists(client):
     key = _create_gateway_key(client)
     _seed_deployment(
@@ -325,6 +356,182 @@ def test_unknown_model_uses_openai_error_shape(client):
 
     assert response.status_code == 404
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+@respx.mock
+def test_multimodal_chat_normalizes_image_and_video_parts_for_vllm(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        runtime="vllm",
+        capabilities=["chat", "completion", "image", "video"],
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "id": "chatcmpl-multimodal",
+                "object": "chat.completion",
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "ok"}}
+                ],
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe the media"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AA==",
+                            "detail": "high",
+                        },
+                        {
+                            "type": "input_video",
+                            "video_url": "https://example.test/sample.mp4",
+                        },
+                    ],
+                }
+            ],
+            "mm_processor_kwargs": {"max_pixels": 1048576},
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    parts = forwarded["messages"][0]["content"]
+    assert parts[0] == {"type": "text", "text": "Describe the media"}
+    assert parts[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AA==", "detail": "high"},
+    }
+    assert parts[2] == {
+        "type": "video_url",
+        "video_url": {"url": "https://example.test/sample.mp4"},
+    }
+    assert forwarded["mm_processor_kwargs"] == {"max_pixels": 1048576}
+
+
+def test_multimodal_chat_rejects_media_for_text_only_model(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client, capabilities=["chat", "completion"])
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.test/image.jpg"},
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "image" in response.json()["error"]["message"]
+
+
+def test_multimodal_chat_rejects_file_id_and_mixed_runtime_parameters(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        capabilities=["chat", "completion", "image", "video"],
+    )
+    base = {
+        "model": "qwen-upstream",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "file_id": "file-123"}],
+            }
+        ],
+    }
+
+    file_response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json=base,
+    )
+    mixed_response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [{"role": "user", "content": "hello"}],
+            "mm_processor_kwargs": {},
+            "images_config": {},
+        },
+    )
+
+    assert file_response.status_code == 400
+    assert "file_id" in file_response.json()["error"]["message"]
+    assert mixed_response.status_code == 400
+    assert "cannot be mixed" in mixed_response.json()["error"]["message"]
+
+
+@respx.mock
+def test_multimodal_runtime_parameter_selects_matching_shared_instance(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        for name, runtime, endpoint in (
+            ("shared-vllm", "vllm", "http://127.0.0.1:8111"),
+            ("shared-sglang", "sglang", "http://127.0.0.1:8112"),
+        ):
+            db.add(
+                Deployment(
+                    name=name,
+                    runtime=runtime,
+                    endpoint_url=endpoint,
+                    api_model_name=name,
+                    status="running",
+                    health="healthy",
+                    capabilities=["chat", "completion", "image", "video"],
+                    config={"route_alias": "shared-multimodal"},
+                )
+            )
+        db.commit()
+    vllm = respx.post("http://127.0.0.1:8111/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "id": "chatcmpl-vllm",
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "ok"}}
+                ],
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "shared-multimodal",
+            "messages": [{"role": "user", "content": "hello"}],
+            "media_io_kwargs": {"video": {"num_frames": 16}},
+        },
+    )
+
+    assert response.status_code == 200
+    assert vllm.called
 
 
 def test_shared_route_alias_round_robins_across_healthy_instances(client):

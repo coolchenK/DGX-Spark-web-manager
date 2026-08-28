@@ -12,6 +12,10 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models import Deployment, ModelAsset, utc_now
+from app.services.model_capabilities import (
+    infer_model_capabilities,
+    merge_runtime_model_capabilities,
+)
 
 MODEL_PAYLOAD_SUFFIXES = (".safetensors", ".bin", ".gguf", ".pt", ".pth", ".onnx")
 DEPLOYMENT_LIFECYCLE_STATUSES = frozenset({"starting", "stopping", "deleting"})
@@ -232,21 +236,7 @@ def infer_model_metadata(model_path: Path, name: str) -> dict[str, Any]:
 
     parameter_match = re.search(r"(?:^|[-_/])(\d+(?:\.\d+)?)b(?:$|[-_/])", name, re.IGNORECASE)
     parameter_count = f"{parameter_match.group(1)}B" if parameter_match else None
-    architectures = [
-        str(value).lower()
-        for value in config.get("architectures", [])
-        if isinstance(value, str)
-    ]
-    if any("causallm" in architecture for architecture in architectures):
-        capabilities = ["chat", "completion"]
-    elif any(
-        marker in architecture
-        for architecture in architectures
-        for marker in ("embedding", "sequenceclassification")
-    ):
-        capabilities = ["embedding"]
-    else:
-        capabilities = []
+    capabilities = infer_model_capabilities(model_path, config=config)
 
     commit_hash = model_path.name if model_path.parent.name == "snapshots" else None
     return {
@@ -318,6 +308,27 @@ class DiscoveryService:
         except (httpx.HTTPError, ValueError):
             return {"health": "unhealthy"}
 
+    def _deployment_capabilities(self, db: Session, deployment: Deployment) -> list[str]:
+        model_capabilities: set[str] = set()
+        if deployment.model_id:
+            model = db.get(ModelAsset, deployment.model_id)
+            if model is not None:
+                model_capabilities.update(model.capabilities)
+
+        config = deployment.config if isinstance(deployment.config, dict) else {}
+        spec = config.get("spec") if isinstance(config.get("spec"), dict) else {}
+        for candidate in (spec.get("model_path"), config.get("model_path")):
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            path = Path(candidate)
+            if not any(_lexically_within_root(candidate, root) for root in self.model_roots):
+                continue
+            model_capabilities.update(infer_model_capabilities(path))
+        return merge_runtime_model_capabilities(
+            ("chat", "completion"),
+            model_capabilities,
+        )
+
     def scan_containers(self, db: Session) -> list[Deployment]:
         client = self._docker_client()
         discovered: list[Deployment] = []
@@ -387,7 +398,7 @@ class DiscoveryService:
                 "config",
             ):
                 setattr(existing, key, candidate[key])
-            existing.capabilities = ["chat", "completion"]
+            existing.capabilities = self._deployment_capabilities(db, existing)
             existing.last_checked_at = utc_now()
             discovered.append(existing)
         db.commit()

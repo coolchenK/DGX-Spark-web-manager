@@ -33,6 +33,12 @@ from app.runtime.base import (
 )
 from app.services.diagnostics import redact_log
 from app.services.draft_models import DraftCompatibilityService
+from app.services.model_capabilities import (
+    infer_model_capabilities,
+    input_modalities,
+    merge_runtime_model_capabilities,
+    runtime_multimodal_parameters,
+)
 from app.services.model_evidence import ModelEvidenceLoader
 from app.services.resource_estimator import ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilities, RuntimeCapabilityService
@@ -1000,6 +1006,19 @@ class DeploymentService:
             )
 
         preview = adapter.preview(resolved)
+        inferred_capabilities = set(target.capabilities)
+        inferred_capabilities.update(infer_model_capabilities(Path(resolved.model_path)))
+        openai_capabilities = merge_runtime_model_capabilities(
+            adapter.openai_capabilities(),
+            inferred_capabilities,
+        )
+        preview["capabilities"] = openai_capabilities
+        preview["input_modalities"] = input_modalities(openai_capabilities)
+        preview["multimodal_parameters"] = (
+            runtime_multimodal_parameters(resolved.runtime)
+            if inferred_capabilities.intersection({"image", "video"})
+            else []
+        )
         warnings = list(capabilities.warnings)
         if estimate.decision == "warning":
             warnings.append("Current available unified memory requires deployment review")
@@ -1308,7 +1327,7 @@ class DeploymentService:
                     port=resolved.port,
                     benchmark_status="pending" if self.benchmark_runner is not None else None,
                     config=preview,
-                    capabilities=adapter.openai_capabilities(),
+                    capabilities=list(preview["capabilities"]),
                 )
                 db.add(deployment)
                 db.commit()
@@ -1468,7 +1487,7 @@ class DeploymentService:
                 deployment.image = resolved.image
                 deployment.port = resolved.port
                 deployment.config = preview
-                deployment.capabilities = adapter.openai_capabilities()
+                deployment.capabilities = list(preview["capabilities"])
                 db.commit()
                 record_updated = True
             try:

@@ -25,6 +25,60 @@ key:
 Authorization: Bearer dgx_...
 ```
 
+## OpenAI Multimodal Inputs
+
+`POST /v1/chat/completions` accepts text, image, and video content parts when the selected healthy
+deployment advertises the corresponding capability. Images use the OpenAI `image_url` shape; video
+uses the `video_url` extension implemented by the managed vLLM and SGLang runtimes. URLs and
+`data:<media-type>;base64,...` values are forwarded without decoding in the Manager:
+
+```json
+{
+  "model": "qwen38-aeon-ultimate",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "https://example.com/image.jpg",
+            "detail": "high"
+          }
+        },
+        {
+          "type": "video_url",
+          "video_url": {
+            "url": "https://example.com/video.mp4"
+          }
+        },
+        {"type": "text", "text": "Compare the image and video."}
+      ]
+    }
+  ]
+}
+```
+
+For Chat Completions clients that emit Responses-style parts, `input_text`, `input_image`, and
+`input_video` are normalized to `text`, `image_url`, and `video_url`. Remote `file_id` inputs are not
+available because the Manager does not host an OpenAI Files API; use a URL or data URL instead.
+
+Runtime-specific request parameters are passed through only to a compatible shared-route instance:
+
+| Runtime | Optional request parameters |
+| --- | --- |
+| vLLM | `mm_processor_kwargs`, `media_io_kwargs` |
+| SGLang | `images_config`, `use_audio_in_video` |
+
+Do not mix vLLM and SGLang parameter families in one request. Malformed media parts, unsupported
+model modalities, mixed runtime parameters, and invalid parameter types return an OpenAI-compatible
+`400 invalid_request_error` response before inference begins.
+
+`GET /v1/models` and `GET /v1/models/catalog` expose `input_modalities`, multimodal content-part
+names, and the runtime parameter list. A shared route advertises only the capabilities supported by
+every healthy instance, while request routing can select a more capable instance for a specific
+media request.
+
 ## Management Endpoints
 
 | Method | Path | Purpose |
