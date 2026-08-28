@@ -1,5 +1,7 @@
+import asyncio
 import json
 
+import httpx
 import respx
 from app.api import gateway
 from app.gateway import proxy as gateway_proxy
@@ -17,13 +19,19 @@ def _create_gateway_key(client):
     return client.post("/api/keys", json={"name": "Gateway test"}).json()["key"]
 
 
-def _seed_deployment(client, *, config=None, capabilities=None):
+def _seed_deployment(
+    client,
+    *,
+    config=None,
+    capabilities=None,
+    api_model_name="qwen-upstream",
+):
     with client.app.state.database.session_factory() as db:
         deployment = Deployment(
             name="qwen",
             runtime="sglang",
             endpoint_url="http://127.0.0.1:8001",
-            api_model_name="qwen-upstream",
+            api_model_name=api_model_name,
             status="running",
             health="healthy",
             managed=False,
@@ -385,6 +393,14 @@ def test_gateway_stats_include_recent_request_and_token_throughput(authenticated
     assert response.json()["requests_last_minute"] == 1
     assert response.json()["tokens_per_second"] == 3.0
     assert response.json()["active_requests"] == 0
+
+
+def test_gateway_allows_long_inference_reads_beyond_legacy_ten_minute_ceiling():
+    timeout = gateway_proxy.upstream_inference_timeout()
+    assert timeout.connect == 5
+    assert timeout.read == 1800
+    assert timeout.write == 30
+    assert timeout.pool == 5
 
 
 def test_merge_generation_defaults_preserves_explicit_false_zero_and_empty_stop():
@@ -784,6 +800,172 @@ def test_gateway_guides_multi_step_continuation_after_tool_response(client):
 
 
 @respx.mock
+def test_gateway_recovers_ai_sdk_tool_result_parts_from_reasoning_only_stop(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    responses = iter(
+        [
+            Response(
+                200,
+                json={
+                    "id": "chatcmpl-reasoning-only",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "qwen-upstream",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "reasoning": "I have enough information to answer.",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 12},
+                },
+            ),
+            Response(
+                200,
+                json={
+                    "id": "chatcmpl-final",
+                    "object": "chat.completion",
+                    "created": 2,
+                    "model": "qwen-upstream",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "final answer"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 110, "completion_tokens": 4},
+                },
+            ),
+        ]
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        side_effect=lambda _request: next(responses)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "Bash", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool-result",
+                            "toolCallId": "call-1",
+                            "toolName": "Bash",
+                            "output": {"type": "text", "value": "ok"},
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert route.call_count == 2
+    first = json.loads(route.calls[0].request.content)
+    assert first["stream"] is False
+    assert first["chat_template_kwargs"]["enable_thinking"] is False
+    assert b'"content":"final answer"' in response.content
+    assert b"[DONE]" in response.content
+
+
+@respx.mock
+def test_gateway_retries_raw_think_only_content_that_alma_hides(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    responses = iter(
+        [
+            Response(
+                200,
+                json={
+                    "id": "chatcmpl-think-only",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "qwen-upstream",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "<think>I should now answer the user.</think>",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 12},
+                },
+            ),
+            Response(
+                200,
+                json={
+                    "id": "chatcmpl-visible-final",
+                    "object": "chat.completion",
+                    "created": 2,
+                    "model": "qwen-upstream",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "visible final"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 110, "completion_tokens": 4},
+                },
+            ),
+        ]
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        side_effect=lambda _request: next(responses)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "user",
+                    "content": '<tool_response>{"name":"Read","content":"ok"}</tool_response>',
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert route.call_count == 2
+    retry = json.loads(route.calls[1].request.content)
+    assert retry["chat_template_kwargs"]["enable_thinking"] is False
+    assert b'"content":"visible final"' in response.content
+    assert b"[DONE]" in response.content
+
+
+@respx.mock
 def test_gateway_reexposes_failed_bash_tool_for_corrected_retry(client):
     key = _create_gateway_key(client)
     _seed_deployment(
@@ -895,6 +1077,141 @@ def test_gateway_does_not_duplicate_reasoning_after_failed_tool(client):
     assert b'"content":"python failed. use curl directly."' not in response.content
     assert b'"content":"curl succeeded."' in response.content
     assert b'"finish_reason":"stop"' in response.content
+    assert b"[DONE]" in response.content
+
+
+@respx.mock
+def test_gateway_returns_openai_sse_error_for_buffered_alma_upstream_failure(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            503,
+            json={"error": {"message": "upstream unavailable"}},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "stream": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": '<tool_response>{"name":"Read","content":"ok"}</tool_response>',
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert 'data: {"error"' in response.text
+    assert "upstream unavailable" in response.text
+    assert '"upstream_status":503' in response.text
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
+@respx.mock
+def test_gateway_keeps_slow_regular_alma_stream_alive_before_first_upstream_event(
+    client, monkeypatch
+):
+    async def delayed_regular_stream(_request):
+        async def chunks():
+            await asyncio.sleep(0.06)
+            yield (
+                b'data: {"id":"chatcmpl-delayed","object":"chat.completion.chunk",'
+                b'"choices":[{"index":0,"delta":{"content":"REGULAR_OK"},'
+                b'"finish_reason":null}]}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+        class DelayedStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                async for chunk in chunks():
+                    yield chunk
+
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=DelayedStream(),
+        )
+
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        side_effect=delayed_regular_stream
+    )
+    monkeypatch.setattr(gateway_proxy, "ALMA_CONTINUATION_HEARTBEAT_SECONDS", 0.01)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [{"role": "user", "content": "ordinary request"}],
+            "stream": True,
+        },
+    )
+
+    assert route.called
+    assert response.status_code == 200
+    assert ": alma-keepalive" in response.text
+    assert "REGULAR_OK" in response.text
+    assert "data: [DONE]" in response.text
+
+
+@respx.mock
+def test_gateway_keeps_slow_buffered_alma_tool_continuation_alive(client, monkeypatch):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    monkeypatch.setattr(gateway_proxy, "ALMA_CONTINUATION_HEARTBEAT_SECONDS", 0.005)
+
+    async def delayed_response(_request):
+        await asyncio.sleep(0.02)
+        return Response(
+            200,
+            json={
+                "id": "chatcmpl-delayed",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "qwen-upstream",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+            },
+        )
+
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        side_effect=delayed_response
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "continue"},
+                {
+                    "role": "user",
+                    "content": '<tool_response>{"name":"Read","content":"ok"}</tool_response>',
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert route.call_count == 1
+    assert ": alma-keepalive" in response.text
+    assert response.headers["x-accel-buffering"] == "no"
+    assert b'"content":"done"' in response.content
     assert b"[DONE]" in response.content
 
 

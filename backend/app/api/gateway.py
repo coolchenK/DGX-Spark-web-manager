@@ -15,6 +15,7 @@ from app.audit import record_audit
 from app.dependencies import Admin, get_db
 from app.gateway.proxy import (
     GENERATION_KEYS,
+    is_alma_tool_continuation,
     merge_generation_defaults,
     openai_error,
     proxy_openai_request,
@@ -277,18 +278,10 @@ async def enrich_empty_huggingface_search(body: dict[str, Any]) -> dict[str, Any
 def normalize_alma_tool_continuation(body: dict[str, Any]) -> dict[str, Any]:
     """Keep Alma moving after a native or XML tool result without duplicating reasoning."""
     normalized = dict(body)
+    if not is_alma_tool_continuation(normalized):
+        return normalized
     messages = normalized.get("messages")
-    if not isinstance(messages, list) or not any(
-        isinstance(message, Mapping)
-        and (
-            message.get("role") == "tool"
-            or (
-                isinstance(message.get("content"), str)
-                and "<tool_response>" in message["content"]
-            )
-        )
-        for message in messages
-    ):
+    if not isinstance(messages, list):
         return normalized
 
     kwargs = normalized.get("chat_template_kwargs")

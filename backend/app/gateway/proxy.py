@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -30,6 +31,11 @@ GENERATION_KEYS = {
 }
 GENERATION_ENDPOINTS = {"/v1/chat/completions", "/v1/completions"}
 ALMA_TASK_DESCRIPTION_MAX_LENGTH = 80
+ALMA_CONTINUATION_HEARTBEAT_SECONDS = 15.0
+ALMA_HIDDEN_REASONING_BLOCK_RE = re.compile(
+    r"<(?P<tag>think|analysis)\b[^>]*>.*?(?:</(?P=tag)\s*>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 ALMA_EMPTY_CONTINUATION_RETRY_PROMPT = (
     "The preceding assistant generation was empty. Continue the original task now "
     "using the tool results already present in the conversation. If another tool is "
@@ -41,26 +47,65 @@ ALMA_EMPTY_CONTINUATION_FINAL_PROMPT = (
     "the best complete final answer now from the available tool results."
 )
 ALMA_EMPTY_CONTINUATION_FALLBACK = (
-    "模型在工具执行后连续返回了空结果，网关已自动重试但仍未获得有效回答。"
-    "请重新发送本次请求。"
+    "模型在工具执行后连续返回了空结果，网关已自动重试但仍未获得有效回答。请重新发送本次请求。"
 )
 
 
-def _is_alma_tool_continuation(body: dict[str, Any]) -> bool:
+def _content_contains_tool_result(content: Any) -> bool:
+    if isinstance(content, str):
+        lowered = content.casefold()
+        return any(
+            marker in lowered
+            for marker in (
+                "<tool_response>",
+                "<tool_result>",
+                "<tool-response>",
+                "<tool-result>",
+            )
+        )
+    if isinstance(content, dict):
+        item_type = str(content.get("type") or "").casefold().replace("_", "-")
+        if item_type in {"tool-result", "tool-response"}:
+            return True
+        if (content.get("tool_call_id") or content.get("toolCallId")) and any(
+            key in content for key in ("output", "result", "content")
+        ):
+            return True
+        return any(_content_contains_tool_result(value) for value in content.values())
+    if isinstance(content, list):
+        return any(_content_contains_tool_result(item) for item in content)
+    return False
+
+
+def is_alma_tool_continuation(body: dict[str, Any]) -> bool:
     messages = body.get("messages")
     if not isinstance(messages, list):
         return False
-    return any(
-        isinstance(message, dict)
-        and (
-            message.get("role") == "tool"
-            or (
-                isinstance(message.get("content"), str)
-                and "<tool_response>" in message["content"]
-            )
-        )
-        for message in messages
-    )
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool" or message.get("tool_call_id"):
+            return True
+        if _content_contains_tool_result(message.get("content")):
+            return True
+        # Alma 0.4.x can retain the assistant tool call while representing the
+        # corresponding result as a later UI-message part. Treat any completed
+        # assistant tool step as a continuation even when that result shape is
+        # not part of the OpenAI wire schema yet.
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            if index < len(messages) - 1:
+                return True
+    return False
+
+
+def should_buffer_alma_tool_stream(
+    *,
+    endpoint: str,
+    body: dict[str, Any],
+) -> bool:
+    if endpoint != "/v1/chat/completions" or not bool(body.get("stream")):
+        return False
+    return is_alma_tool_continuation(body)
 
 
 def _prepare_alma_continuation_retry(
@@ -117,6 +162,13 @@ def _normalize_nonstream_chat_completion(payload: dict[str, Any]) -> bool:
     return changed
 
 
+def _content_has_visible_text(content: Any) -> bool:
+    if not isinstance(content, str):
+        return False
+    visible = ALMA_HIDDEN_REASONING_BLOCK_RE.sub("", content)
+    return bool(visible.strip())
+
+
 def _chat_completion_has_output(payload: dict[str, Any]) -> bool:
     for choice in payload.get("choices") or []:
         if not isinstance(choice, dict):
@@ -125,7 +177,7 @@ def _chat_completion_has_output(payload: dict[str, Any]) -> bool:
         if not isinstance(message, dict):
             continue
         content = message.get("content")
-        if isinstance(content, str) and content.strip():
+        if _content_has_visible_text(content):
             return True
         if message.get("tool_calls"):
             return True
@@ -313,6 +365,11 @@ def merge_generation_defaults(
     return merged, applied
 
 
+def upstream_inference_timeout() -> httpx.Timeout:
+    """Allow long local-agent turns while retaining bounded connection phases."""
+    return httpx.Timeout(connect=5, read=1800, write=30, pool=5)
+
+
 def openai_error(message: str, *, status_code: int, code: str | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -474,18 +531,108 @@ async def proxy_openai_request(
     body["model"] = deployment.api_model_name
     started_at = time.perf_counter()
     url = f"{deployment.endpoint_url}{endpoint}"
-    timeout = httpx.Timeout(connect=5, read=600, write=30, pool=5)
+    timeout = upstream_inference_timeout()
     client = httpx.AsyncClient(timeout=timeout, trust_env=False)
-    buffer_alma_continuation = (
-        endpoint == "/v1/chat/completions"
-        and bool(body.get("stream"))
-        and _is_alma_tool_continuation(body)
+    buffer_alma_continuation = should_buffer_alma_tool_stream(
+        endpoint=endpoint,
+        body=body,
     )
     upstream_body = dict(body)
     if buffer_alma_continuation:
         upstream_body["stream"] = False
         upstream_body.pop("stream_options", None)
     upstream_request = client.build_request("POST", url, json=upstream_body)
+    if buffer_alma_continuation:
+
+        async def buffered_continuation_body() -> AsyncIterator[bytes]:
+            async def fetch_response() -> Response:
+                try:
+                    upstream = await client.send(upstream_request, stream=True)
+                except httpx.HTTPError as exc:
+                    await client.aclose()
+                    record_request_metric(
+                        request.app.state.database.session_factory,
+                        model=deployment.api_model_name,
+                        endpoint=endpoint,
+                        status_code=502,
+                        started_at=started_at,
+                    )
+                    if on_finished:
+                        on_finished()
+                    return openai_error(
+                        f"Upstream inference service is unavailable: {exc}",
+                        status_code=502,
+                    )
+                return await _buffered_alma_tool_continuation_response(
+                    request=request,
+                    deployment=deployment,
+                    endpoint=endpoint,
+                    body=upstream_body,
+                    client=client,
+                    upstream=upstream,
+                    started_at=started_at,
+                    on_finished=on_finished,
+                )
+
+            response_task = asyncio.create_task(fetch_response())
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {response_task},
+                        timeout=ALMA_CONTINUATION_HEARTBEAT_SECONDS,
+                    )
+                    if done:
+                        response = response_task.result()
+                        if response.status_code >= 400:
+                            error_payload: dict[str, Any]
+                            try:
+                                parsed_error = json.loads(response.body)
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                parsed_error = None
+                            if isinstance(parsed_error, dict) and isinstance(
+                                parsed_error.get("error"), dict
+                            ):
+                                error_payload = parsed_error
+                            else:
+                                error_payload = {
+                                    "error": {
+                                        "message": "Upstream inference request failed",
+                                        "type": "server_error",
+                                        "code": str(response.status_code),
+                                    }
+                                }
+                            error_payload["error"]["upstream_status"] = response.status_code
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    error_payload,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                                + "\n\ndata: [DONE]\n\n"
+                            ).encode()
+                            return
+                        yield bytes(response.body)
+                        return
+                    yield b": alma-keepalive\n\n"
+            finally:
+                if not response_task.done():
+                    response_task.cancel()
+                    try:
+                        await response_task
+                    except asyncio.CancelledError:
+                        pass
+
+        return StreamingResponse(
+            buffered_continuation_body(),
+            status_code=200,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     try:
         upstream = await client.send(upstream_request, stream=bool(body.get("stream")))
     except httpx.HTTPError as exc:
@@ -501,18 +648,6 @@ async def proxy_openai_request(
             on_finished()
         return openai_error(f"Upstream inference service is unavailable: {exc}", status_code=502)
 
-    if buffer_alma_continuation:
-        return await _buffered_alma_tool_continuation_response(
-            request=request,
-            deployment=deployment,
-            endpoint=endpoint,
-            body=upstream_body,
-            client=client,
-            upstream=upstream,
-            started_at=started_at,
-            on_finished=on_finished,
-        )
-
     if body.get("stream"):
 
         async def stream_body() -> AsyncIterator[bytes]:
@@ -524,6 +659,11 @@ async def proxy_openai_request(
             buffered_tool_lines: list[tuple[dict[str, Any] | None, str, bool]] = []
             tool_call_states: dict[int, dict[str, Any]] = {}
             buffering_tool_calls = False
+            upstream_chunks = upstream.aiter_raw()
+
+            async def next_upstream_chunk() -> bytes:
+                return await anext(upstream_chunks)
+
             def flush_tool_lines() -> str:
                 normalized = _normalize_streamed_task_calls(tool_call_states)
                 rendered = "".join(
@@ -536,8 +676,22 @@ async def proxy_openai_request(
                 tool_call_states.clear()
                 return rendered
 
+            chunk_task: asyncio.Task[bytes] | None = asyncio.create_task(next_upstream_chunk())
             try:
-                async for chunk in upstream.aiter_raw():
+                while True:
+                    done, _ = await asyncio.wait(
+                        {chunk_task},
+                        timeout=ALMA_CONTINUATION_HEARTBEAT_SECONDS,
+                    )
+                    if not done:
+                        yield b": alma-keepalive\n\n"
+                        continue
+                    try:
+                        chunk = chunk_task.result()
+                    except StopAsyncIteration:
+                        chunk_task = None
+                        break
+                    chunk_task = asyncio.create_task(next_upstream_chunk())
                     # httpx can split an SSE line across arbitrary chunks. Keep
                     # a buffer so compatibility transforms see complete events.
                     rewrite_pending += chunk
@@ -692,6 +846,12 @@ async def proxy_openai_request(
                 if rewrite_pending:
                     yield rewrite_pending
             finally:
+                if chunk_task is not None and not chunk_task.done():
+                    chunk_task.cancel()
+                    try:
+                        await chunk_task
+                    except asyncio.CancelledError:
+                        pass
                 await upstream.aclose()
                 await client.aclose()
                 record_request_metric(
@@ -710,6 +870,8 @@ async def proxy_openai_request(
         headers = {}
         if content_type := upstream.headers.get("content-type"):
             headers["content-type"] = content_type
+        headers.setdefault("Cache-Control", "no-cache")
+        headers.setdefault("X-Accel-Buffering", "no")
         return StreamingResponse(stream_body(), status_code=upstream.status_code, headers=headers)
 
     content = await upstream.aread()
