@@ -32,6 +32,10 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
   combined base-plus-Draft resource checks. vLLM models with indexed `mtp.*` weights can use their
   embedded MTP head without a duplicate model asset or mount. SGLang DSpark checkpoints are detected,
   paired with the base model, and launched with the DGX Spark cache, attention, and Mamba settings.
+- ARM64-native SGLang SSD Stream support for prepared Qwen3.8 Flash Next checkpoints. The Manager
+  validates the sidecar manifest and reviewed image, excludes SSD-only PLE bytes from unified-memory
+  estimates, enables the embedded MTP head and multimodal API, and grants the trusted runtime only
+  the `io_uring` seccomp and `memlock` settings required by its native page reader.
 - Model-aware SGLang/vLLM launch flags detect tool-call and reasoning parsers from the chat template;
   optional deployment defaults control template thinking behavior without overriding each request.
 - Qwen3.8 deployments automatically use the pinned
@@ -127,10 +131,12 @@ private by setting `DGX_LISTEN_HOST=127.0.0.1` and moving it to another port wit
 
 On startup the manager scans Docker without restarting or recreating existing containers. Discovered SGLang/vLLM services are registered as unmanaged deployments. They can be observed and controlled, but the manager refuses to delete them. Only containers created by this project carry the `com.dgx-spark-manager.managed=true` label and can be removed from the panel.
 
-## Verified Qwen3.8 Flash Next Deployment
+## Verified Qwen3.8 Flash Next Deployments
 
 The following profile was downloaded, deployed, health-checked, benchmarked, and called through the
 OpenAI-compatible gateway on an NVIDIA DGX Spark GB10:
+
+### UD-IQ4_XS llama.cpp
 
 | Setting | Verified value |
 | --- | --- |
@@ -152,6 +158,42 @@ above pins the corresponding Unsloth fork commit instead of assuming that an old
 `llama-server` can load the model. The Manager launches all GGUF layers on the GPU, waits for
 `/v1/models`, runs its standard post-deployment benchmark, and then exposes the route through the
 gateway. A gateway chat-completion smoke test completed with `finish_reason=stop`.
+
+### NVFP4 SSD Stream SGLang
+
+The SSD Stream profile keeps the 47.68 GiB PLE lookup table on NVMe and pages rows into a bounded
+32 MiB registered buffer pool. The remaining weights and runtime state use DGX Spark unified memory.
+The prepared checkpoint records the exact upstream RadixArk revision in `ssd-stream.json`; the
+Manager validates the manifest, sidecar size, reviewed image, runtime flags, and resident-memory
+estimate before it creates the container.
+
+| Setting | Verified value |
+| --- | --- |
+| Prepared model | [`garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream`](https://huggingface.co/garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream) |
+| Prepared / source revisions | `01eb1b0d10b6780d10987dda2125924b5d5a1ec2` / [`RadixArk@7b719225`](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4/tree/7b719225242aacd3dbd3f9407468c2ee9a9d2594) |
+| Downloaded checkpoint | 150,011,203,465 bytes (139.71 GiB), 227 files |
+| SSD PLE sidecar | 51,200,245,760 bytes (47.68 GiB), SHA-256 `b070f9644adf93794d8a1030584ab705809387e64396a9327a68fa3a3a6666b3` |
+| Quantization | ModelOpt NVFP4; BF16 KV cache |
+| Runtime | SGLang `0.0.0.dev1+gd91c3682b`, ModelOpt `0.45.0`, native `NEXTN` MTP (`3` steps, `4` draft tokens) |
+| SSD Stream plugin | [`garnermccloud/sglang-ssd-stream@60ce795`](https://github.com/garnermccloud/sglang-ssd-stream/commit/60ce795c339f9d31a18a8057d0bbe59611e4e9c7) |
+| Runtime image | `dgx-local/sglang-ssd-stream:60ce795-sm121`, digest `sha256:604c37603b0f6d8a356d67b00f05788f968a9a64a74ea2204592968db71b7b33` |
+| Attention backends | Triton prefill / TensorRT-LLM MHA decode; CUDA graph decode enabled |
+| Context / concurrency | `262144` configured / `1`; SGLang allocated `224384` total tokens with the existing MiniCPM service co-resident |
+| Generation defaults | `max_tokens=16384`, `temperature=1`, `top_p=0.95`, `top_k=20`, thinking enabled, `reasoning_effort=xhigh` |
+| API model | `qwen38-flash-next-nvfp4-ssd` on port `8007` |
+| Measured memory | 97,661,222,912 bytes (90.95 GiB), reported from the NVIDIA compute process |
+| Automatic benchmark | 27.779 output tokens/s over 256 generated tokens |
+| Verified gateway inputs | Text, OpenAI tools, SSE, PNG image, and MP4 video |
+
+The pinned SGLang image needs a narrowly reviewed source change to enable its Qwen sparse-attention
+backend on GB10 `SM 12.1`; the image build refuses to patch any source whose SHA-256 differs from the
+reviewed file. Triton prefill and TensorRT-LLM MHA decode avoid the current FlashAttention 4 CuTe
+layout failure on this architecture. This follows the active upstream
+[`SM120/SM121` discussion](https://github.com/sgl-project/sglang/pull/36497) and the independently
+reported [single-DGX-Spark configuration](https://github.com/hashd1ve/qwen38-flash-next-one-dgx-spark).
+The first cold start completed in 461 seconds. Subsequent gateway validation returned HTTP 200 for
+model discovery, non-streaming and streaming text, a structured function call, image input, and
+video input; the runtime remained healthy without a restart or OOM.
 
 ## Administrator Workflow
 

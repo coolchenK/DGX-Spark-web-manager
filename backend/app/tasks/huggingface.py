@@ -523,6 +523,10 @@ class HuggingFaceService:
             ]
             if self.token:
                 command.append(f"--header=Authorization: Bearer {self.token}")
+            # Count the active staging file while aria2 grows it. Keeping the
+            # path in this map also makes resumed bytes visible immediately;
+            # only files with the exact expected size are published later.
+            completed_by_name[name] = destination
             with tempfile.TemporaryFile() as cli_output:
                 process = subprocess.Popen(
                     command,

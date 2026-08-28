@@ -14,7 +14,7 @@ from typing import Any
 import docker
 import httpx
 from docker.errors import NotFound
-from docker.types import DeviceRequest, LogConfig
+from docker.types import DeviceRequest, LogConfig, Ulimit
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -977,7 +977,7 @@ class DeploymentService:
         try:
             evidence = self.evidence_loader.load(resolved.model_path)
             estimate = self.resource_estimator.estimate(
-                model_size_bytes=target.size_bytes,
+                model_size_bytes=adapter.resident_model_size(model_path),
                 draft_size_bytes=draft.size_bytes if draft is not None else 0,
                 config=evidence.config,
                 context_length=resolved.context_length,
@@ -1115,6 +1115,13 @@ class DeploymentService:
                 raise ValueError("Runtime mount conflicts with a model mount")
             volumes[source] = mount
         fingerprint = spec_fingerprint or deployment_spec_fingerprint(spec)
+        security_opt = adapter.security_options(spec)
+        ulimits = [Ulimit(**item) for item in adapter.ulimits(spec)]
+        run_options: dict[str, Any] = {}
+        if security_opt:
+            run_options["security_opt"] = security_opt
+        if ulimits:
+            run_options["ulimits"] = ulimits
         return client.containers.run(
             spec.image,
             entrypoint=adapter.entrypoint(spec),
@@ -1137,6 +1144,7 @@ class DeploymentService:
             ),
             device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
             environment={"HF_HUB_OFFLINE": "1", **adapter.environment(spec)},
+            **run_options,
         )
 
     @staticmethod

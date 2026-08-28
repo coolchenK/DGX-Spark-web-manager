@@ -23,7 +23,7 @@ from app.runtime.base import (
     deterministic_container_name,
     validate_model_path,
 )
-from app.runtime.sglang import SGLangAdapter
+from app.runtime.sglang import SGLANG_SSD_STREAM_IMAGE, SGLangAdapter
 from app.runtime.vllm import VllmAdapter
 from app.services import deployments as deployment_service
 from app.services.draft_models import DraftCandidate
@@ -2081,6 +2081,150 @@ def test_sglang_dspark_uses_repo_id_cache_root_and_dgx_spark_flags(tmp_path):
     assert command[command.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
     assert command[command.index("--mamba-ssm-dtype") + 1] == "float32"
     assert adapter.environment(spec)["HF_HUB_CACHE"] == "/draft-models"
+
+
+def _ssd_stream_model(tmp_path: Path) -> Path:
+    model_path = tmp_path / "models" / "qwen38-flash-next-ssd"
+    (model_path / "ple").mkdir(parents=True)
+    (model_path / "mtp").mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen4ExpForConditionalGeneration"],
+                "layer_types": ["linear_attention", "full_attention"],
+                "num_experts": 512,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_path / "hf_quant_config.json").write_text(
+        '{"quantization":{"format":"NVFP4"}}', encoding="utf-8"
+    )
+    (model_path / "chat_template.jinja").write_text(
+        "<think><tool_call><function=name><parameter=key>", encoding="utf-8"
+    )
+    (model_path / "model.safetensors").write_bytes(b"resident-weights")
+    (model_path / "mtp" / "model.safetensors").write_bytes(b"mtp")
+    table = model_path / "ple" / "table.bin"
+    table.write_bytes(b"streamed")
+    (model_path / "ssd-stream.json").write_text(
+        json.dumps(
+            {
+                "format": "sglang-ssd-stream",
+                "version": 1,
+                "source": {
+                    "model": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+                    "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+                },
+                "tables": [
+                    {
+                        "path": "ple/table.bin",
+                        "bytes": table.stat().st_size,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return model_path
+
+
+def test_sglang_ssd_stream_uses_reviewed_image_profile_and_embedded_mtp(tmp_path):
+    model_path = _ssd_stream_model(tmp_path)
+    adapter = SGLangAdapter(
+        allowed_images={SGLANG_SSD_STREAM_IMAGE},
+        model_roots=(tmp_path / "models",),
+    )
+    spec = DeploymentSpec(
+        name="Qwen Flash Next SSD",
+        model_path=str(model_path),
+        api_model_name="qwen38-flash-next-ssd",
+        runtime="sglang",
+        image=SGLANG_SSD_STREAM_IMAGE,
+        context_length=262_144,
+        memory_fraction=0.9,
+        max_concurrency=1,
+        quantization="modelopt_fp4",
+        trust_remote_code=True,
+        chat_template="model",
+        chat_template_kwargs={"reasoning_effort": "xhigh"},
+    )
+
+    command = adapter.command(spec)
+
+    assert adapter.environment(spec)["SGLANG_PLUGINS"] == "ssd_stream"
+    assert adapter.security_options(spec) == [
+        "no-new-privileges=true",
+        "seccomp=unconfined",
+    ]
+    assert adapter.ulimits(spec) == [
+        {"name": "memlock", "soft": -1, "hard": -1}
+    ]
+    assert command[command.index("--fp4-gemm-backend") + 1] == "flashinfer_cutlass"
+    assert command[command.index("--kv-cache-dtype") + 1] == "auto"
+    assert command[command.index("--prefill-attention-backend") + 1] == "triton"
+    assert command[command.index("--decode-attention-backend") + 1] == "trtllm_mha"
+    assert command[command.index("--mamba-radix-cache-strategy") + 1] == (
+        "extra_buffer_lazy"
+    )
+    assert command[command.index("--max-total-tokens") + 1] == "262144"
+    assert command[command.index("--speculative-algorithm") + 1] == "NEXTN"
+    assert command[command.index("--speculative-draft-model-path") + 1] == (
+        "/models/qwen38-flash-next-ssd/mtp"
+    )
+    assert command[command.index("--speculative-num-draft-tokens") + 1] == "4"
+    assert command[command.index("--speculative-draft-model-quantization") + 1] == (
+        "unquant"
+    )
+    assert "--enable-multimodal" in command
+    assert "--allow-auto-truncate" in command
+    assert "--moe-runner-backend" not in command
+
+    streamed = (model_path / "ple" / "table.bin").stat().st_size
+    assert adapter.resident_model_size(model_path) == adapter.model_size(model_path) - streamed
+    preview = adapter.preview(spec)
+    assert preview["ssd_stream"]["streamed_bytes"] == streamed
+    assert preview["ssd_stream"]["source"]["model"] == (
+        "RadixArk/Qwen3.8-Flash-Next-NVFP4"
+    )
+    assert preview["estimated_memory_bytes"] < preview["estimated_disk_bytes"] * 1.2
+
+
+def test_sglang_ssd_stream_rejects_an_image_without_the_native_plugin(tmp_path):
+    model_path = _ssd_stream_model(tmp_path)
+    adapter = SGLangAdapter(
+        allowed_images={"sglang:plain"},
+        model_roots=(tmp_path / "models",),
+    )
+    spec = DeploymentSpec(
+        name="Qwen Flash Next SSD",
+        model_path=str(model_path),
+        api_model_name="qwen38-flash-next-ssd",
+        runtime="sglang",
+        image="sglang:plain",
+    )
+
+    with pytest.raises(ValueError, match="SSD Stream models require the reviewed image"):
+        adapter.command(spec)
+
+
+def test_sglang_ssd_stream_rejects_an_invalid_sidecar(tmp_path):
+    model_path = _ssd_stream_model(tmp_path)
+    (model_path / "ple" / "table.bin").write_bytes(b"truncated")
+    adapter = SGLangAdapter(
+        allowed_images={SGLANG_SSD_STREAM_IMAGE},
+        model_roots=(tmp_path / "models",),
+    )
+    spec = DeploymentSpec(
+        name="Qwen Flash Next SSD",
+        model_path=str(model_path),
+        api_model_name="qwen38-flash-next-ssd",
+        runtime="sglang",
+        image=SGLANG_SSD_STREAM_IMAGE,
+    )
+
+    with pytest.raises(ValueError, match="manifest or sidecar is invalid"):
+        adapter.command(spec)
 
 
 def test_sglang_dflash_uses_model_card_block_size(tmp_path):

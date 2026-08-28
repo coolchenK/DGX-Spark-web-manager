@@ -630,9 +630,21 @@ def test_aria2_download_resumes_staging_and_publishes_snapshot(tmp_path, monkeyp
     calls = []
 
     class CompletedProcess:
-        returncode = 0
+        def __init__(self, destination, chunks):
+            self.destination = destination
+            self.chunks = iter(chunks)
+            self.returncode = None
 
         def poll(self):
+            if self.returncode is not None:
+                return self.returncode
+            try:
+                chunk = next(self.chunks)
+            except StopIteration:
+                self.returncode = 0
+                return self.returncode
+            with self.destination.open("ab") as stream:
+                stream.write(chunk)
             return self.returncode
 
         def terminate(self):
@@ -652,12 +664,8 @@ def test_aria2_download_resumes_staging_and_publishes_snapshot(tmp_path, monkeyp
         )
         destination = directory / filename
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if filename == "model.safetensors":
-            with destination.open("ab") as stream:
-                stream.write(b"def")
-        else:
-            destination.write_bytes(b"{}")
-        return CompletedProcess()
+        chunks = [b"d", b"ef"] if filename == "model.safetensors" else [b"{", b"}"]
+        return CompletedProcess(destination, chunks)
 
     monkeypatch.setattr(huggingface.subprocess, "Popen", fake_popen)
     staging = cache_dir / ".dgx-aria2" / "models--org--model" / "abc"
@@ -689,6 +697,7 @@ def test_aria2_download_resumes_staging_and_publishes_snapshot(tmp_path, monkeyp
     assert (snapshot / "config.json").read_bytes() == b"{}"
     assert (cache_dir / "models--org--model" / "refs" / "main").read_text() == "abc"
     assert not staging.exists()
+    assert any(update.get("completed_bytes") == 4 for update in updates)
     assert updates[-1]["progress"] == 100
 
 

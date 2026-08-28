@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+from typing import Any
 
 from app.runtime.base import (
     DeploymentSpec,
@@ -72,6 +74,9 @@ REASONING_PARSER_MARKERS = (("qwen3", ("<think>",)),)
 # strategy DSpark accepts.
 MAMBA_STATE_SLOTS_PER_REQUEST = 5
 MAMBA_RADIX_CACHE_STRATEGY = "extra_buffer"
+SGLANG_SSD_STREAM_IMAGE = "dgx-local/sglang-ssd-stream:60ce795-sm121"
+SSD_STREAM_MANIFEST = "ssd-stream.json"
+SSD_STREAM_MAMBA_STATE_SLOTS_PER_REQUEST = 5
 
 
 def _is_hybrid_gdn(model_path) -> bool:
@@ -130,6 +135,47 @@ def _is_nvfp4_moe(model_path) -> bool:
     )
 
 
+def _ssd_stream_manifest(model_path: Path) -> dict[str, Any] | None:
+    path = model_path / SSD_STREAM_MANIFEST
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("format") != "sglang-ssd-stream"
+        or payload.get("version") != 1
+        or not isinstance(payload.get("tables"), list)
+    ):
+        return None
+    return payload
+
+
+def _ssd_streamed_bytes(model_path: Path) -> int:
+    manifest = _ssd_stream_manifest(model_path)
+    if manifest is None:
+        return 0
+    streamed = 0
+    resolved_root = model_path.resolve()
+    for table in manifest["tables"]:
+        if not isinstance(table, dict) or not isinstance(table.get("path"), str):
+            return 0
+        candidate = (model_path / table["path"]).resolve()
+        if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
+            return 0
+        try:
+            size = candidate.stat().st_size
+        except OSError:
+            return 0
+        declared = table.get("bytes")
+        if not isinstance(declared, int) or declared <= 0 or size != declared:
+            return 0
+        streamed += size
+    return streamed
+
+
 def _hf_repo_id_from_cache_path(path: str) -> str | None:
     """Translate a mounted HF cache path to its repository id.
 
@@ -156,6 +202,22 @@ def _hf_cache_root_from_container_path(path: str) -> str | None:
 class SGLangAdapter(RuntimeAdapter):
     runtime = "sglang"
 
+    def validate(self, spec: DeploymentSpec) -> Path:
+        model_path = super().validate(spec)
+        manifest_path = model_path / SSD_STREAM_MANIFEST
+        manifest = _ssd_stream_manifest(model_path)
+        if manifest_path.is_file() and (manifest is None or _ssd_streamed_bytes(model_path) <= 0):
+            raise ValueError("SSD Stream manifest or sidecar is invalid")
+        if manifest is not None and spec.image != SGLANG_SSD_STREAM_IMAGE:
+            raise ValueError(
+                f"SSD Stream models require the reviewed image {SGLANG_SSD_STREAM_IMAGE}"
+            )
+        return model_path
+
+    def resident_model_size(self, model_path: Path) -> int:
+        total = self.model_size(model_path)
+        return max(total - _ssd_streamed_bytes(model_path), 0)
+
     def environment(self, spec: DeploymentSpec) -> dict[str, str]:
         # Use every host CPU core for tensor/linear-algebra work and model
         # loading. SGLang defaults to a fraction of the cores on ARM hosts.
@@ -175,7 +237,23 @@ class SGLangAdapter(RuntimeAdapter):
             cache_root = _hf_cache_root_from_container_path(draft_path) or cache_root
         env["HF_HOME"] = cache_root
         env["HF_HUB_CACHE"] = cache_root
+        if _ssd_stream_manifest(self.validate(spec)) is not None:
+            env["SGLANG_PLUGINS"] = "ssd_stream"
         return env
+
+    def security_options(self, spec: DeploymentSpec) -> list[str]:
+        if _ssd_stream_manifest(self.validate(spec)) is None:
+            return []
+        # Docker's default seccomp profile blocks io_uring on this host. The
+        # plugin only receives this exception for a validated SSD manifest and
+        # its reviewed, pinned image; no-new-privileges remains enforced.
+        return ["no-new-privileges=true", "seccomp=unconfined"]
+
+    def ulimits(self, spec: DeploymentSpec) -> list[dict[str, int | str]]:
+        if _ssd_stream_manifest(self.validate(spec)) is None:
+            return []
+        # PageReader registers one 32 MiB io_uring buffer pool per reader.
+        return [{"name": "memlock", "soft": -1, "hard": -1}]
 
     def command(self, spec: DeploymentSpec) -> list[str]:
         model_path = self.container_model_path(spec)
@@ -201,7 +279,41 @@ class SGLangAdapter(RuntimeAdapter):
             "20",
         ]
         resolved_model_path = self.validate(spec)
-        if _is_hybrid_gdn(resolved_model_path):
+        ssd_stream = _ssd_stream_manifest(resolved_model_path) is not None
+        if ssd_stream:
+            command.extend(
+                [
+                    "--fp4-gemm-backend",
+                    "flashinfer_cutlass",
+                    # SM121 QSA rejects mixed BF16-query/FP8-key attention;
+                    # auto keeps this DGX Spark path on the model's BF16 KV.
+                    "--kv-cache-dtype",
+                    "auto",
+                    "--prefill-attention-backend",
+                    "triton",
+                    "--decode-attention-backend",
+                    "trtllm_mha",
+                    "--page-size",
+                    "64",
+                    "--mamba-radix-cache-strategy",
+                    "extra_buffer_lazy",
+                    "--mamba-track-interval",
+                    "64",
+                    "--mamba-ssm-dtype",
+                    "float32",
+                    "--max-mamba-cache-size",
+                    str(spec.max_concurrency * SSD_STREAM_MAMBA_STATE_SLOTS_PER_REQUEST),
+                    "--chunked-prefill-size",
+                    "4096",
+                    "--max-total-tokens",
+                    str(spec.context_length),
+                    "--cuda-graph-max-bs-decode",
+                    str(spec.max_concurrency),
+                    "--allow-auto-truncate",
+                    "--enable-multimodal",
+                ]
+            )
+        elif _is_hybrid_gdn(resolved_model_path):
             command.extend(
                 [
                     "--mamba-radix-cache-strategy",
@@ -210,7 +322,7 @@ class SGLangAdapter(RuntimeAdapter):
                     str(spec.max_concurrency * MAMBA_STATE_SLOTS_PER_REQUEST),
                 ]
             )
-        if _is_nvfp4_moe(resolved_model_path):
+        if not ssd_stream and _is_nvfp4_moe(resolved_model_path):
             command.extend(["--moe-runner-backend", "flashinfer_cutlass"])
         template, template_path = effective_chat_template(spec, resolved_model_path)
         if template_path is not None:
@@ -228,7 +340,24 @@ class SGLangAdapter(RuntimeAdapter):
         command.extend(default_chat_template_kwargs_flags(spec))
         if spec.trust_remote_code:
             command.append("--trust-remote-code")
-        if spec.speculative is not None:
+        if ssd_stream and spec.speculative is None:
+            command.extend(
+                [
+                    "--speculative-algorithm",
+                    "NEXTN",
+                    "--speculative-draft-model-path",
+                    f"{model_path}/mtp",
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--speculative-draft-model-quantization",
+                    "unquant",
+                ]
+            )
+        elif spec.speculative is not None:
             runtime_method = require_speculative_runtime_method(spec)
             expected_method = SGLANG_SPECULATIVE_METHODS[spec.speculative.method]
             if runtime_method != expected_method:
@@ -298,3 +427,17 @@ class SGLangAdapter(RuntimeAdapter):
             # Remaining tuning from the SGLang cookbook's DGX Spark recipe.
             command.extend(list(SGLANG_DSPARK_FLAGS))
         return command
+
+    def preview(self, spec: DeploymentSpec) -> dict[str, Any]:
+        preview = super().preview(spec)
+        model_path = self.validate(spec)
+        manifest = _ssd_stream_manifest(model_path)
+        if manifest is not None:
+            preview["ssd_stream"] = {
+                "enabled": True,
+                "streamed_bytes": _ssd_streamed_bytes(model_path),
+                "resident_model_bytes": self.resident_model_size(model_path),
+                "source": manifest.get("source"),
+                "native_mtp": spec.speculative is None,
+            }
+        return preview

@@ -542,6 +542,10 @@ class RuntimeAdapter(ABC):
                 continue
         return total
 
+    def resident_model_size(self, model_path: Path) -> int:
+        """Return model bytes expected to occupy unified memory at runtime."""
+        return self.model_size(model_path)
+
     def openai_capabilities(self) -> list[str]:
         return ["chat", "completion"]
 
@@ -556,6 +560,14 @@ class RuntimeAdapter(ABC):
     def entrypoint(self, spec: DeploymentSpec) -> list[str] | None:
         del spec
         return None
+
+    def security_options(self, spec: DeploymentSpec) -> list[str]:
+        del spec
+        return []
+
+    def ulimits(self, spec: DeploymentSpec) -> list[dict[str, int | str]]:
+        del spec
+        return []
 
     def start(self, container: Any) -> None:
         container.start()
@@ -610,6 +622,7 @@ class RuntimeAdapter(ABC):
         model_path = self.validate(spec)
         compatibility = self.check_model_compatibility(model_path)
         model_size = self.model_size(model_path)
+        resident_model_size = self.resident_model_size(model_path)
         route_name = spec.route_alias or spec.api_model_name
         return {
             "spec": (
@@ -627,7 +640,7 @@ class RuntimeAdapter(ABC):
             "command": self.command(spec),
             "estimated_memory_fraction": spec.memory_fraction,
             "estimated_disk_bytes": model_size,
-            "estimated_memory_bytes": int(model_size * 1.2),
+            "estimated_memory_bytes": int(resident_model_size * 1.2),
             "environment": self.detect_environment(spec),
             "compatibility": compatibility,
             "capabilities": self.openai_capabilities(),
