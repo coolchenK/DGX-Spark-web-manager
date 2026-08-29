@@ -1627,6 +1627,65 @@ def test_alma_future_action_pledge_detector_does_not_match_procedural_answer():
     assert gateway_proxy._chat_completion_has_actionable_output(procedure)
 
 
+def test_alma_nonstream_normalization_promotes_tagged_task_call():
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        '<tool_call>{"name":"Task","arguments":'
+                        '{"prompt":"Analyze the video","agent_id":"developer"}}'
+                        "</tool_call>"
+                    ),
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    assert gateway_proxy._normalize_nonstream_chat_completion(payload)
+    choice = payload["choices"][0]
+    message = choice["message"]
+    assert message["content"] == ""
+    assert choice["finish_reason"] == "tool_calls"
+    function = message["tool_calls"][0]["function"]
+    assert function["name"] == "Task"
+    assert json.loads(function["arguments"]) == {
+        "prompt": "Analyze the video",
+        "agent_id": "developer",
+        "description": "Analyze the video",
+    }
+
+
+def test_alma_protocol_and_punctuation_only_content_is_not_actionable():
+    for content in (
+        '<tool_call>{"name":"Bash","arguments":{"command":"pwd"}}</tool_call>',
+        "<|channel|>analysis<|message|>",
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+        "\n\n...\n",
+    ):
+        payload = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        assert not gateway_proxy._chat_completion_has_actionable_output(payload)
+
+    answer = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "任务执行失败：命令不存在。"},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    assert gateway_proxy._chat_completion_has_actionable_output(answer)
+
+
 @respx.mock
 def test_gateway_never_returns_an_empty_alma_tool_continuation(client):
     key = _create_gateway_key(client)

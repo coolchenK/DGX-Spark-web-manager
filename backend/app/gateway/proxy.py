@@ -37,6 +37,15 @@ ALMA_HIDDEN_REASONING_BLOCK_RE = re.compile(
     r"<(?P<tag>think|analysis)\b[^>]*>.*?(?:</(?P=tag)\s*>|$)",
     re.IGNORECASE | re.DOTALL,
 )
+ALMA_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<tool_call>\s*(?P<payload>\{.*?\})\s*</tool_call>",
+    re.IGNORECASE | re.DOTALL,
+)
+ALMA_PROTOCOL_TOKEN_RE = re.compile(
+    r"<\|channel\|>[^<]*<\|message\|>|<\|[^>]+\|>",
+    re.IGNORECASE,
+)
+ALMA_VISIBLE_WORD_RE = re.compile(r"\w", re.UNICODE)
 ALMA_EMPTY_CONTINUATION_RETRY_PROMPT = (
     "The preceding assistant generation was empty or stopped after describing a future "
     "action without performing it. Continue the original task now "
@@ -162,6 +171,8 @@ def _normalize_nonstream_chat_completion(payload: dict[str, Any]) -> bool:
         message = choice.get("message")
         if not isinstance(message, dict):
             continue
+        if _promote_tagged_tool_call(message):
+            changed = True
         if normalize_alma_tool_call_arguments(message):
             changed = True
         reasoning = (
@@ -183,7 +194,9 @@ def _content_has_visible_text(content: Any) -> bool:
     if not isinstance(content, str):
         return False
     visible = ALMA_HIDDEN_REASONING_BLOCK_RE.sub("", content)
-    return bool(visible.strip())
+    visible = ALMA_TOOL_CALL_BLOCK_RE.sub("", visible)
+    visible = ALMA_PROTOCOL_TOKEN_RE.sub("", visible).strip()
+    return bool(visible and ALMA_VISIBLE_WORD_RE.search(visible))
 
 
 def _chat_completion_has_output(payload: dict[str, Any]) -> bool:
@@ -307,6 +320,46 @@ def _normalize_alma_task_arguments(arguments: Any) -> bool:
         return False
     arguments["description"] = description
     return True
+
+
+def _promote_tagged_tool_call(message: dict[str, Any]) -> bool:
+    if message.get("tool_calls"):
+        return False
+    for key in ("reasoning_text", "reasoning_content", "reasoning", "content"):
+        source = message.get(key)
+        if not isinstance(source, str):
+            continue
+        match = ALMA_TOOL_CALL_BLOCK_RE.search(source)
+        if match is None:
+            continue
+        try:
+            parsed_call = json.loads(match.group("payload"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed_call, dict):
+            continue
+        name = parsed_call.get("name")
+        arguments = parsed_call.get("arguments")
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            continue
+        message["tool_calls"] = [
+            {
+                "id": f"chatcmpl-tool-{uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(
+                        arguments,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+        ]
+        if key == "content":
+            message["content"] = f"{source[: match.start()]}{source[match.end() :]}"
+        return True
+    return False
 
 
 def normalize_alma_tool_call_arguments(delta: dict[str, Any]) -> bool:

@@ -50,7 +50,8 @@ ARM64-native management plane for NVIDIA DGX Spark. It discovers existing SGLang
   disables repeated Qwen thinking, and validates visible output before releasing OpenAI SSE.
   Reasoning-only fields and raw `<think>`/`<analysis>` blocks are retried with bounded corrective
   prompts. Missing or oversized Alma `Task.description` values are repaired from the task prompt,
-  and short future-action pledges without a tool call are treated as incomplete continuations.
+  raw XML-tagged tool intents are promoted to OpenAI `tool_calls`, and protocol-only, punctuation-only,
+  or short future-action pledges without a tool call are treated as incomplete continuations.
   Successful or failed tools therefore cannot silently terminate without a final response.
   Fifteen-second SSE keepalives and a 30-minute upstream read timeout protect long agent turns.
 - OpenAI-compatible `/v1/models`, chat completions, completions, embeddings (when supported), and SSE streaming.
