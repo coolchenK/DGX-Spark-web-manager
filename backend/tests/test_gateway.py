@@ -5,6 +5,7 @@ import httpx
 import respx
 from app.api import gateway
 from app.gateway import proxy as gateway_proxy
+from app.gateway.adapters import adapter_for_runtime
 from app.models import AuditEvent, Deployment, RequestMetric
 from httpx import Response
 from sqlalchemy import select
@@ -318,6 +319,55 @@ def test_models_does_not_overwrite_shared_route_metadata_with_second_instance(cl
     assert shared["context_length"] == 8192
 
 
+def test_model_retrieve_uses_standard_object_shape_and_supports_route_slashes(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        db.add(
+            Deployment(
+                name="namespaced-model",
+                runtime="sglang",
+                endpoint_url="http://127.0.0.1:8014",
+                api_model_name="upstream-model",
+                status="running",
+                health="healthy",
+                capabilities=["chat"],
+                config={"route_alias": "org/model"},
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        "/v1/models/org/model",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 200
+    model = response.json()
+    assert model["id"] == "org/model"
+    assert model["object"] == "model"
+    assert isinstance(model["created"], int)
+    assert model["owned_by"] == "dgx-spark-manager"
+
+
+def test_model_retrieve_returns_openai_error_for_unknown_model(client):
+    key = _create_gateway_key(client)
+
+    response = client.get(
+        "/v1/models/missing",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "message": "Model 'missing' was not found or is not healthy",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": None,
+        }
+    }
+
+
 @respx.mock
 def test_chat_completions_routes_alias_and_records_usage(client):
     key = _create_gateway_key(client)
@@ -356,6 +406,88 @@ def test_unknown_model_uses_openai_error_shape(client):
 
     assert response.status_code == 404
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_local_adapter_translates_developer_role_without_mutating_input():
+    adapter = adapter_for_runtime("sglang")
+    body = {
+        "model": "qwen",
+        "messages": [
+            {"role": "developer", "content": "Follow these instructions", "name": "app"},
+            {"role": "user", "content": "Hello"},
+        ],
+    }
+
+    result = adapter.adapt_request("/v1/chat/completions", body)
+
+    assert result.transformations == ("messages.role.developer_to_system",)
+    assert result.body["messages"] == [
+        {"role": "system", "content": "Follow these instructions", "name": "app"},
+        {"role": "user", "content": "Hello"},
+    ]
+    assert body["messages"][0]["role"] == "developer"
+
+
+@respx.mock
+def test_chat_proxy_accepts_standard_developer_role_and_adapts_upstream(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [
+                {"role": "developer", "content": "Be concise"},
+                {"role": "user", "content": "Reply OK"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["messages"] == [
+        {"role": "system", "content": "Be concise"},
+        {"role": "user", "content": "Reply OK"},
+    ]
+
+
+@respx.mock
+def test_chat_proxy_normalizes_nonstandard_upstream_error_for_stream_request(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            400,
+            json={
+                "object": "error",
+                "message": "Unexpected message role.",
+                "type": "BadRequest",
+                "code": 400,
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {
+        "error": {
+            "message": "Unexpected message role.",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": None,
+        }
+    }
 
 
 @respx.mock

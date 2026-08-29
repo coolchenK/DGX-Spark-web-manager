@@ -14,6 +14,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.orm import sessionmaker
 
+from app.gateway.adapters import GatewayAdapter
 from app.models import Deployment, RequestMetric
 
 logger = logging.getLogger(__name__)
@@ -527,6 +528,7 @@ async def _buffered_alma_tool_continuation_response(
     body: dict[str, Any],
     client: httpx.AsyncClient,
     upstream: httpx.Response,
+    adapter: GatewayAdapter,
     started_at: float,
     on_finished: Callable[[], None] | None,
 ) -> Response:
@@ -592,6 +594,8 @@ async def _buffered_alma_tool_continuation_response(
 
     await client.aclose()
     if status_code >= 400 and content:
+        content = adapter.normalize_error(content, status_code=status_code)
+        media_type = "application/json"
         response = Response(content=content, status_code=status_code, media_type=media_type)
     else:
         if parsed is None:
@@ -640,6 +644,7 @@ async def proxy_openai_request(
     deployment: Deployment,
     endpoint: str,
     body: dict[str, Any],
+    adapter: GatewayAdapter,
     on_finished: Callable[[], None] | None = None,
 ) -> Response:
     body["model"] = deployment.api_model_name
@@ -684,6 +689,7 @@ async def proxy_openai_request(
                     body=upstream_body,
                     client=client,
                     upstream=upstream,
+                    adapter=adapter,
                     started_at=started_at,
                     on_finished=on_finished,
                 )
@@ -761,6 +767,26 @@ async def proxy_openai_request(
         if on_finished:
             on_finished()
         return openai_error(f"Upstream inference service is unavailable: {exc}", status_code=502)
+
+    if upstream.is_error:
+        content = await upstream.aread()
+        await upstream.aclose()
+        await client.aclose()
+        content = adapter.normalize_error(content, status_code=upstream.status_code)
+        record_request_metric(
+            request.app.state.database.session_factory,
+            model=deployment.api_model_name,
+            endpoint=endpoint,
+            status_code=upstream.status_code,
+            started_at=started_at,
+        )
+        if on_finished:
+            on_finished()
+        return Response(
+            content=content,
+            status_code=upstream.status_code,
+            media_type="application/json",
+        )
 
     if body.get("stream"):
 

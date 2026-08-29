@@ -549,6 +549,7 @@ and resource checks. An edit uses a health-gated container replacement and rollb
 ## OpenAI-Compatible Endpoints
 
 - `GET /v1/models`
+- `GET /v1/models/{model}`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
 - `POST /v1/embeddings` for deployments advertising `embedding`
@@ -557,6 +558,12 @@ and resource checks. An edit uses a health-gated container replacement and rollb
 name with the selected deployment's upstream `api_model_name`. SSE bytes are relayed without
 buffering, upstream status/content types are preserved, and manager-generated failures use the
 standard OpenAI `error` object.
+
+The public Chat Completions contract accepts OpenAI `developer` messages. A runtime adapter converts
+that role to the legacy `system` equivalent only in requests sent to local SGLang, vLLM, and
+llama.cpp chat templates. Client configuration, stored conversations, message content, and all
+other message fields remain unchanged. Non-standard flat runtime errors are converted to the same
+OpenAI `error` envelope before they are returned, including when the caller requested streaming.
 
 Set the optional `route_alias` to the same value on multiple instances to expose one gateway model
 name. Healthy instances are selected round-robin. `/v1/models` reports `instances` and only the

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.audit import record_audit
 from app.dependencies import Admin, get_db
+from app.gateway.adapters import adapter_for_runtime
 from app.gateway.proxy import (
     GENERATION_KEYS,
     is_alma_tool_continuation,
@@ -773,6 +774,14 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
     }
 
 
+@router.get("/v1/models/{model:path}")
+def openai_model(model: str, key: GatewayKey, db: GatewayDb) -> Any:
+    for item in openai_models(key, db)["data"]:
+        if item["id"] == model:
+            return item
+    return openai_error(f"Model '{model}' was not found or is not healthy", status_code=404)
+
+
 async def _proxy(
     endpoint: str,
     request: Request,
@@ -814,6 +823,8 @@ async def _proxy(
                 status_code=400,
             )
         return openai_error(f"Model '{model}' was not found or is not healthy", status_code=404)
+    adapter = adapter_for_runtime(deployment.runtime)
+    normalized_body = adapter.adapt_request(endpoint, normalized_body).body
     defaults, supported = deployment_generation_settings(deployment)
     normalized_body = extract_alma_system_tools(normalized_body)
     normalized_body = await enrich_empty_huggingface_search(normalized_body)
@@ -863,6 +874,7 @@ async def _proxy(
             deployment,
             endpoint,
             merged_body,
+            adapter,
             on_finished=finish_request,
         )
     except Exception:

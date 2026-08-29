@@ -82,7 +82,7 @@ uninstaller.
 | `runtime` | SGLang/vLLM environment and model checks, configuration, lifecycle, health, logs, metrics, uninstall, and OpenAI capabilities |
 | `deployment_recommendations` | Model evidence, deterministic settings, bounded AI fallback, resource estimates, and Draft candidates |
 | `deployments` | Idempotent container creation, health wait, preview/edit/clone workflows, lifecycle, logs, and rollback |
-| `gateway` | OpenAI model routing, JSON/SSE proxying, usage metrics |
+| `gateway` | OpenAI contract, model routing, runtime adapters, JSON/SSE proxying, normalized errors, usage metrics |
 | `providers` | Encrypted external OpenAI-compatible API configuration, structured connection/default-model readiness probes, and bounded response repair |
 | `diagnostics` | Persistent operations sessions, ordered messages/tool runs, bounded read-only orchestration, and linked plans |
 | `operations` | Digest-bound administrator approval and asynchronous execution of the exact displayed Shell plan through the Host Agent |
@@ -182,6 +182,12 @@ and the deployment worker resolves and validates the stored spec before containe
 effective route must have identical normalized generation defaults. The gateway round-robins route
 members, advertises the intersection of their OpenAI capabilities, and applies only defaults present
 in the selected deployment's saved capability snapshot.
+
+The gateway uses the same boundary as a channel-based AI relay: API handlers own the public OpenAI
+contract and routing, runtime adapters own request/error translation, and the HTTP proxy owns
+transport, SSE heartbeats, timeouts, response normalization, and metrics. This keeps local chat
+template limitations out of clients while preserving the existing Alma tool-continuation and
+multimodal transformations.
 
 ## Trust Boundaries
 
