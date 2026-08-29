@@ -565,6 +565,13 @@ llama.cpp chat templates. Client configuration, stored conversations, message co
 other message fields remain unchanged. Non-standard flat runtime errors are converted to the same
 OpenAI `error` envelope before they are returned, including when the caller requested streaming.
 
+For SGLang deployments, model discovery reads the live `max_total_num_tokens` value exposed by the
+runtime. The standard model-listing extensions report the lower of that profiled capacity and the
+configured model context as `context_length`/`context_window`, while
+`configured_context_length` preserves the theoretical setting. `max_input_tokens` reserves the
+advertised output allowance so clients compact before the runtime shortens a response to fit its
+actual KV token pool.
+
 Set the optional `route_alias` to the same value on multiple instances to expose one gateway model
 name. Healthy instances are selected round-robin. `/v1/models` reports `instances` and only the
 capabilities shared by every instance. Preview rejects members of one effective route when their

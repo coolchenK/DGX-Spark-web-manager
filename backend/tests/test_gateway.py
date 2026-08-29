@@ -183,9 +183,51 @@ def test_models_exposes_discovery_aliases_and_benchmark_performance_metadata(cli
     assert model["metadata"]["runtime"] == "sglang"
     assert model["limits"] == {
         "context_window": 204800,
+        "configured_context_length": 204800,
+        "runtime_token_capacity": None,
         "max_input_tokens": 188416,
         "max_output_tokens": 16384,
         "max_concurrency": 2,
+    }
+
+
+@respx.mock
+def test_models_uses_profiled_sglang_capacity_and_reserves_output_tokens(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {
+                "context_length": 262144,
+                "generation_defaults": {"max_tokens": 16384},
+            }
+        },
+    )
+    respx.get("http://127.0.0.1:8001/get_server_info").mock(
+        return_value=Response(
+            200,
+            json={
+                "context_length": 262144,
+                "max_total_tokens": 262144,
+                "max_total_num_tokens": 84608,
+            },
+        )
+    )
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    model = response.json()["data"][0]
+    assert model["context_length"] == 84608
+    assert model["context_window"] == 84608
+    assert model["configured_context_length"] == 262144
+    assert model["runtime_token_capacity"] == 84608
+    assert model["max_input_tokens"] == 68224
+    assert model["max_output_tokens"] == 16384
+    assert model["limit"] == {
+        "context": 84608,
+        "input": 68224,
+        "output": 16384,
     }
 
 

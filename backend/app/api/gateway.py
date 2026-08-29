@@ -33,6 +33,7 @@ router = APIRouter(tags=["openai-gateway"])
 GatewayDb = Annotated[Session, Depends(get_db)]
 _route_positions: dict[str, int] = defaultdict(int)
 _route_lock = Lock()
+RUNTIME_CAPACITY_PROBE_TIMEOUT_SECONDS = 1.0
 
 
 class GatewayAuthError(Exception):
@@ -508,6 +509,62 @@ def deployment_generation_settings(
     return validated, {key for key in supported if isinstance(key, str)}
 
 
+def deployment_context_limits(deployment: Deployment) -> dict[str, int | None]:
+    """Resolve public limits from configured context and live runtime capacity."""
+    config = deployment.config if isinstance(deployment.config, Mapping) else {}
+    spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
+    configured_context = spec.get("context_length") or config.get("context_length")
+    if not isinstance(configured_context, int) or isinstance(configured_context, bool):
+        configured_context = None
+
+    runtime_capacity: int | None = None
+    if deployment.runtime == "sglang":
+        try:
+            with httpx.Client(
+                timeout=RUNTIME_CAPACITY_PROBE_TIMEOUT_SECONDS,
+                trust_env=False,
+            ) as client:
+                response = client.get(
+                    f"{deployment.endpoint_url.rstrip('/')}/get_server_info"
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            payload = None
+        if isinstance(payload, Mapping):
+            candidate = payload.get("max_total_num_tokens")
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                runtime_capacity = candidate
+
+    if configured_context is None:
+        context_length = runtime_capacity
+    elif runtime_capacity is None:
+        context_length = configured_context
+    else:
+        context_length = min(configured_context, runtime_capacity)
+
+    defaults = (
+        dict(spec.get("generation_defaults") or {})
+        if isinstance(spec.get("generation_defaults"), Mapping)
+        else {}
+    )
+    max_output_tokens = defaults.get("max_tokens")
+    if not isinstance(max_output_tokens, int) or isinstance(max_output_tokens, bool):
+        max_output_tokens = None
+    max_input_tokens = (
+        max(context_length - max_output_tokens, 0)
+        if context_length is not None and max_output_tokens is not None
+        else context_length
+    )
+    return {
+        "context_length": context_length,
+        "configured_context_length": configured_context,
+        "runtime_token_capacity": runtime_capacity,
+        "max_input_tokens": max_input_tokens,
+        "max_output_tokens": max_output_tokens,
+    }
+
+
 def _healthy_gateway_deployments(db: Session) -> list[Deployment]:
     return list(
         db.scalars(
@@ -523,22 +580,15 @@ def _alma_catalog_entry(
     deployment: Deployment,
     *,
     capability_names: list[str] | None = None,
+    context_limits: Mapping[str, int | None] | None = None,
 ) -> dict[str, Any]:
-    config = deployment.config if isinstance(deployment.config, Mapping) else {}
-    spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
     route_name = deployment_route_name(deployment)
-    context_length = spec.get("context_length") or config.get("context_length")
-    defaults = (
-        dict(spec.get("generation_defaults") or {})
-        if isinstance(spec.get("generation_defaults"), Mapping)
-        else {}
-    )
-    max_output_tokens = defaults.get("max_tokens")
-    max_input_tokens = (
-        max(context_length - max_output_tokens, 0)
-        if isinstance(context_length, int) and isinstance(max_output_tokens, int)
-        else context_length
-    )
+    limits = dict(context_limits or deployment_context_limits(deployment))
+    context_length = limits.get("context_length")
+    configured_context_length = limits.get("configured_context_length")
+    runtime_token_capacity = limits.get("runtime_token_capacity")
+    max_output_tokens = limits.get("max_output_tokens")
+    max_input_tokens = limits.get("max_input_tokens")
     capability_set = set(
         deployment.capabilities if capability_names is None else capability_names
     )
@@ -561,6 +611,8 @@ def _alma_catalog_entry(
         "api": "openai-compatible chat/completions",
         "context_length": context_length,
         "contextWindow": context_length,
+        "configured_context_length": configured_context_length,
+        "runtime_token_capacity": runtime_token_capacity,
         "max_output_tokens": max_output_tokens,
         "maxOutputTokens": max_output_tokens,
         "limit": {
@@ -618,24 +670,26 @@ def alma_models_catalog(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
 @router.get("/v1/models")
 def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
     deployments = _healthy_gateway_deployments(db)
+    context_limits = {
+        deployment.id: deployment_context_limits(deployment) for deployment in deployments
+    }
     routes: dict[str, dict[str, Any]] = {}
     for deployment in deployments:
         route_name = deployment_route_name(deployment)
+        deployment_limits = context_limits[deployment.id]
         if route_name not in routes:
             config = deployment.config if isinstance(deployment.config, Mapping) else {}
             spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
-            context_length = spec.get("context_length") or config.get("context_length")
+            context_length = deployment_limits["context_length"]
+            configured_context_length = deployment_limits["configured_context_length"]
+            runtime_token_capacity = deployment_limits["runtime_token_capacity"]
             generation_defaults = (
                 dict(spec.get("generation_defaults") or {})
                 if isinstance(spec.get("generation_defaults"), Mapping)
                 else {}
             )
-            max_output_tokens = generation_defaults.get("max_tokens")
-            max_input_tokens = (
-                max(context_length - max_output_tokens, 0)
-                if isinstance(context_length, int) and isinstance(max_output_tokens, int)
-                else context_length
-            )
+            max_output_tokens = deployment_limits["max_output_tokens"]
+            max_input_tokens = deployment_limits["max_input_tokens"]
             max_concurrency = spec.get("max_concurrency")
             benchmark_tps = deployment.benchmark_tps
             benchmark_status = deployment.benchmark_status or (
@@ -654,6 +708,8 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
             }
             limits = {
                 "context_window": context_length,
+                "configured_context_length": configured_context_length,
+                "runtime_token_capacity": runtime_token_capacity,
                 "max_input_tokens": max_input_tokens,
                 "max_output_tokens": max_output_tokens,
                 "max_concurrency": max_concurrency,
@@ -661,6 +717,8 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
             metadata = {
                 **limits,
                 "context_length": context_length,
+                "configured_context_length": configured_context_length,
+                "runtime_token_capacity": runtime_token_capacity,
                 "max_model_len": context_length,
                 "max_context_tokens": context_length,
                 "output_token_limit": max_output_tokens,
@@ -689,6 +747,8 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
                 # several established aliases so discovery clients with different
                 # schemas can recognize the same limits without guesswork.
                 "context_length": context_length,
+                "configured_context_length": configured_context_length,
+                "runtime_token_capacity": runtime_token_capacity,
                 "max_model_len": context_length,
                 "max_context_tokens": context_length,
                 "context_window": context_length,
@@ -713,6 +773,21 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
             if capability in deployment.capabilities
         ]
         route["instances"] += 1
+        member_context = deployment_limits["context_length"]
+        if isinstance(member_context, int) and (
+            not isinstance(route["context_length"], int)
+            or member_context < route["context_length"]
+        ):
+            route["context_length"] = member_context
+            route["context_window"] = member_context
+            route["max_model_len"] = member_context
+            route["max_context_tokens"] = member_context
+            max_output_tokens = route.get("max_output_tokens")
+            route["max_input_tokens"] = (
+                max(member_context - max_output_tokens, 0)
+                if isinstance(max_output_tokens, int)
+                else member_context
+            )
     # Keep the standard OpenAI list envelope while enriching each item with
     # the same catalog fields Alma 0.3.0's OpenCode Go parser understands.
     # Alma's Custom provider ignores these fields (an Alma-side limitation),
@@ -725,7 +800,17 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
         )
         capability_names = list(route["capabilities"])
         route.update(
-            _alma_catalog_entry(deployment, capability_names=capability_names)
+            _alma_catalog_entry(
+                deployment,
+                capability_names=capability_names,
+                context_limits={
+                    "context_length": route["context_length"],
+                    "configured_context_length": route["configured_context_length"],
+                    "runtime_token_capacity": route["runtime_token_capacity"],
+                    "max_input_tokens": route["max_input_tokens"],
+                    "max_output_tokens": route["max_output_tokens"],
+                },
+            )
         )
         route["object"] = "model"
         route["created"] = route.get("created", int(deployment.created_at.timestamp()))
@@ -743,6 +828,8 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
         route["tokens_per_second"] = deployment.benchmark_tps
         route["metadata"] = {
             "context_window": route["context_window"],
+            "configured_context_length": route["configured_context_length"],
+            "runtime_token_capacity": route["runtime_token_capacity"],
             "max_input_tokens": route["max_input_tokens"],
             "max_output_tokens": route["max_output_tokens"],
             "max_concurrency": route["max_concurrency"],
@@ -763,6 +850,8 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
         }
         route["limits"] = {
             "context_window": route["context_window"],
+            "configured_context_length": route["configured_context_length"],
+            "runtime_token_capacity": route["runtime_token_capacity"],
             "max_input_tokens": route["max_input_tokens"],
             "max_output_tokens": route["max_output_tokens"],
             "max_concurrency": route["max_concurrency"],
