@@ -31,13 +31,15 @@ GENERATION_KEYS = {
 }
 GENERATION_ENDPOINTS = {"/v1/chat/completions", "/v1/completions"}
 ALMA_TASK_DESCRIPTION_MAX_LENGTH = 80
+ALMA_TASK_DESCRIPTION_FALLBACK = "Execute delegated task"
 ALMA_CONTINUATION_HEARTBEAT_SECONDS = 15.0
 ALMA_HIDDEN_REASONING_BLOCK_RE = re.compile(
     r"<(?P<tag>think|analysis)\b[^>]*>.*?(?:</(?P=tag)\s*>|$)",
     re.IGNORECASE | re.DOTALL,
 )
 ALMA_EMPTY_CONTINUATION_RETRY_PROMPT = (
-    "The preceding assistant generation was empty. Continue the original task now "
+    "The preceding assistant generation was empty or stopped after describing a future "
+    "action without performing it. Continue the original task now "
     "using the tool results already present in the conversation. If another tool is "
     "strictly necessary, call it immediately. Otherwise, return the complete final "
     "answer. Do not emit an empty response."
@@ -47,7 +49,22 @@ ALMA_EMPTY_CONTINUATION_FINAL_PROMPT = (
     "the best complete final answer now from the available tool results."
 )
 ALMA_EMPTY_CONTINUATION_FALLBACK = (
-    "模型在工具执行后连续返回了空结果，网关已自动重试但仍未获得有效回答。请重新发送本次请求。"
+    "模型在工具执行后连续返回了空结果或未执行的状态信息，"
+    "网关已自动重试但仍未获得有效回答。请重新发送本次请求。"
+)
+ALMA_INCOMPLETE_ACTION_PATTERNS = (
+    re.compile(
+        r"(?:我(?:先|现在|这就|马上)?(?:会|将|去|来)?|现在我|接下来我|这就).{0,32}"
+        r"(?:获取|抓|下载|查询|搜索|查看|检查|调用|运行|执行).{0,40}"
+        r"(?:稍等|等一下|请稍候|片刻|[~～…])",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"(?:i(?:'ll| will| am going to)|let me|next i(?:'ll| will)).{0,48}"
+        r"(?:fetch|download|query|search|look up|inspect|check|call|run|execute).{0,48}"
+        r"(?:wait|one moment|hold on|shortly|\.\.\.)",
+        re.IGNORECASE | re.DOTALL,
+    ),
 )
 
 
@@ -184,6 +201,30 @@ def _chat_completion_has_output(payload: dict[str, Any]) -> bool:
     return False
 
 
+def _chat_completion_is_incomplete_action_pledge(payload: dict[str, Any]) -> bool:
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict) or message.get("tool_calls"):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        visible = ALMA_HIDDEN_REASONING_BLOCK_RE.sub("", content).strip()
+        if len(visible) > 500:
+            continue
+        if any(pattern.search(visible) for pattern in ALMA_INCOMPLETE_ACTION_PATTERNS):
+            return True
+    return False
+
+
+def _chat_completion_has_actionable_output(payload: dict[str, Any]) -> bool:
+    return _chat_completion_has_output(
+        payload
+    ) and not _chat_completion_is_incomplete_action_pledge(payload)
+
+
 def _merge_usage(total: dict[str, int], payload: dict[str, Any]) -> None:
     usage = payload.get("usage")
     if not isinstance(usage, dict):
@@ -246,6 +287,28 @@ def _chat_completion_to_sse(payload: dict[str, Any]) -> bytes:
     return f"{rendered}data: [DONE]\n\n".encode()
 
 
+def _normalize_alma_task_arguments(arguments: Any) -> bool:
+    if not isinstance(arguments, dict):
+        return False
+    current = arguments.get("description")
+    if isinstance(current, str) and current.strip():
+        description = current[:ALMA_TASK_DESCRIPTION_MAX_LENGTH]
+    else:
+        description = ""
+        for key in ("subject", "title", "prompt"):
+            candidate = arguments.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                description = " ".join(candidate.split())
+                break
+        description = (
+            description[:ALMA_TASK_DESCRIPTION_MAX_LENGTH] or ALMA_TASK_DESCRIPTION_FALLBACK
+        )
+    if current == description:
+        return False
+    arguments["description"] = description
+    return True
+
+
 def normalize_alma_tool_call_arguments(delta: dict[str, Any]) -> bool:
     """Keep Alma Task calls within its client-side schema."""
     changed = False
@@ -260,10 +323,8 @@ def normalize_alma_tool_call_arguments(delta: dict[str, Any]) -> bool:
             arguments = json.loads(raw_arguments)
         except json.JSONDecodeError:
             continue
-        description = arguments.get("description") if isinstance(arguments, dict) else None
-        if not isinstance(description, str) or len(description) <= ALMA_TASK_DESCRIPTION_MAX_LENGTH:
+        if not _normalize_alma_task_arguments(arguments):
             continue
-        arguments["description"] = description[:ALMA_TASK_DESCRIPTION_MAX_LENGTH]
         function["arguments"] = json.dumps(
             arguments,
             ensure_ascii=False,
@@ -315,10 +376,8 @@ def _normalize_streamed_task_calls(states: dict[int, dict[str, Any]]) -> bool:
             arguments = json.loads("".join(state["arguments"]))
         except json.JSONDecodeError:
             continue
-        description = arguments.get("description") if isinstance(arguments, dict) else None
-        if not isinstance(description, str) or len(description) <= ALMA_TASK_DESCRIPTION_MAX_LENGTH:
+        if not _normalize_alma_task_arguments(arguments):
             continue
-        arguments["description"] = description[:ALMA_TASK_DESCRIPTION_MAX_LENGTH]
         functions = state["functions"]
         for function in functions:
             function["arguments"] = ""
@@ -441,7 +500,9 @@ async def _buffered_alma_tool_continuation_response(
         if parsed is not None:
             _normalize_nonstream_chat_completion(parsed)
             _merge_usage(total_usage, parsed)
-        if status_code >= 400 or (parsed is not None and _chat_completion_has_output(parsed)):
+        if status_code >= 400 or (
+            parsed is not None and _chat_completion_has_actionable_output(parsed)
+        ):
             break
         if attempt >= 2:
             break
@@ -488,9 +549,9 @@ async def _buffered_alma_tool_continuation_response(
                 "model": deployment.api_model_name,
                 "choices": [],
             }
-        if not _chat_completion_has_output(parsed):
+        if not _chat_completion_has_actionable_output(parsed):
             logger.error(
-                "Alma tool continuation remained empty after retries model=%s",
+                "Alma tool continuation remained incomplete after retries model=%s",
                 deployment.api_model_name,
             )
             parsed["choices"] = [

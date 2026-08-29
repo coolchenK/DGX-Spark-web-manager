@@ -372,9 +372,7 @@ def test_multimodal_chat_normalizes_image_and_video_parts_for_vllm(client):
             json={
                 "id": "chatcmpl-multimodal",
                 "object": "chat.completion",
-                "choices": [
-                    {"index": 0, "message": {"role": "assistant", "content": "ok"}}
-                ],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
             },
         )
     )
@@ -513,9 +511,7 @@ def test_multimodal_runtime_parameter_selects_matching_shared_instance(client):
             200,
             json={
                 "id": "chatcmpl-vllm",
-                "choices": [
-                    {"index": 0, "message": {"role": "assistant", "content": "ok"}}
-                ],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
             },
         )
     )
@@ -1516,6 +1512,122 @@ def test_gateway_retries_empty_alma_tool_continuation_before_returning(client):
 
 
 @respx.mock
+def test_gateway_retries_alma_future_action_pledge_as_incomplete(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    task_arguments = {
+        "prompt": "Download the YouTube video and inspect its metadata.",
+        "agent_id": "developer",
+    }
+    responses = iter(
+        [
+            Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "我先去抓一下这个视频的信息。稍等~",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+                },
+            ),
+            Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_task_retry",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Task",
+                                            "arguments": json.dumps(task_arguments),
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 120, "completion_tokens": 30},
+                },
+            ),
+        ]
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        side_effect=lambda _request: next(responses)
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "inspect this video"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_task_failed",
+                    "content": "validation failed: description is required",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert route.call_count == 2
+    retry = json.loads(route.calls[1].request.content)
+    assert "stopped after describing a future action" in retry["messages"][-1]["content"]
+    calls = _streamed_calls(response)
+    normalized = json.loads("".join(calls[0]["arguments"]))
+    assert normalized == {
+        **task_arguments,
+        "description": "Download the YouTube video and inspect its metadata.",
+    }
+    assert '"finish_reason":"tool_calls"' in response.text
+
+
+def test_alma_future_action_pledge_detector_does_not_match_procedural_answer():
+    pledge = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "我先去抓一下这个视频的信息。稍等~",
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    procedure = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "接下来检查配置，然后重启服务并验证健康状态。",
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    assert not gateway_proxy._chat_completion_has_actionable_output(pledge)
+    assert gateway_proxy._chat_completion_has_actionable_output(procedure)
+
+
+@respx.mock
 def test_gateway_never_returns_an_empty_alma_tool_continuation(client):
     key = _create_gateway_key(client)
     _seed_deployment(client)
@@ -2222,6 +2334,54 @@ def test_gateway_clamps_nonstreaming_task_description_to_alma_schema_limit(clien
 
 
 @respx.mock
+def test_gateway_fills_missing_nonstreaming_task_description(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    arguments = {
+        "prompt": "Download and analyze the requested video.",
+        "agent_id": "developer",
+    }
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_task_missing_description",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Task",
+                                        "arguments": json.dumps(arguments),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {},
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": []},
+    )
+
+    function = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert json.loads(function["arguments"]) == {
+        **arguments,
+        "description": arguments["prompt"],
+    }
+
+
+@respx.mock
 def test_gateway_clamps_fragmented_streaming_task_arguments(client):
     key = _create_gateway_key(client)
     _seed_deployment(client)
@@ -2292,6 +2452,76 @@ def test_gateway_clamps_fragmented_streaming_task_arguments(client):
     normalized = json.loads("".join(calls[0]["arguments"]))
     assert normalized == _task_arguments(overlong[:80])
     assert response.text.count("\n\ndata: ") == len(events)
+
+
+@respx.mock
+def test_gateway_fills_missing_fragmented_streaming_task_description(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    arguments = json.dumps(
+        {"prompt": "Fetch the video metadata.", "agent_id": "developer"},
+        separators=(",", ":"),
+    )
+    midpoint = len(arguments) // 2
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_task_missing_description",
+                                "type": "function",
+                                "function": {
+                                    "name": "Task",
+                                    "arguments": arguments[:midpoint],
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": arguments[midpoint:]},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=_stream_payload(events),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    calls = _streamed_calls(response)
+    normalized = json.loads("".join(calls[0]["arguments"]))
+    assert normalized == {
+        "prompt": "Fetch the video metadata.",
+        "agent_id": "developer",
+        "description": "Fetch the video metadata.",
+    }
 
 
 @respx.mock
