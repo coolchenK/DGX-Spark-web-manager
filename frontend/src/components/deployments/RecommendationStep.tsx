@@ -222,6 +222,9 @@ export function RecommendationStep({
         <RecommendedField name="context_length" path="context_length" label="上下文长度" recommended={field('context_length')} editedFields={editedFields} rules={[{ required: true, type: 'number', min: 1024, max: 1_048_576 }]}>
           <InputNumber min={1024} max={1_048_576} step={1024} />
         </RecommendedField>
+        <RecommendedField name="max_total_tokens" path="max_total_tokens" label="运行时总 Token 槽" editedFields={editedFields} rules={[{ type: 'number', min: 1024, max: 1_048_576 }]}>
+          <InputNumber min={1024} max={1_048_576} step={1024} disabled={runtime !== 'sglang'} />
+        </RecommendedField>
         <RecommendedField name="max_concurrency" path="max_concurrency" label="最大并发" recommended={field('max_concurrency')} editedFields={editedFields} rules={[{ required: true, type: 'number', min: 1, max: 1024 }]}>
           <InputNumber min={1} max={1024} />
         </RecommendedField>

@@ -166,6 +166,7 @@ class DeploymentSpec(BaseModel):
     image: str
     port: int | None = Field(default=None, ge=1024, le=65535)
     context_length: int = Field(default=32768, ge=1024, le=1_048_576)
+    max_total_tokens: int | None = Field(default=None, ge=1024, le=1_048_576)
     memory_fraction: float = Field(default=0.8, ge=0.05, le=0.98)
     max_concurrency: int = Field(default=8, ge=1, le=1024)
     max_batched_tokens: int | None = Field(default=None, ge=1024, le=1_048_576)
@@ -216,6 +217,11 @@ class DeploymentSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_runtime_specific_settings(self):
+        if (
+            self.max_total_tokens is not None
+            and self.max_total_tokens > self.context_length
+        ):
+            raise ValueError("max_total_tokens cannot exceed context_length")
         if self.runtime == "llama_cpp":
             if self.quantization not in {None, "auto", "gguf"}:
                 raise ValueError("llama.cpp deployments require GGUF quantization")

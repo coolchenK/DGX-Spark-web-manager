@@ -129,7 +129,11 @@ def resolve_host_model_mount(
 # one changes the fingerprint, which is correct because the launch command
 # changes too. Add to this tuple whenever DeploymentSpec gains an optional
 # field.
-FINGERPRINT_FIELDS_OMITTED_WHEN_UNSET = ("chat_template", "chat_template_kwargs")
+FINGERPRINT_FIELDS_OMITTED_WHEN_UNSET = (
+    "chat_template",
+    "chat_template_kwargs",
+    "max_total_tokens",
+)
 
 
 def _deployment_spec_fingerprint(

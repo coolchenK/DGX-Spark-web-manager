@@ -90,6 +90,7 @@ export function DeploymentPreviewStep({
         <Typography.Title level={5}>解析后的部署参数</Typography.Title>
         <Descriptions bordered size="small" column={1} items={[
           { key: 'context', label: '上下文长度', children: spec?.context_length ?? '未设置' },
+          { key: 'total-tokens', label: '运行时总 Token 槽', children: spec?.max_total_tokens ?? '自动' },
           { key: 'fraction', label: '统一内存比例', children: spec?.memory_fraction ?? '未设置' },
           { key: 'concurrency', label: '最大并发', children: spec?.max_concurrency ?? '未设置' },
           { key: 'batched', label: '批处理 Token 上限', children: spec?.max_batched_tokens ?? '不适用' },

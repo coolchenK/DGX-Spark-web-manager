@@ -301,7 +301,7 @@ class SGLangAdapter(RuntimeAdapter):
                     "--chunked-prefill-size",
                     "8192",
                     "--max-total-tokens",
-                    str(spec.context_length),
+                    str(spec.max_total_tokens or spec.context_length),
                     "--cuda-graph-max-bs-decode",
                     str(spec.max_concurrency),
                     "--disable-prefill-cuda-graph",
@@ -309,6 +309,8 @@ class SGLangAdapter(RuntimeAdapter):
                     "--enable-multimodal",
                 ]
             )
+        elif spec.max_total_tokens is not None:
+            command.extend(["--max-total-tokens", str(spec.max_total_tokens)])
         elif _is_hybrid_gdn(resolved_model_path):
             command.extend(
                 [

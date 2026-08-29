@@ -116,7 +116,8 @@ that does not carry the required head.
 
 SGLang also sizes hybrid GDN/Mamba state slots from deployment concurrency, selects
 `flashinfer_cutlass` for NVFP4 MoE checkpoints, and detects tool-call/reasoning parsers from local chat
-templates. vLLM performs the corresponding parser detection, including Muse Glimmer's `ATEM`
+templates. Its optional `max_total_tokens` deployment field caps the runtime token pool independently
+from the model context declaration. vLLM performs the corresponding parser detection, including Muse Glimmer's `ATEM`
 tool-call format and `muse_glimmer` reasoning protocol when the dedicated ARM64 image is selected.
 Nemotron-H checkpoints additionally receive the official DGX Spark Marlin MoE, FP8 KV cache,
 FlashInfer Mamba, aligned Mamba cache, prefix-cache, `nemotron_v3` reasoning, and `qwen3_coder`

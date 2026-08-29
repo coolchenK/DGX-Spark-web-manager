@@ -484,6 +484,11 @@ the origin of retained recommended fields. `modified_fields` records recommendat
 the administrator changed after application; both use dotted generation paths such as
 `generation_defaults.temperature`. The backend persists JSON-safe provenance with the task/spec.
 
+`max_total_tokens` is an optional SGLang runtime-pool limit and cannot exceed `context_length`.
+It is distinct from the model's advertised context window and from `generation_defaults.max_tokens`.
+SSD Stream deployments pass it to `--max-total-tokens`; omitting it preserves the prior behavior of
+using `context_length` for the requested pool size.
+
 For SGLang, replace `num_speculative_tokens` with all three grouped values `num_steps`,
 `eagle_top_k`, and `num_draft_tokens`, or omit all three. These tuning groups are mutually exclusive
 by runtime. A SGLang DSpark candidate uses `method: "dspark"`; the adapter maps it to `DSPARK`,

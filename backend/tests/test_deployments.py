@@ -722,6 +722,7 @@ def test_stored_container_fingerprints_accept_specs_created_before_optional_fiel
     legacy = spec.model_dump(mode="json")
     legacy.pop("chat_template")
     legacy.pop("chat_template_kwargs")
+    legacy.pop("max_total_tokens")
     legacy_without_path = {key: value for key, value in legacy.items() if key != "model_path"}
 
     def fingerprint(payload):
@@ -2142,6 +2143,7 @@ def test_sglang_ssd_stream_uses_reviewed_image_profile_and_embedded_mtp(tmp_path
         runtime="sglang",
         image=SGLANG_SSD_STREAM_IMAGE,
         context_length=262_144,
+        max_total_tokens=212_992,
         memory_fraction=0.9,
         max_concurrency=1,
         quantization="modelopt_fp4",
@@ -2165,7 +2167,7 @@ def test_sglang_ssd_stream_uses_reviewed_image_profile_and_embedded_mtp(tmp_path
     assert command[command.index("--mamba-radix-cache-strategy") + 1] == (
         "extra_buffer_lazy"
     )
-    assert command[command.index("--max-total-tokens") + 1] == "262144"
+    assert command[command.index("--max-total-tokens") + 1] == "212992"
     assert command[command.index("--speculative-algorithm") + 1] == "NEXTN"
     assert command[command.index("--speculative-draft-model-path") + 1] == (
         "/models/qwen38-flash-next-ssd/mtp"

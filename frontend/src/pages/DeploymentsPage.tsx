@@ -751,6 +751,9 @@ export function DeploymentsPage() {
     if (runtime !== 'vllm' || result.max_batched_tokens === undefined) {
       delete result.max_batched_tokens
     }
+    if (runtime !== 'sglang' || result.max_total_tokens === undefined) {
+      delete result.max_total_tokens
+    }
     // The backend rejects an empty object here, and "no defaults" is the
     // common case, so send the key only when something is actually set.
     if (!Object.keys(result.chat_template_kwargs ?? {}).length) {
@@ -1111,7 +1114,7 @@ export function DeploymentsPage() {
     replaceEditedFields(new Set([...editedFieldsRef.current, ...changedPaths]))
     if ('runtime' in changed) {
       const previousPaths = priorRecommendationPaths()
-      const forced = new Set(['max_batched_tokens', 'quantization'])
+      const forced = new Set(['max_batched_tokens', 'max_total_tokens', 'quantization'])
       clearRecommendationValues(new Set([...previousPaths, ...forced]), forced)
       lastAppliedRecommendation.current = null
       restoredTupleKey.current = null
@@ -1134,6 +1137,7 @@ export function DeploymentsPage() {
         resource_warning_acknowledged: false,
         recommendation: null,
         max_batched_tokens: undefined,
+        max_total_tokens: undefined,
         quantization: nextRuntime === 'llama_cpp' ? 'gguf' : 'auto',
       })
       applyingRecommendation.current = false
@@ -1141,13 +1145,14 @@ export function DeploymentsPage() {
         !path.startsWith('speculative.')
         && path !== 'resource_warning_acknowledged'
         && path !== 'max_batched_tokens'
+        && path !== 'max_total_tokens'
         && path !== 'quantization'
       ))))
       return
     }
     if ('image' in changed) {
       const previousPaths = priorRecommendationPaths()
-      const forced = new Set(['max_batched_tokens', 'quantization'])
+      const forced = new Set(['max_batched_tokens', 'max_total_tokens', 'quantization'])
       clearRecommendationValues(new Set([...previousPaths, ...forced]), forced)
       lastAppliedRecommendation.current = null
       restoredTupleKey.current = null
@@ -1157,6 +1162,7 @@ export function DeploymentsPage() {
         resource_warning_acknowledged: false,
         recommendation: null,
         max_batched_tokens: undefined,
+        max_total_tokens: undefined,
         quantization: runtime === 'llama_cpp' ? 'gguf' : 'auto',
       })
       applyingRecommendation.current = false
@@ -1164,6 +1170,7 @@ export function DeploymentsPage() {
         !path.startsWith('speculative.')
         && path !== 'resource_warning_acknowledged'
         && path !== 'max_batched_tokens'
+        && path !== 'max_total_tokens'
         && path !== 'quantization'
       ))))
       return

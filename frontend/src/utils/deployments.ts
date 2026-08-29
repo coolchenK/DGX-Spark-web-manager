@@ -59,6 +59,7 @@ export interface DeploymentFormValues {
   image: string
   port?: number
   context_length: number
+  max_total_tokens?: number
   memory_fraction: number
   max_concurrency: number
   max_batched_tokens?: number
@@ -223,6 +224,10 @@ export function deploymentToFormValues(
       : deployment.runtime === 'llama_cpp' ? '--parallel' : '--max-num-seqs',
   )
   const routeAlias = String(deployment.config.route_alias ?? saved.route_alias ?? '') || undefined
+  const maxTotalTokens = (
+    saved.max_total_tokens
+    ?? finiteNumber(commandValue(command, '--max-total-tokens'), 0)
+  ) || undefined
   const values: DeploymentFormValues = {
     name: deployment.name,
     model_id: deployment.model_id ?? model.id,
@@ -233,6 +238,7 @@ export function deploymentToFormValues(
     image: deployment.image ?? '',
     port: deployment.port ?? undefined,
     context_length: finiteNumber(saved.context_length ?? contextValue, 32768),
+    ...(maxTotalTokens ? { max_total_tokens: maxTotalTokens } : {}),
     memory_fraction: finiteNumber(saved.memory_fraction ?? memoryValue, 0.8),
     max_concurrency: finiteNumber(saved.max_concurrency ?? concurrencyValue, 8),
     max_batched_tokens: (
