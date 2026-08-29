@@ -2161,9 +2161,7 @@ def test_sglang_ssd_stream_uses_reviewed_image_profile_and_embedded_mtp(tmp_path
         {"name": "memlock", "soft": -1, "hard": -1}
     ]
     assert command[command.index("--fp4-gemm-backend") + 1] == "flashinfer_cutlass"
-    assert command[command.index("--kv-cache-dtype") + 1] == "auto"
-    assert command[command.index("--prefill-attention-backend") + 1] == "triton"
-    assert command[command.index("--decode-attention-backend") + 1] == "trtllm_mha"
+    assert command[command.index("--kv-cache-dtype") + 1] == "bfloat16"
     assert command[command.index("--mamba-radix-cache-strategy") + 1] == (
         "extra_buffer_lazy"
     )
@@ -2173,9 +2171,10 @@ def test_sglang_ssd_stream_uses_reviewed_image_profile_and_embedded_mtp(tmp_path
         "/models/qwen38-flash-next-ssd/mtp"
     )
     assert command[command.index("--speculative-num-draft-tokens") + 1] == "4"
-    assert command[command.index("--speculative-draft-model-quantization") + 1] == (
-        "unquant"
-    )
+    assert command[command.index("--chunked-prefill-size") + 1] == "8192"
+    assert command[command.index("--tool-call-parser") + 1] == "auto"
+    assert command[command.index("--reasoning-parser") + 1] == "auto"
+    assert "--disable-prefill-cuda-graph" in command
     assert "--enable-multimodal" in command
     assert "--allow-auto-truncate" in command
     assert "--moe-runner-backend" not in command

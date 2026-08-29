@@ -74,7 +74,7 @@ REASONING_PARSER_MARKERS = (("qwen3", ("<think>",)),)
 # strategy DSpark accepts.
 MAMBA_STATE_SLOTS_PER_REQUEST = 5
 MAMBA_RADIX_CACHE_STRATEGY = "extra_buffer"
-SGLANG_SSD_STREAM_IMAGE = "dgx-local/sglang-ssd-stream:60ce795-sm121"
+SGLANG_SSD_STREAM_IMAGE = "dgx-local/sglang-ssd-stream:5aeffa3-sm121-r3"
 SSD_STREAM_MANIFEST = "ssd-stream.json"
 SSD_STREAM_MAMBA_STATE_SLOTS_PER_REQUEST = 5
 
@@ -285,14 +285,9 @@ class SGLangAdapter(RuntimeAdapter):
                 [
                     "--fp4-gemm-backend",
                     "flashinfer_cutlass",
-                    # SM121 QSA rejects mixed BF16-query/FP8-key attention;
-                    # auto keeps this DGX Spark path on the model's BF16 KV.
+                    # The upstream DGX Spark profile keeps KV in BF16.
                     "--kv-cache-dtype",
-                    "auto",
-                    "--prefill-attention-backend",
-                    "triton",
-                    "--decode-attention-backend",
-                    "trtllm_mha",
+                    "bfloat16",
                     "--page-size",
                     "64",
                     "--mamba-radix-cache-strategy",
@@ -304,11 +299,12 @@ class SGLangAdapter(RuntimeAdapter):
                     "--max-mamba-cache-size",
                     str(spec.max_concurrency * SSD_STREAM_MAMBA_STATE_SLOTS_PER_REQUEST),
                     "--chunked-prefill-size",
-                    "4096",
+                    "8192",
                     "--max-total-tokens",
                     str(spec.context_length),
                     "--cuda-graph-max-bs-decode",
                     str(spec.max_concurrency),
+                    "--disable-prefill-cuda-graph",
                     "--allow-auto-truncate",
                     "--enable-multimodal",
                 ]
@@ -329,10 +325,14 @@ class SGLangAdapter(RuntimeAdapter):
             command.extend(
                 ["--chat-template", container_chat_template_path(model_path, template_path)]
             )
-        tool_call_parser = match_parser(template, TOOL_CALL_PARSER_MARKERS)
+        tool_call_parser = "auto" if ssd_stream else match_parser(
+            template, TOOL_CALL_PARSER_MARKERS
+        )
         if tool_call_parser:
             command.extend(["--tool-call-parser", tool_call_parser])
-        reasoning_parser = match_parser(template, REASONING_PARSER_MARKERS)
+        reasoning_parser = "auto" if ssd_stream else match_parser(
+            template, REASONING_PARSER_MARKERS
+        )
         if reasoning_parser:
             command.extend(["--reasoning-parser", reasoning_parser])
         if spec.quantization and spec.quantization != "auto":
@@ -353,8 +353,6 @@ class SGLangAdapter(RuntimeAdapter):
                     "1",
                     "--speculative-num-draft-tokens",
                     "4",
-                    "--speculative-draft-model-quantization",
-                    "unquant",
                 ]
             )
         elif spec.speculative is not None:

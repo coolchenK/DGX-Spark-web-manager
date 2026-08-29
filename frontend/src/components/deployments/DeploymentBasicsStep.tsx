@@ -18,7 +18,7 @@ const runtimeImages = {
   sglang: [
     'dgx-local/sglang-qwen38-dflash2:61fa64a',
     'lmsysorg/sglang:qwen38-27b',
-    'dgx-local/sglang-ssd-stream:60ce795-sm121',
+    'dgx-local/sglang-ssd-stream:5aeffa3-sm121-r3',
     'sglang-inkling:specforge',
     'lmsysorg/sglang:dev-cu13-inkling-dspark',
   ],

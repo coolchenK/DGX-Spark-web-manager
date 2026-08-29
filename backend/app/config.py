@@ -48,7 +48,7 @@ class Settings(BaseSettings):
         "dgx-local/sglang-qwen38-dflash2:61fa64a,lmsysorg/sglang:qwen38-27b,"
         "sglang-inkling:specforge,"
         "lmsysorg/sglang:dev-cu13-inkling-dspark,"
-        "dgx-local/sglang-ssd-stream:60ce795-sm121"
+        "dgx-local/sglang-ssd-stream:5aeffa3-sm121-r3"
     )
     allowed_llama_cpp_images: str = "nvidia/cuda:12.9.0-devel-ubuntu24.04"
     llama_cpp_host_dir: Path = Path("/opt/llamacpp")

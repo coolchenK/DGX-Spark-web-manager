@@ -161,8 +161,9 @@ gateway. A gateway chat-completion smoke test completed with `finish_reason=stop
 
 ### NVFP4 SSD Stream SGLang
 
-The SSD Stream profile keeps the 47.68 GiB PLE lookup table on NVMe and pages rows into a bounded
-32 MiB registered buffer pool. The remaining weights and runtime state use DGX Spark unified memory.
+The SSD Stream profile keeps the 47.68 GiB PLE lookup table on NVMe and pages rows through two
+bounded 32 MiB pinned staging slots and a 32 MiB registered page pool. The remaining weights and
+runtime state use DGX Spark unified memory.
 The prepared checkpoint records the exact upstream RadixArk revision in `ssd-stream.json`; the
 Manager validates the manifest, sidecar size, reviewed image, runtime flags, and resident-memory
 estimate before it creates the container.
@@ -174,26 +175,27 @@ estimate before it creates the container.
 | Downloaded checkpoint | 150,011,203,465 bytes (139.71 GiB), 227 files |
 | SSD PLE sidecar | 51,200,245,760 bytes (47.68 GiB), SHA-256 `b070f9644adf93794d8a1030584ab705809387e64396a9327a68fa3a3a6666b3` |
 | Quantization | ModelOpt NVFP4; BF16 KV cache |
-| Runtime | SGLang `0.0.0.dev1+gd91c3682b`, ModelOpt `0.45.0`, native `NEXTN` MTP (`3` steps, `4` draft tokens) |
-| SSD Stream plugin | [`garnermccloud/sglang-ssd-stream@60ce795`](https://github.com/garnermccloud/sglang-ssd-stream/commit/60ce795c339f9d31a18a8057d0bbe59611e4e9c7) |
-| Runtime image | `dgx-local/sglang-ssd-stream:60ce795-sm121`, digest `sha256:604c37603b0f6d8a356d67b00f05788f968a9a64a74ea2204592968db71b7b33` |
-| Attention backends | Triton prefill / TensorRT-LLM MHA decode; CUDA graph decode enabled |
-| Context / concurrency | `262144` configured / `1`; SGLang allocated `224384` total tokens with the existing MiniCPM service co-resident |
+| Runtime | [`SGLang@0a79825`](https://github.com/sgl-project/sglang/commit/0a79825b7baa3e2aafd54e89097a5aba83d00b4e), ModelOpt `0.45.0`, native `NEXTN` MTP (`3` steps, `4` draft tokens) |
+| SSD Stream plugin | [`garnermccloud/sglang-ssd-stream@5aeffa3`](https://github.com/garnermccloud/sglang-ssd-stream/commit/5aeffa316e111d77aa6032a9956e4bcd4b752d9d), version `0.1.0` |
+| Runtime image | `dgx-local/sglang-ssd-stream:5aeffa3-sm121-r3`, digest `sha256:5eee51e5b261016d66c41cb91df7bc574a858974fbcef607cff8b2621067cf6f` |
+| Attention backends | FlashInfer with the Codex/Kimi K3 KDA Qwen3.8 QSA kernel on `SM121`; Cutlass FP4 MoE; decode CUDA graph enabled and prefill graph disabled |
+| Context / concurrency | `262144` configured / `1`; SGLang allocated `84608` effective total tokens with the existing MiniCPM service co-resident |
 | Generation defaults | `max_tokens=16384`, `temperature=1`, `top_p=0.95`, `top_k=20`, thinking enabled, `reasoning_effort=xhigh` |
 | API model | `qwen38-flash-next-nvfp4-ssd` on port `8007` |
-| Measured memory | 97,661,222,912 bytes (90.95 GiB), reported from the NVIDIA compute process |
-| Automatic benchmark | 27.779 output tokens/s over 256 generated tokens |
+| Measured memory | 96,168,050,688 bytes (89.56 GiB), reported from the NVIDIA compute process |
+| Automatic benchmark | 38.889 output tokens/s over 256 generated tokens |
 | Verified gateway inputs | Text, OpenAI tools, SSE, PNG image, and MP4 video |
 
-The pinned SGLang image needs a narrowly reviewed source change to enable its Qwen sparse-attention
-backend on GB10 `SM 12.1`; the image build refuses to patch any source whose SHA-256 differs from the
-reviewed file. Triton prefill and TensorRT-LLM MHA decode avoid the current FlashAttention 4 CuTe
-layout failure on this architecture. This follows the active upstream
-[`SM120/SM121` discussion](https://github.com/sgl-project/sglang/pull/36497) and the independently
-reported [single-DGX-Spark configuration](https://github.com/hashd1ve/qwen38-flash-next-one-dgx-spark).
-The first cold start completed in 461 seconds. Subsequent gateway validation returned HTTP 200 for
-model discovery, non-streaming and streaming text, a structured function call, image input, and
-video input; the runtime remained healthy without a restart or OOM.
+The image pins and checksum-verifies the complete SGLang and SSD Stream source archives used by the
+current upstream DGX Spark profile. It therefore uses the full `SM121` QSA implementation instead of
+the earlier one-line architecture guard. BF16 KV, 8192-token chunked prefill, automatic Qwen parsers,
+and disabled prefill CUDA graph match the upstream profile. Each PLE token uses two n-gram lookup
+rows, so the build expands each pinned staging slot from 16 MiB to 32 MiB; this covers SGLang's full
+84608-token effective pool without a process-wide capacity failure. The verified cold start completed
+in 423.28 seconds. Subsequent gateway validation returned HTTP 200 for model discovery, non-streaming
+and streaming text, an Alma-style tool-call continuation, image input, video input, and 40,953- and
+68,917-token prompts. The long-context responses contained no pathological punctuation repetition,
+and the runtime completed the suite with zero restarts or OOMs.
 
 ## Administrator Workflow
 
