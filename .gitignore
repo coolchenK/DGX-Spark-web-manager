@@ -1,0 +1,36 @@
+# Local Codex workspace and credentials
+work/
+outputs/
+.worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*.bak*
+.pytest_cache/
+.ruff_cache/
+.venv/
+.venv-native/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/coverage/
+playwright-report/
+test-results/
+.playwright-cli/
+
+# Runtime data and secrets
+.env
+data/
+*.db
+*.sqlite
+*.sqlite3
+backups/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

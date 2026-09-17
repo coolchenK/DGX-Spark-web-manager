@@ -1,0 +1,1983 @@
+import asyncio
+import json
+
+import httpx
+import respx
+from app.api import gateway
+from app.gateway import proxy as gateway_proxy
+from app.gateway.adapters import adapter_for_runtime
+from app.models import AuditEvent, Deployment, RequestMetric
+from httpx import Response
+from sqlalchemy import select
+
+
+def _create_gateway_key(client):
+    login = client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "Test-password-1234"},
+    )
+    client.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+    return client.post("/api/keys", json={"name": "Gateway test"}).json()["key"]
+
+
+def _seed_deployment(
+    client,
+    *,
+    config=None,
+    capabilities=None,
+    api_model_name="qwen-upstream",
+    runtime="sglang",
+    endpoint_url="http://127.0.0.1:8001",
+):
+    with client.app.state.database.session_factory() as db:
+        deployment = Deployment(
+            name="qwen",
+            runtime=runtime,
+            endpoint_url=endpoint_url,
+            api_model_name=api_model_name,
+            status="running",
+            health="healthy",
+            managed=False,
+            config=config or {},
+            capabilities=capabilities or ["chat", "completion"],
+        )
+        db.add(deployment)
+        db.commit()
+
+
+def _generation_config(defaults, supported):
+    return {
+        "spec": {"generation_defaults": defaults},
+        "runtime_capabilities": {"generation_defaults": supported},
+    }
+
+
+def test_models_requires_api_key_and_lists_healthy_deployments(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+
+    assert client.get("/v1/models").status_code == 401
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    assert response.json()["data"][0]["id"] == "qwen-upstream"
+
+
+def test_models_exposes_runtime_context_and_generation_metadata_and_hides_stopped(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        db.add_all(
+            [
+                Deployment(
+                    name="qwen-metadata",
+                    runtime="vllm",
+                    endpoint_url="http://127.0.0.1:8012",
+                    api_model_name="qwen38-upstream",
+                    status="running",
+                    health="healthy",
+                    config={
+                        "spec": {
+                            "context_length": 262144,
+                            "generation_defaults": {
+                                "temperature": 0.0,
+                                "top_p": 1.0,
+                                "top_k": 20,
+                                "max_tokens": 8192,
+                            },
+                        }
+                    },
+                ),
+                Deployment(
+                    name="stopped-metadata",
+                    runtime="vllm",
+                    endpoint_url="http://127.0.0.1:8013",
+                    api_model_name="stopped-upstream",
+                    status="stopped",
+                    health="unknown",
+                    config={"spec": {"context_length": 4096}},
+                ),
+            ]
+        )
+        db.commit()
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    models = {item["id"]: item for item in response.json()["data"]}
+    model = models["qwen38-upstream"]
+    assert model["id"] == "qwen38-upstream"
+    assert model["object"] == "model"
+    assert model["owned_by"] == "dgx-spark-manager"
+    assert model["root"] == "qwen38-upstream"
+    assert model["capability_names"] == []
+    assert model["instances"] == 1
+    assert model["runtime"] == "vllm"
+    assert model["endpoint_url"] == "http://127.0.0.1:8012"
+    assert model["context_length"] == 262144
+    assert model["max_model_len"] == 262144
+    assert model["max_context_tokens"] == 262144
+    assert model["context_window"] == 262144
+    assert model["max_input_tokens"] == 253952
+    assert model["max_output_tokens"] == 8192
+    assert model["max_tokens"] == 8192
+    assert model["generation_defaults"] == {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 20,
+        "max_tokens": 8192,
+    }
+    assert model["performance"]["status"] == "unavailable"
+    assert "stopped-upstream" not in models
+
+
+def test_models_exposes_discovery_aliases_and_benchmark_performance_metadata(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        db.add(
+            Deployment(
+                name="metadata-compatible",
+                runtime="sglang",
+                endpoint_url="http://127.0.0.1:8019",
+                api_model_name="metadata-compatible-upstream",
+                status="running",
+                health="healthy",
+                capabilities=["chat", "completion"],
+                benchmark_status="succeeded",
+                benchmark_tps=78.018,
+                benchmark_completion_tokens=256,
+                benchmark_duration_seconds=3.281,
+                config={
+                    "route_alias": "metadata-compatible",
+                    "spec": {
+                        "context_length": 204800,
+                        "max_concurrency": 2,
+                        "generation_defaults": {"max_tokens": 16384},
+                    },
+                },
+            )
+        )
+        db.commit()
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    model = next(item for item in response.json()["data"] if item["id"] == "metadata-compatible")
+    assert model["context_length"] == 204800
+    assert model["max_model_len"] == 204800
+    assert model["max_context_tokens"] == 204800
+    assert model["context_window"] == 204800
+    assert model["max_input_tokens"] == 188416
+    assert model["max_output_tokens"] == 16384
+    assert model["max_tokens"] == 16384
+    assert model["output_token_limit"] == 16384
+    assert model["max_concurrency"] == 2
+    assert model["benchmark_tps"] == 78.018
+    assert model["tokens_per_second"] == 78.018
+    assert model["performance"]["tokens_per_second"] == 78.018
+    assert model["performance"]["completion_tokens"] == 256
+    assert model["performance"]["duration_seconds"] == 3.281
+    assert model["performance"]["status"] == "succeeded"
+    assert model["metadata"]["context_window"] == 204800
+    assert model["metadata"]["max_output_tokens"] == 16384
+    assert model["metadata"]["tokens_per_second"] == 78.018
+    assert model["metadata"]["runtime"] == "sglang"
+    assert model["limits"] == {
+        "context_window": 204800,
+        "configured_context_length": 204800,
+        "runtime_token_capacity": None,
+        "max_input_tokens": 188416,
+        "max_output_tokens": 16384,
+        "max_concurrency": 2,
+    }
+
+
+@respx.mock
+def test_models_uses_profiled_sglang_capacity_and_reserves_output_tokens(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {
+                "context_length": 262144,
+                "generation_defaults": {"max_tokens": 16384},
+            }
+        },
+    )
+    respx.get("http://127.0.0.1:8001/get_server_info").mock(
+        return_value=Response(
+            200,
+            json={
+                "context_length": 262144,
+                "max_total_tokens": 262144,
+                "max_total_num_tokens": 84608,
+            },
+        )
+    )
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    model = response.json()["data"][0]
+    assert model["context_length"] == 84608
+    assert model["context_window"] == 84608
+    assert model["configured_context_length"] == 262144
+    assert model["runtime_token_capacity"] == 84608
+    assert model["max_input_tokens"] == 68224
+    assert model["max_output_tokens"] == 16384
+    assert model["limit"] == {
+        "context": 84608,
+        "input": 68224,
+        "output": 16384,
+    }
+
+
+def test_models_exposes_discovery_fields_on_standard_route(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        db.add(
+            Deployment(
+                name="Go Compatible Formal Display Name",
+                runtime="vllm",
+                endpoint_url="http://127.0.0.1:8020",
+                api_model_name="go-compatible-upstream",
+                status="running",
+                health="healthy",
+                capabilities=["chat", "completion"],
+                benchmark_status="succeeded",
+                benchmark_tps=27.892,
+                config={
+                    "route_alias": "go-compatible",
+                    "spec": {
+                        "context_length": 204800,
+                        "max_concurrency": 2,
+                        "generation_defaults": {"max_tokens": 16384},
+                    },
+                },
+            )
+        )
+        db.commit()
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    model = response.json()["data"][0]
+    assert model["id"] == "go-compatible"
+    assert model["name"] == "Go Compatible Formal Display Name"
+    assert model["display_name"] == "Go Compatible Formal Display Name"
+    assert model["limit"] == {
+        "context": 204800,
+        "input": 188416,
+        "output": 16384,
+    }
+    assert model["context_length"] == 204800
+    assert model["max_output_tokens"] == 16384
+    assert model["apiFormat"] == "openai-chat"
+    assert model["api"] == "openai-compatible chat/completions"
+    assert model["tool_call"] is True
+    assert model["structured_output"] is True
+    assert model["reasoning"] is True
+    assert model["performance"]["tokens_per_second"] == 27.892
+
+
+def test_models_exposes_multimodal_inputs_and_runtime_parameters(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        runtime="vllm",
+        capabilities=["chat", "completion", "image", "video"],
+    )
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    assert response.status_code == 200
+    model = response.json()["data"][0]
+    assert model["capability_names"] == ["chat", "completion", "image", "video"]
+    assert model["modalities"] == {
+        "input": ["text", "image", "video"],
+        "output": ["text"],
+    }
+    assert model["input_modalities"] == ["text", "image", "video"]
+    assert model["attachment"] is True
+    assert model["capabilities"]["vision"] is True
+    assert model["capabilities"]["video"] is True
+    assert model["multimodal"] == {
+        "image_content_type": "image_url",
+        "video_content_type": "video_url",
+        "request_parameters": ["mm_processor_kwargs", "media_io_kwargs"],
+    }
+    assert model["metadata"]["input_modalities"] == ["text", "image", "video"]
+
+
+def test_models_reports_null_performance_when_no_benchmark_exists(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {
+                "context_length": 8192,
+                "generation_defaults": {"max_tokens": 1024},
+            }
+        },
+    )
+
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    model = response.json()["data"][0]
+    assert model["benchmark_tps"] is None
+    assert model["tokens_per_second"] is None
+    assert model["performance"]["status"] == "unavailable"
+    assert model["performance"]["tokens_per_second"] is None
+
+
+def test_models_does_not_overwrite_shared_route_metadata_with_second_instance(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        for name, endpoint, context in (
+            ("shared-a", "http://127.0.0.1:8011", 8192),
+            ("shared-b", "http://127.0.0.1:8012", 262144),
+        ):
+            db.add(
+                Deployment(
+                    name=name,
+                    runtime="vllm",
+                    endpoint_url=endpoint,
+                    api_model_name=f"{name}-upstream",
+                    status="running",
+                    health="healthy",
+                    capabilities=["chat"],
+                    config={
+                        "route_alias": "shared-route",
+                        "spec": {"context_length": context},
+                    },
+                )
+            )
+        db.commit()
+
+    models = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"}).json()["data"]
+    shared = next(item for item in models if item["id"] == "shared-route")
+
+    assert shared["instances"] == 2
+    assert shared["endpoint_url"] == "http://127.0.0.1:8011"
+    assert shared["context_length"] == 8192
+
+
+def test_model_retrieve_uses_standard_object_shape_and_supports_route_slashes(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        db.add(
+            Deployment(
+                name="namespaced-model",
+                runtime="sglang",
+                endpoint_url="http://127.0.0.1:8014",
+                api_model_name="upstream-model",
+                status="running",
+                health="healthy",
+                capabilities=["chat"],
+                config={"route_alias": "org/model"},
+            )
+        )
+        db.commit()
+
+    response = client.get(
+        "/v1/models/org/model",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 200
+    model = response.json()
+    assert model["id"] == "org/model"
+    assert model["object"] == "model"
+    assert isinstance(model["created"], int)
+    assert model["owned_by"] == "dgx-spark-manager"
+
+
+def test_model_retrieve_returns_openai_error_for_unknown_model(client):
+    key = _create_gateway_key(client)
+
+    response = client.get(
+        "/v1/models/missing",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "message": "Model 'missing' was not found or is not healthy",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": None,
+        }
+    }
+
+
+@respx.mock
+def test_chat_completions_routes_alias_and_records_usage(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+    assert route.calls[0].request.content.find(b'"model":"qwen-upstream"') >= 0
+
+
+def test_unknown_model_uses_openai_error_shape(client):
+    key = _create_gateway_key(client)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "missing", "messages": []},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_local_adapter_translates_developer_role_without_mutating_input():
+    adapter = adapter_for_runtime("sglang")
+    body = {
+        "model": "qwen",
+        "messages": [
+            {"role": "developer", "content": "Follow these instructions", "name": "app"},
+            {"role": "user", "content": "Hello"},
+        ],
+    }
+
+    result = adapter.adapt_request("/v1/chat/completions", body)
+
+    assert result.transformations == ("messages.role.developer_to_system",)
+    assert result.body["messages"] == [
+        {"role": "system", "content": "Follow these instructions", "name": "app"},
+        {"role": "user", "content": "Hello"},
+    ]
+    assert body["messages"][0]["role"] == "developer"
+
+
+@respx.mock
+def test_chat_proxy_accepts_standard_developer_role_and_adapts_upstream(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [
+                {"role": "developer", "content": "Be concise"},
+                {"role": "user", "content": "Reply OK"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["messages"] == [
+        {"role": "system", "content": "Be concise"},
+        {"role": "user", "content": "Reply OK"},
+    ]
+
+
+@respx.mock
+def test_chat_proxy_normalizes_nonstandard_upstream_error_for_stream_request(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            400,
+            json={
+                "object": "error",
+                "message": "Unexpected message role.",
+                "type": "BadRequest",
+                "code": 400,
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {
+        "error": {
+            "message": "Unexpected message role.",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": None,
+        }
+    }
+
+
+@respx.mock
+def test_multimodal_chat_normalizes_image_and_video_parts_for_vllm(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        runtime="vllm",
+        capabilities=["chat", "completion", "image", "video"],
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "id": "chatcmpl-multimodal",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe the media"},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AA==",
+                            "detail": "high",
+                        },
+                        {
+                            "type": "input_video",
+                            "video_url": "https://example.test/sample.mp4",
+                        },
+                    ],
+                }
+            ],
+            "mm_processor_kwargs": {"max_pixels": 1048576},
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    parts = forwarded["messages"][0]["content"]
+    assert parts[0] == {"type": "text", "text": "Describe the media"}
+    assert parts[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AA==", "detail": "high"},
+    }
+    assert parts[2] == {
+        "type": "video_url",
+        "video_url": {"url": "https://example.test/sample.mp4"},
+    }
+    assert forwarded["mm_processor_kwargs"] == {"max_pixels": 1048576}
+
+
+def test_multimodal_chat_rejects_media_for_text_only_model(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client, capabilities=["chat", "completion"])
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.test/image.jpg"},
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "image" in response.json()["error"]["message"]
+
+
+def test_multimodal_chat_rejects_file_id_and_mixed_runtime_parameters(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        capabilities=["chat", "completion", "image", "video"],
+    )
+    base = {
+        "model": "qwen-upstream",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "file_id": "file-123"}],
+            }
+        ],
+    }
+
+    file_response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json=base,
+    )
+    mixed_response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [{"role": "user", "content": "hello"}],
+            "mm_processor_kwargs": {},
+            "images_config": {},
+        },
+    )
+
+    assert file_response.status_code == 400
+    assert "file_id" in file_response.json()["error"]["message"]
+    assert mixed_response.status_code == 400
+    assert "cannot be mixed" in mixed_response.json()["error"]["message"]
+
+
+@respx.mock
+def test_multimodal_runtime_parameter_selects_matching_shared_instance(client):
+    key = _create_gateway_key(client)
+    with client.app.state.database.session_factory() as db:
+        for name, runtime, endpoint in (
+            ("shared-vllm", "vllm", "http://127.0.0.1:8111"),
+            ("shared-sglang", "sglang", "http://127.0.0.1:8112"),
+        ):
+            db.add(
+                Deployment(
+                    name=name,
+                    runtime=runtime,
+                    endpoint_url=endpoint,
+                    api_model_name=name,
+                    status="running",
+                    health="healthy",
+                    capabilities=["chat", "completion", "image", "video"],
+                    config={"route_alias": "shared-multimodal"},
+                )
+            )
+        db.commit()
+    vllm = respx.post("http://127.0.0.1:8111/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "id": "chatcmpl-vllm",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "shared-multimodal",
+            "messages": [{"role": "user", "content": "hello"}],
+            "media_io_kwargs": {"video": {"num_frames": 16}},
+        },
+    )
+
+    assert response.status_code == 200
+    assert vllm.called
+
+
+def test_shared_route_alias_round_robins_across_healthy_instances(client):
+    with client.app.state.database.session_factory() as db:
+        first = Deployment(
+            name="qwen-a",
+            runtime="vllm",
+            endpoint_url="http://127.0.0.1:8101",
+            api_model_name="qwen-instance-a",
+            status="running",
+            health="healthy",
+            capabilities=["chat"],
+            config={"route_alias": "qwen-shared"},
+        )
+        second = Deployment(
+            name="qwen-b",
+            runtime="vllm",
+            endpoint_url="http://127.0.0.1:8102",
+            api_model_name="qwen-instance-b",
+            status="running",
+            health="healthy",
+            capabilities=["chat"],
+            config={"route_alias": "qwen-shared"},
+        )
+        db.add_all([first, second])
+        db.commit()
+        select_route = getattr(gateway, "select_routed_deployment", lambda *_args: None)
+
+        selected = [select_route(db, "qwen-shared") for _ in range(4)]
+
+    selected_ids = [item.id for item in selected]
+    assert set(selected_ids[:2]) == {first.id, second.id}
+    assert selected_ids[0] == selected_ids[2]
+    assert selected_ids[1] == selected_ids[3]
+
+
+def test_gateway_activity_tracks_concurrent_requests():
+    activity_type = getattr(gateway, "GatewayActivity", None)
+
+    assert activity_type is not None
+    activity = activity_type()
+    activity.start()
+    activity.start()
+    assert activity.current == 2
+    activity.finish()
+    assert activity.current == 1
+
+
+def test_gateway_stats_include_recent_request_and_token_throughput(authenticated_client):
+    with authenticated_client.app.state.database.session_factory() as db:
+        db.add(
+            RequestMetric(
+                model="qwen",
+                endpoint="/v1/chat/completions",
+                status_code=200,
+                latency_ms=100,
+                prompt_tokens=120,
+                completion_tokens=60,
+            )
+        )
+        db.commit()
+
+    response = authenticated_client.get("/api/gateway/stats")
+
+    assert response.status_code == 200
+    assert response.json()["requests_last_minute"] == 1
+    assert response.json()["tokens_per_second"] == 3.0
+    assert response.json()["active_requests"] == 0
+
+
+def test_gateway_allows_long_inference_reads_beyond_legacy_ten_minute_ceiling():
+    timeout = gateway_proxy.upstream_inference_timeout()
+    assert timeout.connect == 5
+    assert timeout.read == 1800
+    assert timeout.write == 30
+    assert timeout.pool == 5
+
+
+def test_merge_generation_defaults_applies_deployment_sampling_values():
+    merge = getattr(gateway_proxy, "merge_generation_defaults", None)
+    assert merge is not None
+    body = {"temperature": 0, "top_p": False, "stop": [], "messages": []}
+    defaults = {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "min_p": 0.05,
+        "stop": ["END"],
+    }
+
+    merged, applied = merge("/v1/chat/completions", body, defaults, supported=set(defaults))
+
+    # sampling is owned by the deployment: client values are replaced
+    assert merged["temperature"] == 0.6
+    assert merged["top_p"] == 0.95
+    assert merged["min_p"] == 0.05
+    assert sorted(applied) == ["min_p", "temperature", "top_p"]
+    # the caller's body is never mutated
+    assert body == {"temperature": 0, "top_p": False, "stop": [], "messages": []}
+
+
+def test_max_completion_tokens_prevents_default_max_tokens():
+    merge = getattr(gateway_proxy, "merge_generation_defaults", None)
+    assert merge is not None
+
+    merged, applied = merge(
+        "/v1/chat/completions",
+        {"max_completion_tokens": 100},
+        {"max_tokens": 500},
+        supported={"max_tokens"},
+    )
+
+    assert "max_tokens" not in merged
+    assert applied == []
+
+
+def test_merge_generation_defaults_filters_unknown_and_unsupported_extensions():
+    merge = getattr(gateway_proxy, "merge_generation_defaults", None)
+    assert merge is not None
+
+    merged, applied = merge(
+        "/v1/completions",
+        {"prompt": "hello"},
+        {"temperature": 0.6, "top_k": 40, "min_p": 0.05, "future_sampling": 1},
+        supported={"temperature", "top_k", "future_sampling"},
+    )
+
+    assert merged["temperature"] == 0.6
+    assert merged["top_k"] == 40
+    assert "min_p" not in merged
+    assert "future_sampling" not in merged
+    assert applied == ["temperature", "top_k"]
+
+
+def test_merge_generation_defaults_leaves_non_generation_endpoints_unchanged():
+    merge = getattr(gateway_proxy, "merge_generation_defaults", None)
+    assert merge is not None
+    body = {"input": "hello"}
+
+    merged, applied = merge(
+        "/v1/embeddings",
+        body,
+        {"temperature": 0.6},
+        supported={"temperature"},
+    )
+
+    assert merged == body
+    assert merged is not body
+    assert applied == []
+
+
+
+
+@respx.mock
+def test_gateway_normalizes_reasoning_effort_for_qwen_templates(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {"generation_defaults": {}},
+            "runtime_capabilities": {"generation_defaults": []},
+        },
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"reasoning_effort": "high"},
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["reasoning_effort"] == "medium"
+    assert forwarded["chat_template_kwargs"]["reasoning_effort"] == "medium"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@respx.mock
+def test_gateway_normalizes_max_effort_to_qwen_supported_xhigh(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {"generation_defaults": {}},
+            "runtime_capabilities": {"generation_defaults": []},
+        },
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [],
+            "reasoning_effort": "xhigh",
+            "chat_template_kwargs": {"reasoning_effort": "xhigh"},
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["reasoning_effort"] == "xhigh"
+    assert forwarded["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+
+
+@respx.mock
+def test_chat_proxy_applies_saved_defaults_and_records_one_bounded_audit(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config=_generation_config(
+            {"temperature": 0.6, "top_p": 0.9, "top_k": 40, "unknown": "secret"},
+            ["temperature", "top_p", "unknown"],
+        ),
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "temperature": 0,
+            "messages": [{"role": "user", "content": "audit-secret-prompt"}],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    # the deployment owns sampling, so its defaults replace client values
+    assert forwarded["temperature"] == 0.6
+    assert forwarded["top_p"] == 0.9
+    assert "unknown" not in forwarded
+    with client.app.state.database.session_factory() as db:
+        events = list(
+            db.scalars(select(AuditEvent).where(AuditEvent.action == "gateway.defaults.apply"))
+        )
+    assert len(events) == 1
+    assert events[0].actor == "gateway"
+    assert events[0].resource_type == "deployment"
+    assert events[0].resource_id is not None
+    assert events[0].details == {
+        "endpoint": "/v1/chat/completions",
+        "model": "qwen-upstream",
+        "applied_fields": ["temperature", "top_p"],
+    }
+    assert "audit-secret-prompt" not in json.dumps(events[0].details)
+    assert "0.9" not in json.dumps(events[0].details)
+
+
+@respx.mock
+def test_completion_proxy_applies_saved_generation_defaults(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config=_generation_config({"max_tokens": 128}, ["max_tokens"]),
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "prompt": "hello"},
+    )
+
+    assert response.status_code == 200
+    assert json.loads(route.calls[0].request.content)["max_tokens"] == 128
+
+
+@respx.mock
+def test_embeddings_proxy_does_not_apply_or_audit_generation_defaults(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config=_generation_config({"temperature": 0.6}, ["temperature"]),
+        capabilities=["embedding"],
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/embeddings").mock(
+        return_value=Response(200, json={"data": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/embeddings",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "input": "hello"},
+    )
+
+    assert response.status_code == 200
+    assert "temperature" not in json.loads(route.calls[0].request.content)
+    with client.app.state.database.session_factory() as db:
+        event = db.scalar(select(AuditEvent).where(AuditEvent.action == "gateway.defaults.apply"))
+    assert event is None
+
+
+@respx.mock
+def test_streaming_chat_proxy_uses_the_same_generation_default_merge(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config=_generation_config({"top_p": 0.8}, ["top_p"]),
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=b'data: {"choices": []}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert json.loads(route.calls[0].request.content)["top_p"] == 0.8
+
+
+
+
+
+
+
+
+
+
+@respx.mock
+def test_streaming_gateway_records_usage_from_terminal_chunk(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=(
+                b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+                b'"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert b"[DONE]" in response.content
+    with client.app.state.database.session_factory() as db:
+        metric = db.scalar(select(RequestMetric).order_by(RequestMetric.created_at.desc()))
+    assert metric.prompt_tokens == 3
+    assert metric.completion_tokens == 1
+    assert metric.status_code == 200
+
+
+@respx.mock
+def test_streaming_gateway_records_completion_when_client_disconnects(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        next(response.iter_bytes())
+
+    with client.app.state.database.session_factory() as db:
+        metric = db.scalar(select(RequestMetric).order_by(RequestMetric.created_at.desc()))
+    assert metric.status_code == 499
+
+
+@respx.mock
+def test_streaming_gateway_preserves_upstream_error_status_in_metrics(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            400,
+            content=b'{"error":{"message":"bad reasoning effort"}}',
+            headers={"content-type": "application/json"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    assert response.status_code == 400
+    with client.app.state.database.session_factory() as db:
+        metric = db.scalar(select(RequestMetric).order_by(RequestMetric.created_at.desc()))
+    assert metric.status_code == 400
+
+
+@respx.mock
+def test_gateway_ignores_defaults_without_a_valid_capability_snapshot(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {"generation_defaults": {"temperature": 0.6}},
+            "runtime_capabilities": {"generation_defaults": "temperature"},
+        },
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": []},
+    )
+
+    assert response.status_code == 200
+    assert "temperature" not in json.loads(route.calls[0].request.content)
+
+
+@respx.mock
+def test_gateway_strictly_skips_coercible_defaults_without_dropping_valid_fields(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config=_generation_config(
+            {
+                "temperature": True,
+                "top_p": "0.7",
+                "max_tokens": True,
+                "min_p": 0.05,
+            },
+            ["temperature", "top_p", "max_tokens", "min_p"],
+        ),
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": []},
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert "temperature" not in forwarded
+    assert "top_p" not in forwarded
+    assert "max_tokens" not in forwarded
+    assert forwarded["min_p"] == 0.05
+    with client.app.state.database.session_factory() as db:
+        event = db.scalar(select(AuditEvent).where(AuditEvent.action == "gateway.defaults.apply"))
+    assert event is not None
+    assert event.details["applied_fields"] == ["min_p"]
+
+
+@respx.mock
+def test_gateway_does_not_audit_when_all_saved_defaults_fail_strict_validation(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config=_generation_config(
+            {"temperature": True, "top_p": "0.7", "max_tokens": True},
+            ["temperature", "top_p", "max_tokens"],
+        ),
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [], "usage": {}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": []},
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert "temperature" not in forwarded
+    assert "top_p" not in forwarded
+    assert "max_tokens" not in forwarded
+    with client.app.state.database.session_factory() as db:
+        event = db.scalar(select(AuditEvent).where(AuditEvent.action == "gateway.defaults.apply"))
+    assert event is None
+
+
+def _task_arguments(description: str) -> dict[str, str]:
+    return {
+        "description": description,
+        "prompt": "Find the requested software on Hugging Face.",
+        "agent_id": "developer",
+    }
+
+
+def _stream_payload(events: list[dict], *, done: bool = True) -> bytes:
+    payload = "".join(f"data: {json.dumps(event, separators=(',', ':'))}\n\n" for event in events)
+    if done:
+        payload += "data: [DONE]\n\n"
+    return payload.encode()
+
+
+def _streamed_calls(response) -> dict[int, dict]:
+    calls: dict[int, dict] = {}
+    for line in response.text.splitlines():
+        if not line.startswith("data: {"):
+            continue
+        event = json.loads(line.removeprefix("data: "))
+        for choice in event.get("choices") or []:
+            for tool_call in (choice.get("delta") or {}).get("tool_calls") or []:
+                current = calls.setdefault(
+                    tool_call.get("index", 0),
+                    {"name": "", "arguments": []},
+                )
+                function = tool_call.get("function") or {}
+                name = function.get("name")
+                if isinstance(name, str) and not current["name"].endswith(name):
+                    current["name"] += name
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    current["arguments"].append(arguments)
+    return calls
+
+
+
+
+
+
+
+
+
+
+
+
+@respx.mock
+def test_gateway_preserves_fragmented_non_task_tool_calls(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_search_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "WebSearch",
+                                    "arguments": '{"query":"Qwen',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '3.8"}'}}]},
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            content=_stream_payload(events),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "messages": [], "stream": True},
+    )
+
+    calls = _streamed_calls(response)
+    assert calls[0]["name"] == "WebSearch"
+    assert json.loads("".join(calls[0]["arguments"])) == {"query": "Qwen3.8"}
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
+
+
+def _chat_sse(*frames):
+    body = b"".join(
+        f"data: {json.dumps(frame)}\n\n".encode() for frame in frames
+    )
+    return body + b"data: [DONE]\n\n"
+
+
+def _sse_events(response):
+    """Parse a Responses SSE body into (event_name, payload) pairs."""
+    parsed = []
+    for block in response.text.replace("\r\n", "\n").split("\n\n"):
+        if not block.strip():
+            continue
+        name = None
+        data = None
+        for line in block.split("\n"):
+            if line.startswith("event:"):
+                name = line[6:].strip()
+            elif line.startswith("data:"):
+                data = line[5:].strip()
+        if data and data != "[DONE]":
+            parsed.append((name, json.loads(data)))
+    return parsed
+
+
+def _sse_names(response):
+    return [name for name, _ in _sse_events(response)]
+
+
+def _delta_chunk(**delta):
+    return {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+
+
+@respx.mock
+def test_responses_non_streaming_maps_text_and_usage(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {"generation_defaults": {}},
+            "runtime_capabilities": {"generation_defaults": []},
+        },
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "PONG"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 4,
+                    "completion_tokens_details": {"reasoning_tokens": 2},
+                },
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "input": "ping", "stream": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "response"
+    assert payload["status"] == "completed"
+    assert payload["model"] == "qwen-upstream"
+    assert len(payload["output"]) == 1
+    item = payload["output"][0]
+    assert item["type"] == "message"
+    assert item["role"] == "assistant"
+    assert item["content"][0]["type"] == "output_text"
+    assert item["content"][0]["text"] == "PONG"
+    assert payload["usage"]["input_tokens"] == 11
+    assert payload["usage"]["output_tokens"] == 4
+    assert payload["usage"]["total_tokens"] == 15
+    assert payload["usage"]["output_tokens_details"]["reasoning_tokens"] == 2
+
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["model"] == "qwen-upstream"
+    assert forwarded["messages"] == [{"role": "user", "content": "ping"}]
+    assert forwarded["stream"] is False
+
+
+@respx.mock
+def test_responses_maps_instructions_and_input_item_roles(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "instructions": "be terse",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "skill text"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    # `instructions` and the developer item are merged into one leading system
+    # message: Qwen templates reject a system message that is not first.
+    assert forwarded["messages"][0] == {
+        "role": "system",
+        "content": "be terse\n\nskill text",
+    }
+    assert forwarded["messages"][1] == {"role": "user", "content": "hello"}
+    assert [message["role"] for message in forwarded["messages"]] == ["system", "user"]
+
+
+@respx.mock
+def test_responses_keeps_system_message_first_when_input_leads_with_user(client):
+    """Codex sends `instructions` plus a developer turn; Qwen requires the
+    merged system message to be the very first message in the payload."""
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "instructions": "You are Codex.",
+            "input": [
+                {"type": "message", "role": "user", "content": "environment context"},
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "sandbox: read-only"}],
+                },
+                {"type": "message", "role": "user", "content": "list files"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    roles = [message["role"] for message in forwarded["messages"]]
+    assert roles[0] == "system"
+    assert roles.count("system") == 1
+    assert "developer" not in roles
+    assert forwarded["messages"][0]["content"] == "You are Codex.\n\nsandbox: read-only"
+
+
+@respx.mock
+def test_responses_preserves_function_call_history(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "input": [
+                {"type": "message", "role": "user", "content": "list files"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"ls"}',
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "file.txt"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assistant = forwarded["messages"][1]
+    assert assistant["role"] == "assistant"
+    assert assistant["tool_calls"][0]["id"] == "call_1"
+    assert assistant["tool_calls"][0]["function"]["name"] == "exec_command"
+    tool_message = forwarded["messages"][2]
+    assert tool_message == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "file.txt",
+    }
+
+
+@respx.mock
+def test_responses_flattens_namespace_and_server_side_tools(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "qwen-upstream",
+            "input": "hi",
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "run a command",
+                    "strict": False,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {
+                    "type": "namespace",
+                    "name": "multi_agent_v1",
+                    "description": "sub agents",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "description": "spawn",
+                            "strict": False,
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                },
+                {"type": "web_search", "external_web_access": False},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    names = [tool["function"]["name"] for tool in forwarded["tools"]]
+    assert names == ["exec_command", "multi_agent_v1__spawn_agent", "web_search"]
+    assert forwarded["tool_choice"] == "auto"
+    assert forwarded["parallel_tool_calls"] is True
+    # Bookkeeping keys used for round-tripping must never leak upstream.
+    for tool in forwarded["tools"]:
+        assert "x-dgx-name" not in tool
+        assert set(tool) == {"type", "function"}
+
+
+@respx.mock
+def test_responses_maps_tool_call_response_and_unnamespaces_name(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_abc",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "multi_agent_v1__spawn_agent",
+                                        "arguments": '{"message":"go"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 6},
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "input": "spawn", "stream": False},
+    )
+
+    assert response.status_code == 200
+    output = response.json()["output"]
+    assert len(output) == 1
+    call = output[0]
+    assert call["type"] == "function_call"
+    assert call["call_id"] == "call_abc"
+    # The namespace prefix added for chat/completions must be removed again.
+    assert call["name"] == "spawn_agent"
+    assert json.loads(call["arguments"]) == {"message": "go"}
+
+
+@respx.mock
+def test_responses_streams_reasoning_message_and_tool_call_events(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    raw = _chat_sse(
+        _delta_chunk(role="assistant", content=""),
+        _delta_chunk(reasoning_content="thinking hard"),
+        _delta_chunk(content="Hel"),
+        _delta_chunk(content="lo"),
+        _delta_chunk(
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": '{"cmd":'},
+                }
+            ]
+        ),
+        _delta_chunk(
+            tool_calls=[{"index": 0, "function": {"arguments": '"ls"}'}}]
+        ),
+        {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 8},
+        },
+    )
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200, content=raw, headers={"content-type": "text/event-stream"}
+        )
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "input": "go", "stream": True},
+    )
+
+    assert response.status_code == 200
+    names = _sse_names(response)
+    assert names[0] == "response.created"
+    assert names[1] == "response.in_progress"
+    assert names[-1] == "response.completed"
+    assert "response.reasoning_summary_text.delta" in names
+    assert "response.output_text.delta" in names
+    assert "response.function_call_arguments.delta" in names
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+    events = dict(_sse_events(response))
+    assert events["response.reasoning_summary_text.delta"]["delta"] == "thinking hard"
+
+    text_deltas = [
+        payload["delta"]
+        for name, payload in _sse_events(response)
+        if name == "response.output_text.delta"
+    ]
+    assert "".join(text_deltas) == "Hello"
+
+    argument_deltas = [
+        payload["delta"]
+        for name, payload in _sse_events(response)
+        if name == "response.function_call_arguments.delta"
+    ]
+    assert "".join(argument_deltas) == '{"cmd":"ls"}'
+
+    completed = [
+        payload for name, payload in _sse_events(response) if name == "response.completed"
+    ][0]
+    kinds = [item["type"] for item in completed["response"]["output"]]
+    assert kinds == ["reasoning", "message", "function_call"]
+    assert completed["response"]["usage"]["input_tokens"] == 7
+    assert completed["response"]["usage"]["output_tokens"] == 8
+
+
+@respx.mock
+def test_responses_stream_handles_vllm_reasoning_field(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    raw = _chat_sse(
+        _delta_chunk(reasoning="vllm style"),
+        _delta_chunk(content="ok"),
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    )
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200, content=raw, headers={"content-type": "text/event-stream"}
+        )
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "input": "go", "stream": True},
+    )
+
+    assert response.status_code == 200
+    deltas = [
+        payload["delta"]
+        for name, payload in _sse_events(response)
+        if name == "response.reasoning_summary_text.delta"
+    ]
+    assert deltas == ["vllm style"]
+
+
+@respx.mock
+def test_responses_keeps_qwen_effort_levels_within_supported_range(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {"chat_template": "model", "generation_defaults": {}},
+            "runtime_capabilities": {"generation_defaults": []},
+        },
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    for requested, expected in (
+        ("low", "low"),
+        ("medium", "medium"),
+        ("xhigh", "xhigh"),
+        # vLLM rejects `high` and `minimal`; both must be downgraded locally.
+        ("high", "xhigh"),
+        ("minimal", "low"),
+    ):
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": "qwen-upstream",
+                "input": "hi",
+                "reasoning": {"effort": requested},
+            },
+        )
+        assert response.status_code == 200, requested
+        forwarded = json.loads(route.calls[-1].request.content)
+        assert forwarded["reasoning_effort"] == expected, requested
+        assert forwarded["chat_template_kwargs"]["reasoning_effort"] == expected
+
+
+@respx.mock
+def test_responses_maps_none_effort_to_thinking_off(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {"chat_template": "model", "generation_defaults": {}},
+            "runtime_capabilities": {"generation_defaults": []},
+        },
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "input": "hi", "reasoning": {"effort": "none"}},
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    assert forwarded["reasoning_effort"] == "none"
+    assert forwarded["chat_template_kwargs"]["enable_thinking"] is False
+
+
+@respx.mock
+def test_responses_collapses_every_level_to_boolean_for_thinking_toggle_model(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(
+        client,
+        config={
+            "spec": {
+                "chat_template": "model",
+                "chat_template_kwargs": {"enable_thinking": True},
+                "generation_defaults": {},
+            },
+            "runtime_capabilities": {"generation_defaults": []},
+        },
+    )
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    # MiniCPM-class models expose only on/off, so graded levels must not be
+    # forwarded as unsupported effort values.
+    for requested, expected in (
+        ("minimal", True),
+        ("low", True),
+        ("medium", True),
+        ("high", True),
+        ("xhigh", True),
+        ("none", False),
+    ):
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": "qwen-upstream",
+                "input": "hi",
+                "reasoning": {"effort": requested},
+            },
+        )
+        assert response.status_code == 200, requested
+        forwarded = json.loads(route.calls[-1].request.content)
+        assert "reasoning_effort" not in forwarded, requested
+        assert forwarded["chat_template_kwargs"]["enable_thinking"] is expected, requested
+
+
+@respx.mock
+def test_responses_routes_alias_and_honours_max_output_tokens(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client, api_model_name="MiniCPM5-2B")
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "MiniCPM5-2B",
+            "input": "hi",
+            "max_output_tokens": 256,
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(route.calls[0].request.content)
+    # The routing alias must never be replaced by the upstream api_model_name.
+    assert forwarded["model"] == "MiniCPM5-2B"
+    assert forwarded["max_tokens"] == 256
+    # Unsupported Responses-only fields must not be invented upstream.
+    assert "store" not in forwarded
+    assert "include" not in forwarded
+
+
+def test_responses_requires_api_key(client):
+    assert client.post("/v1/responses", json={"model": "x", "input": "hi"}).status_code == 401
+
+
+def test_responses_rejects_unknown_model_with_openai_error(client):
+    key = _create_gateway_key(client)
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "nope", "input": "hi"},
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["message"].startswith("Model 'nope'")
+
+
+def test_responses_rejects_missing_model_and_empty_input(client):
+    key = _create_gateway_key(client)
+    headers = {"Authorization": f"Bearer {key}"}
+
+    assert client.post("/v1/responses", headers=headers, json={"input": "hi"}).status_code == 400
+
+    _seed_deployment(client)
+    empty = client.post(
+        "/v1/responses", headers=headers, json={"model": "qwen-upstream", "input": []}
+    )
+    assert empty.status_code == 400
+    assert "at least one message" in empty.json()["error"]["message"]
+
+
+def test_retrieve_response_reports_stateless_gateway(client):
+    key = _create_gateway_key(client)
+    response = client.get(
+        "/v1/responses/resp_123", headers={"Authorization": f"Bearer {key}"}
+    )
+    assert response.status_code == 404
+    assert "does not" in response.json()["error"]["message"]
+
+
+@respx.mock
+def test_responses_stream_survives_upstream_error_status(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            400,
+            json={
+                "object": "error",
+                "message": "Unexpected reasoning effort minimal.",
+                "type": "BadRequestError",
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "qwen-upstream", "input": "hi", "stream": True},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Unexpected reasoning effort minimal."
+

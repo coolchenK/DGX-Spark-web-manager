@@ -1,0 +1,68 @@
+services:
+  manager:
+    image: dgx-spark-web-manager:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dgx-spark-web-manager
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    user: "${PUID:-1000}:${PGID:-1000}"
+    group_add:
+      - "${DOCKER_GID:-988}"
+      - "${OPS_AGENT_GID:-989}"
+    gpus: all
+    environment:
+      DGX_DATABASE_URL: sqlite:////app/data/manager.db
+      DGX_DATA_DIR: /app/data
+      DGX_STATIC_DIR: /app/frontend/dist
+      DGX_LISTEN_HOST: ${DGX_LISTEN_HOST:-0.0.0.0}
+      DGX_LISTEN_PORT: ${DGX_LISTEN_PORT:-3000}
+      DGX_SECRET_KEY: ${DGX_SECRET_KEY:?Set DGX_SECRET_KEY in .env}
+      DGX_ADMIN_USERNAME: ${DGX_ADMIN_USERNAME:-admin}
+      DGX_ADMIN_PASSWORD: ${DGX_ADMIN_PASSWORD:?Set DGX_ADMIN_PASSWORD in .env}
+      DGX_COOKIE_SECURE: ${DGX_COOKIE_SECURE:-false}
+      DGX_ALLOWED_ORIGINS: ${DGX_ALLOWED_ORIGINS:-http://localhost:3000}
+      DGX_MODEL_ROOTS: /models,/hf-cache/hub
+      DGX_MODEL_ROOT_MAPPINGS: /models=${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env};/hf-cache/hub=${HF_HOME_HOST:?Set HF_HOME_HOST in .env}/hub
+      DGX_LLAMA_CPP_HOST_DIR: ${LLAMA_CPP_HOME_HOST:-/opt/llamacpp}
+      DGX_LLAMA_CPP_MANAGER_DIR: /llamacpp-runtime
+      DGX_HF_CACHE_DIR: /hf-cache/hub
+      HOME: /hf-cache
+      HF_HOME: /hf-cache
+      HF_HUB_CACHE: /hf-cache/hub
+      HF_XET_CACHE: /hf-cache/xet
+      XDG_CACHE_HOME: /hf-cache/.cache
+      DGX_AUTO_DISCOVERY: "true"
+      DGX_DEPLOYMENT_STARTUP_TIMEOUT_SECONDS: ${DGX_DEPLOYMENT_STARTUP_TIMEOUT_SECONDS:-1200}
+      DGX_OPS_AGENT_SOCKET: /run/dgx-spark-manager/ops-agent.sock
+      DGX_OPS_AGENT_KEY_FILE: /run/secrets/ops-agent.key
+      DGX_OPS_AGENT_CONNECT_TIMEOUT_SECONDS: ${DGX_OPS_AGENT_CONNECT_TIMEOUT_SECONDS:-3}
+      DGX_OPS_AGENT_READ_TIMEOUT_SECONDS: ${DGX_OPS_AGENT_READ_TIMEOUT_SECONDS:-30}
+      DGX_OPS_AGENT_OUTPUT_LIMIT_BYTES: ${DGX_OPS_AGENT_OUTPUT_LIMIT_BYTES:-1000000}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./data:/app/data
+      - ./scripts/entrypoint.sh:/app/scripts/entrypoint.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HF_HOME_HOST:?Set HF_HOME_HOST in .env}:/hf-cache
+      - ${MODEL_HOME_HOST:?Set MODEL_HOME_HOST in .env}:/models
+      - ${LLAMA_CPP_HOME_HOST:-/opt/llamacpp}:/llamacpp-runtime:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /run/dgx-spark-manager:/run/dgx-spark-manager
+      - /etc/dgx-spark-manager/ops-agent.key:/run/secrets/ops-agent.key:ro
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.getenv('DGX_LISTEN_PORT','3000')+'/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5

@@ -1,0 +1,590 @@
+# API Reference
+
+## Authentication and CSRF
+
+Management endpoints use the `dgx_session` HttpOnly cookie. Login also returns a CSRF value and
+sets the `dgx_csrf` cookie:
+
+```http
+POST /api/auth/login
+Content-Type: application/json
+
+{"username":"admin","password":"..."}
+```
+
+Send the returned value as `X-CSRF-Token` on state-changing management requests. The deployment
+recommendation endpoint also requires it because a request can call a configured third-party AI
+provider and records an audit event. `POST /api/deployments/preview` is read-only and requires the
+administrator session but does not enforce the CSRF dependency. The web client sends the header
+whenever a CSRF value is available.
+
+OpenAI endpoints do not use the administrator session. They require a separately generated gateway
+key:
+
+```http
+Authorization: Bearer dgx_...
+```
+
+## OpenAI Multimodal Inputs
+
+`POST /v1/chat/completions` accepts text, image, and video content parts when the selected healthy
+deployment advertises the corresponding capability. Images use the OpenAI `image_url` shape; video
+uses the `video_url` extension implemented by the managed vLLM and SGLang runtimes. URLs and
+`data:<media-type>;base64,...` values are forwarded without decoding in the Manager:
+
+```json
+{
+  "model": "qwen38-aeon-ultimate",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "https://example.com/image.jpg",
+            "detail": "high"
+          }
+        },
+        {
+          "type": "video_url",
+          "video_url": {
+            "url": "https://example.com/video.mp4"
+          }
+        },
+        {"type": "text", "text": "Compare the image and video."}
+      ]
+    }
+  ]
+}
+```
+
+For Chat Completions clients that emit Responses-style parts, `input_text`, `input_image`, and
+`input_video` are normalized to `text`, `image_url`, and `video_url`. Remote `file_id` inputs are not
+available because the Manager does not host an OpenAI Files API; use a URL or data URL instead.
+
+Runtime-specific request parameters are passed through only to a compatible shared-route instance:
+
+| Runtime | Optional request parameters |
+| --- | --- |
+| vLLM | `mm_processor_kwargs`, `media_io_kwargs` |
+| SGLang | `images_config`, `use_audio_in_video` |
+
+Do not mix vLLM and SGLang parameter families in one request. Malformed media parts, unsupported
+model modalities, mixed runtime parameters, and invalid parameter types return an OpenAI-compatible
+`400 invalid_request_error` response before inference begins.
+
+`GET /v1/models` and `GET /v1/models/catalog` expose `input_modalities`, multimodal content-part
+names, and the runtime parameter list. A shared route advertises only the capabilities supported by
+every healthy instance, while request routing can select a more capable instance for a specific
+media request.
+
+## Management Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/health` | Service and database liveness |
+| GET | `/api/ops-agent/health` | Admin-only safe Host Operations Agent status |
+| GET | `/api/system` | Current host and GPU snapshot |
+| GET | `/api/models` | Registered model assets |
+| DELETE | `/api/models/{id}` | Create a permanent model deletion task |
+| GET | `/api/deployments` | Discovered and managed deployments |
+| POST | `/api/discovery/scan` | Re-scan Docker and model roots |
+| GET | `/api/huggingface/search?query=` | Search Hub models |
+| GET | `/api/huggingface/models/{repo}` | Repository files and metadata |
+| POST | `/api/huggingface/downloads` | Create persistent download task |
+| POST | `/api/deployments/recommendations` | Recommend settings for a model/runtime/image tuple |
+| POST | `/api/deployments/preview` | Revalidate and preview a deployment spec |
+| POST | `/api/deployments` | Create a deployment task |
+| PATCH | `/api/deployments/{id}` | Replace a managed deployment from a validated spec |
+| POST | `/api/deployments/{id}/{start|stop|restart|delete}` | Create a lifecycle task |
+| GET | `/api/deployments/{id}/logs` | Sanitized container log tail |
+| GET | `/api/tasks` | Persistent task history |
+| POST | `/api/tasks/{id}/{pause|resume}` | Task control |
+| DELETE | `/api/tasks/{id}` | Cancel task |
+| GET/POST/PATCH/DELETE | `/api/providers` | Encrypted online AI provider configuration |
+| POST | `/api/providers/{id}/test` | Provider connectivity test |
+| GET | `/api/diagnostics` | Legacy operation-plan history |
+| POST | `/api/diagnostics` | Create an operations session and queue its first message |
+| GET/POST | `/api/diagnostics/sessions` | List or create persistent operations sessions |
+| GET | `/api/diagnostics/sessions/{id}` | Session messages, tool runs, and linked plans |
+| POST | `/api/diagnostics/sessions/{id}/messages` | Queue an asynchronous AI operations response |
+| POST | `/api/diagnostics/{id}/{approve|reject}` | Human decision |
+| GET | `/api/keys` | Gateway key metadata |
+| POST | `/api/keys` | Create and reveal a gateway key once |
+| DELETE | `/api/keys/{id}` | Revoke a gateway key |
+| GET | `/api/audit` | Audit history |
+| GET | `/api/settings` | Non-secret manager configuration |
+| PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
+| DELETE | `/api/settings/alerts-diagnostics-history` | Physically clear failed-task and AI operations history |
+
+### Deployment TPS benchmarks
+
+After a newly created deployment passes its runtime health check, the same task sends one warmup
+request and one fixed non-streaming chat-completion request to the local endpoint. The measured
+completion-token throughput is persisted on the deployment. A benchmark failure does not roll back
+an otherwise healthy deployment.
+
+`GET /api/deployments` exposes `benchmark_status` (`pending`, `running`, `succeeded`, `failed`, or
+`null`), `benchmark_tps`, `benchmark_completion_tokens`, `benchmark_duration_seconds`,
+`benchmark_tested_at`, and `benchmark_error`. Historical or discovered deployments without a result
+return `null` benchmark values.
+
+`GET /api/models` exposes the latest successful result as `benchmark_tps` and
+`benchmark_tested_at`. A successful later benchmark replaces these model-level values. Failed tests
+leave the previous successful result unchanged, and uninstalling a deployment does not erase it.
+
+### Deployment lifecycle actions
+
+`POST /api/deployments/{id}/stop` stops an inference instance and immediately removes it from
+gateway routing while the task runs. Stopping preserves the container, deployment configuration,
+model files, image, and volumes so the same instance can be started again.
+
+`POST /api/deployments/{id}/delete` uninstalls an inference service. The task stops a running
+container, removes that container, and removes its deployment record. It does not delete the linked
+model asset or model files, and it does not remove Docker images or volumes. This behavior applies to
+both manager-created and discovered inference services.
+
+Manager-created services can be uninstalled without a request body. A discovered service requires
+the exact current container name as confirmation:
+
+```json
+{"confirm_container_name":"external-inference"}
+```
+
+Missing or mismatched confirmation returns `422` and does not create a task. The submitted
+confirmation field is used only to authorize the request and is not copied into the task input or
+audit event. The server stores its own container ID and name snapshot in the task so a queued action
+cannot be redirected to a replacement container.
+
+### Permanent model deletion
+
+`DELETE /api/models/{id}` requires an administrator session and CSRF token. The request body must
+confirm the model's exact registered name:
+
+```json
+{"confirmation":"Qwen Model"}
+```
+
+An accepted request returns `202` with the persistent `model.delete` task. Deletion runs
+asynchronously and permanently removes the model directory or Hugging Face cache repository before
+removing its inventory record. Models marked `unavailable` can be submitted to clear stale history,
+and a `delete_failed` model can be submitted again. A model already marked `deleting` returns `409`.
+
+Deletion is blocked with `409` and `code: model_in_use` while any deployment references the model as
+its base model, Draft Model, or through a legacy model path. The response identifies every blocking
+deployment:
+
+```json
+{
+  "detail": {
+    "code": "model_in_use",
+    "references": [
+      {
+        "deployment_id": "deployment-id",
+        "deployment_name": "qwen-production",
+        "usage": "base"
+      }
+    ]
+  }
+}
+```
+
+A missing model returns `404`. A confirmation that does not exactly match the registered name
+returns `422`. Repeating an accepted request while its task is still queued and has not started
+reuses the same task. Once the worker starts and marks the model `deleting`, another request returns
+`409`; after deletion completes and the inventory record is removed, it returns `404`.
+
+### AI operations sessions
+
+Create a persistent session with an enabled Provider:
+
+```json
+{
+  "provider_id": "provider-id",
+  "deployment_id": null,
+  "title": "Repair gateway"
+}
+```
+
+`POST /api/diagnostics/sessions/{id}/messages` accepts
+`{"content":"Inspect the gateway"}` and returns `202` with an `ops.respond` task. Provider
+reasoning, read-only tools, and plan creation run in the task worker, not in the HTTP request. The
+queue audit contains the task ID but does not contain message text.
+
+Sending requires a successful structured connection and default-model probe. An upgraded Provider
+with the old `last_test_status="healthy"` state and no structured result is probed once before its
+first queued message. Untested or failed Providers return `409` with a retest instruction. A
+session that is processing, waiting for plan approval, or already has an active response task also
+returns `409`.
+
+`GET /api/diagnostics/sessions/{id}` returns the session fields plus ordered `messages`,
+`tool_runs`, and plans linked from assistant messages. `GET /api/diagnostics` remains the legacy
+plan-history endpoint. The old `POST /api/diagnostics` request body remains accepted, but now
+creates a session and returns its asynchronous task with `202`.
+
+An assistant response can invoke only the bounded structured read tools exposed by the Host Agent.
+A Shell proposal is stored as a pending plan with exact `command`, `cwd`, `timeout_seconds`,
+`impact`, and `rollback` values. `POST /api/diagnostics/{id}/approve` records administrator approval
+and returns an asynchronous `operation.execute` task. The worker verifies the plan digest before
+execution. `POST /api/diagnostics/{id}/reject` leaves the plan rejected and returns its session to
+`active`.
+
+### Physical operations-history deletion
+
+`DELETE /api/settings/alerts-diagnostics-history` requires an administrator session, CSRF token,
+and this exact request body:
+
+```json
+{"confirmation":"清除历史记录"}
+```
+
+The endpoint returns `409` while an `ops.respond` or `operation.execute` task is queued, running,
+paused, or cancellation-requested, or while a plan is approved/executing. Otherwise one database
+transaction physically deletes failed tasks, all operation plans, all operations sessions/messages/
+tool runs, and their related operations/failed-task audit rows. It then creates one
+`maintenance.history.clear` audit record and returns aggregate deletion counts. Models,
+deployments, Providers, API keys, Hugging Face secrets, gateway metrics, and successful tasks are
+not deleted. A transaction failure rolls back every deletion.
+
+### Hugging Face Spark compatibility
+
+`GET /api/huggingface/search?query=Qwen&limit=20` evaluates up to 50 Hub candidates for
+DGX Spark suitability before applying the requested result limit. NVFP4 receives the strongest
+positive signal. Results are ordered by compatibility level, then score; Hub relevance remains
+the tie-breaker for candidates with the same level and score.
+
+Each search result includes an additive compatibility object:
+
+```json
+{
+  "id": "unsloth/Qwen3.8-27B-NVFP4",
+  "spark_compatibility": {
+    "level": "recommended",
+    "score": 180,
+    "reasons": ["NVFP4 quantization", "compressed weights", "Safetensors weights"]
+  }
+}
+```
+
+`level` is `recommended`, `compatible`, or `review`. This metadata controls search order and
+presentation only; it does not bypass download, runtime, image, quantization, or resource checks.
+
+## Deployment Recommendations
+
+`POST /api/deployments/recommendations` accepts the stable selection tuple. Unknown fields are
+rejected. `provider_id` is optional; when omitted, recommendations remain deterministic and no
+online AI provider is called.
+
+```json
+{
+  "model_id": "model-asset-id",
+  "runtime": "vllm",
+  "image": "vllm/vllm-openai:v0.27.1",
+  "provider_id": "provider-id"
+}
+```
+
+Use `?force_ai=true` to require the configured healthy provider even when deterministic fields are
+already complete. `?refresh_ai=true` also forces a fresh provider request and bypasses a matching AI cache entry. Model evidence, runtime capability,
+device memory, resource estimation, and Draft Model classification are still evaluated on every
+request. A missing provider returns `404`; a disabled provider or one whose last test failed returns
+`409`.
+
+The response has this shape (values are illustrative):
+
+```json
+{
+  "status": "complete",
+  "generated_at": "2026-08-16T00:00:00Z",
+  "model_id": "model-asset-id",
+  "runtime": "vllm",
+  "image_digest": "sha256:...",
+  "evidence_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "fields": {
+    "context_length": {
+      "value": 32768,
+      "source": "model_card",
+      "confidence": "high",
+      "reason": "Model card explicitly sets context_length",
+      "warning": null
+    },
+    "quantization": {
+      "value": "modelopt_fp4",
+      "source": "local_config",
+      "confidence": "high",
+      "reason": "Local model asset metadata declares quantization",
+      "warning": null
+    }
+  },
+  "generation_defaults": {
+    "temperature": {
+      "value": 0.6,
+      "source": "ai",
+      "confidence": "medium",
+      "reason": "AI filled a bounded generation recommendation",
+      "warning": null
+    }
+  },
+  "speculative_defaults": {
+    "num_speculative_tokens": {
+      "value": 3,
+      "source": "model_card",
+      "confidence": "high",
+      "reason": "Model card recommends the speculative draft length",
+      "warning": null
+    }
+  },
+  "resource_snapshot": {
+    "total_bytes": 130595860480,
+    "available_bytes": 100000000000,
+    "reserved_bytes": 13059586048
+  },
+  "resource_estimate": {
+    "total_bytes": 130595860480,
+    "available_bytes": 100000000000,
+    "reserved_bytes": 13059586048,
+    "weight_bytes": 45000000000,
+    "draft_weight_bytes": 0,
+    "kv_cache_bytes": 8000000000,
+    "runtime_overhead_bytes": 2147483648,
+    "required_bytes": 55147483648,
+    "decision": "ok",
+    "confidence": "high",
+    "reasons": []
+  },
+  "runtime_capabilities": {
+    "runtime": "vllm",
+    "image": "vllm/vllm-openai:v0.27.1",
+    "image_digest": "sha256:...",
+    "source": "probe",
+    "generation_defaults": [
+      "temperature",
+      "top_p",
+      "top_k",
+      "min_p",
+      "repetition_penalty",
+      "presence_penalty",
+      "frequency_penalty",
+      "max_tokens",
+      "stop"
+    ],
+    "quantization_methods": [
+      "auto",
+      "awq",
+      "gptq",
+      "fp8",
+      "bitsandbytes",
+      "marlin",
+      "gguf",
+      "modelopt",
+      "modelopt_fp4",
+      "nvfp4_online",
+      "compressed-tensors"
+    ],
+    "quantization_mapping": {"nvfp4": "modelopt_fp4"},
+    "speculative_methods": ["draft_model", "eagle3", "mtp"],
+    "method_mapping": {"draft_model": "draft_model", "eagle3": "eagle3", "mtp": "mtp"},
+    "speculative_transport": "json",
+    "warnings": []
+  },
+  "draft_candidates": [],
+  "warnings": []
+}
+```
+
+`status` is:
+
+- `complete`: every critical deployment field is resolved and no AI fallback failed.
+- `partial`: safe values are returned, but unresolved fields or an unavailable/invalid AI result
+  still require administrator review.
+- `unavailable`: a required model, capability, evidence, resource snapshot, or physical resource
+  check could not be verified. The response can retain partial fields and warnings for inspection.
+
+Every recommended value has a `source`: `model_card`, `local_config`, `runtime_default`,
+`device_rule`, or `ai`. `draft_candidates` use `compatible`, `review`, or `incompatible` status.
+A `review` candidate requires `speculative.manual_review_acknowledged=true`; an `incompatible`
+candidate cannot pass preview. Resource `warning` requires `resource_warning_acknowledged=true`,
+while `blocked` cannot be acknowledged through.
+
+A Draft candidate contains the local asset identity, detected method, classification reasons, raw
+size, and the combined estimate when it could be calculated:
+
+```json
+{
+  "model_id": "draft-model-asset-id",
+  "name": "qwen-eagle3-draft",
+  "repository_id": "org/qwen-eagle3-draft",
+  "method": "eagle3",
+  "status": "review",
+  "reasons": ["Auxiliary Draft Model target pairing evidence is missing"],
+  "size_bytes": 2147483648,
+  "estimated_total_bytes": 57365372928
+}
+```
+
+## Deployment Spec, Preview, Create, Edit, and Clone
+
+Preview, create, and edit accept the same strict `DeploymentSpec` JSON body:
+
+```json
+{
+  "name": "qwen-nvfp4",
+  "model_id": "model-asset-id",
+  "model_path": "/models/qwen-nvfp4",
+  "api_model_name": "qwen-nvfp4",
+  "route_alias": "qwen-production",
+  "runtime": "vllm",
+  "image": "vllm/vllm-openai:v0.27.1",
+  "port": 8010,
+  "context_length": 32768,
+  "memory_fraction": 0.8,
+  "max_concurrency": 4,
+  "max_batched_tokens": 8192,
+  "quantization": "modelopt_fp4",
+  "trust_remote_code": false,
+  "generation_defaults": {
+    "temperature": 0.6,
+    "top_p": 0.9,
+    "max_tokens": 2048,
+    "stop": ["<|end|>"]
+  },
+  "chat_template_kwargs": {
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+  },
+  "speculative": {
+    "draft_model_id": "draft-model-asset-id",
+    "method": "eagle3",
+    "num_speculative_tokens": 5,
+    "manual_review_acknowledged": false
+  },
+  "recommendation": {
+    "generated_at": "2026-08-16T00:00:00Z",
+    "evidence_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "provider_id": "provider-id",
+    "resource_snapshot": {
+      "total_bytes": 130595860480,
+      "available_bytes": 100000000000,
+      "reserved_bytes": 13059586048
+    },
+    "modified_fields": ["generation_defaults.temperature"],
+    "sources": {
+      "context_length": "model_card",
+      "quantization": "local_config",
+      "generation_defaults.temperature": "ai"
+    }
+  },
+  "resource_warning_acknowledged": false
+}
+```
+
+`recommendation` is provenance, not an instruction to call AI during deployment. `sources` records
+the origin of retained recommended fields. `modified_fields` records recommendation-managed fields
+the administrator changed after application; both use dotted generation paths such as
+`generation_defaults.temperature`. The backend persists JSON-safe provenance with the task/spec.
+
+`max_total_tokens` is an optional SGLang runtime-pool limit and cannot exceed `context_length`.
+It is distinct from the model's advertised context window and from `generation_defaults.max_tokens`.
+SSD Stream deployments pass it to `--max-total-tokens`; omitting it preserves the prior behavior of
+using `context_length` for the requested pool size.
+
+For SGLang, replace `num_speculative_tokens` with all three grouped values `num_steps`,
+`eagle_top_k`, and `num_draft_tokens`, or omit all three. These tuning groups are mutually exclusive
+by runtime. A SGLang DSpark candidate uses `method: "dspark"`; the adapter maps it to `DSPARK`,
+resolves a Hugging Face cache path back to its repository ID, and applies the DGX Spark-specific
+draft attention, cache, and Mamba flags.
+
+`chat_template_kwargs` is optional and accepts at most 16 identifier keys with scalar string,
+number, or boolean values. vLLM and SGLang receive it as `--default-chat-template-kwargs`;
+llama.cpp receives `--chat-template-kwargs` when Jinja templates are enabled. Per-request template
+kwargs continue to take precedence.
+
+After login, these commands exercise recommendation, preview, and create using JSON files containing
+the request bodies shown in this reference:
+
+```bash
+BASE_URL=http://dgx-spark.local:3000
+
+curl -sS -c cookies.txt \
+  -H 'Content-Type: application/json' \
+  --data-binary @login.json \
+  "$BASE_URL/api/auth/login" > login-response.json
+CSRF=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])' \
+  < login-response.json)
+
+curl -sS -b cookies.txt \
+  -H "X-CSRF-Token: $CSRF" \
+  -H 'Content-Type: application/json' \
+  --data-binary @recommendation-request.json \
+  "$BASE_URL/api/deployments/recommendations?refresh_ai=true"
+
+curl -sS -b cookies.txt \
+  -H 'Content-Type: application/json' \
+  --data-binary @deployment.json \
+  "$BASE_URL/api/deployments/preview"
+
+curl -sS -b cookies.txt \
+  -H "X-CSRF-Token: $CSRF" \
+  -H 'Content-Type: application/json' \
+  --data-binary @deployment.json \
+  "$BASE_URL/api/deployments"
+```
+
+Preview returns the normalized `spec`, command, mounts, `runtime_capabilities`, recomputed
+`resource_estimate`, selected `draft_candidate`, `generation_defaults`, `speculative`,
+`recommendation`, warnings, and `spec_fingerprint`. The panel submits the exact payload snapshot
+that produced the displayed preview. Any subsequent form or tuple change invalidates that preview.
+
+For an edit, pass the record ID as a preview query parameter so route/name checks exclude that
+record, then use the same ID in the PATCH path:
+
+```text
+POST  /api/deployments/preview?deployment_id=<deployment-id>
+PATCH /api/deployments/<deployment-id>
+```
+
+`deployment_id` is not a field in `DeploymentSpec`. Create uses `POST /api/deployments`. Clone is a
+panel workflow that starts from an existing saved spec, requires a new name/API model name/port,
+previews it, then uses the create endpoint. Create and edit return a persistent task with HTTP 202.
+
+Preview and submit both repeat allowlist, path, image, capability, Draft compatibility, shared-route,
+and resource checks. An edit uses a health-gated container replacement and rollback path.
+
+## OpenAI-Compatible Endpoints
+
+- `GET /v1/models`
+- `GET /v1/models/{model}`
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /v1/embeddings` for deployments advertising `embedding`
+
+`GET /v1/models` lists only running, healthy deployments. The gateway replaces the requested route
+name with the selected deployment's upstream `api_model_name`. SSE bytes are relayed without
+buffering, upstream status/content types are preserved, and manager-generated failures use the
+standard OpenAI `error` object.
+
+The public Chat Completions contract accepts OpenAI `developer` messages. A runtime adapter converts
+that role to the legacy `system` equivalent only in requests sent to local SGLang, vLLM, and
+llama.cpp chat templates. Client configuration, stored conversations, message content, and all
+other message fields remain unchanged. Non-standard flat runtime errors are converted to the same
+OpenAI `error` envelope before they are returned, including when the caller requested streaming.
+
+For SGLang deployments, model discovery reads the live `max_total_num_tokens` value exposed by the
+runtime. The standard model-listing extensions report the lower of that profiled capacity and the
+configured model context as `context_length`/`context_window`, while
+`configured_context_length` preserves the theoretical setting. `max_input_tokens` reserves the
+advertised output allowance so clients compact before the runtime shortens a response to fit its
+actual KV token pool.
+
+Set the optional `route_alias` to the same value on multiple instances to expose one gateway model
+name. Healthy instances are selected round-robin. `/v1/models` reports `instances` and only the
+capabilities shared by every instance. Preview rejects members of one effective route when their
+normalized `generation_defaults` differ.
+
+For `/v1/chat/completions` and `/v1/completions`, the gateway fills only missing saved defaults that
+also appear in the deployment's saved runtime-capability snapshot. Explicit request values,
+including `0`, `false`, and an empty `stop`, win. `max_completion_tokens` also prevents the saved
+`max_tokens` default from being inserted. Invalid, unknown, or unsupported saved values are ignored;
+embeddings are unchanged. Applied field names, not their values or prompts, are recorded under the
+`gateway.defaults.apply` audit action.

@@ -1,0 +1,956 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import stat
+from collections import namedtuple
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+from huggingface_hub import ModelCard
+from pydantic import BaseModel, ConfigDict, Field
+from yaml.error import YAMLError
+
+MAX_JSON_BYTES = 4 * 1024**2
+MAX_CARD_CHARS = 500_000
+MAX_TOKENIZER_FILE_BYTES = 128 * 1024**2
+
+DEPLOYMENT_FLAGS = {
+    "--max-model-len": "context_length",
+    "--context-length": "context_length",
+    "--gpu-memory-utilization": "memory_fraction",
+    "--mem-fraction-static": "memory_fraction",
+    "--max-num-seqs": "max_concurrency",
+    "--max-running-requests": "max_concurrency",
+    "--max-num-batched-tokens": "max_batched_tokens",
+    "--quantization": "quantization",
+    # NVIDIA's Nemotron cards use both spellings across vLLM releases.
+    "--speculative_config.num_speculative_tokens": "num_speculative_tokens",
+    "--speculative-config.num-speculative-tokens": "num_speculative_tokens",
+    "--speculative-config.num_speculative_tokens": "num_speculative_tokens",
+}
+
+GENERATION_KEYS = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+    "max_tokens",
+    "stop",
+}
+
+TOKENIZER_FILES = {
+    "added_tokens.json",
+    "merges.txt",
+    "sentencepiece.bpe.model",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "vocab.json",
+}
+TARGET_MODEL_KEYS = (
+    "base_model",
+    "base_models",
+    "target_model",
+    "target_models",
+    "target_model_id",
+    "target_model_ids",
+)
+SPECULATIVE_METHOD_KEYS = (
+    "speculative_method",
+    "speculative_decoding_method",
+)
+SPECULATIVE_METHODS = {"draft_model", "dflash", "dspark", "eagle", "eagle3", "mtp"}
+SAFE_CARD_DATA_KEYS = (
+    *TARGET_MODEL_KEYS,
+    *SPECULATIVE_METHOD_KEYS,
+    "datasets",
+    "language",
+    "library_name",
+    "license",
+    "model_name",
+    "pipeline_tag",
+    "tags",
+)
+
+OPEN_FENCE_LINE = re.compile(r"^[ \t]*```(?P<language>[A-Za-z0-9_-]*)[ \t]*(?:\r?\n)?$")
+CLOSE_FENCE_LINE = re.compile(r"^[ \t]*```[ \t]*(?:\r?\n)?$")
+QUANTIZATION_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+REPOSITORY_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+HUGGINGFACE_CACHE_REPOSITORY = re.compile(
+    r"^models--[A-Za-z0-9][A-Za-z0-9._-]*--[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"(?:--[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+)
+HUGGINGFACE_BLOB_LINK = re.compile(
+    r"^\.\./\.\./blobs/(?P<digest>[A-Fa-f0-9]{40}(?:[A-Fa-f0-9]{24})?)$"
+)
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON constant")
+
+
+class ModelEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_path: str
+    config: dict[str, Any]
+    generation_config: dict[str, Any]
+    tokenizer_fingerprint: str | None
+    card_text: str
+    card_data: dict[str, Any]
+    card_deployment_values: dict[str, int | float | bool | str]
+    card_generation_values: dict[str, Any]
+    local_generation_values: dict[str, Any]
+    target_model_ids: list[str]
+    speculative_method: str | None
+    embedded_mtp_available: bool = False
+    evidence_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    warnings: list[str]
+
+
+Fence = namedtuple("Fence", "language body start end closed newline")
+WindowsSnapshotLayout = namedtuple(
+    "WindowsSnapshotLayout",
+    "repository original_paths resolved_paths identities",
+)
+
+
+def _parse_huggingface_blob_link_target(target: str) -> str | None:
+    match = HUGGINGFACE_BLOB_LINK.fullmatch(target)
+    return match.group("digest") if match is not None else None
+
+
+def _huggingface_snapshot_paths(model_root: Path) -> tuple[Path, Path, Path] | None:
+    snapshots = model_root.parent
+    repository = snapshots.parent
+    if (
+        snapshots.name != "snapshots"
+        or not model_root.name
+        or HUGGINGFACE_CACHE_REPOSITORY.fullmatch(repository.name) is None
+    ):
+        return None
+    return repository, snapshots, model_root
+
+
+def _resolve_strict(path: Path) -> Path:
+    return path.resolve(strict=True)
+
+
+def _resolve_evidence_path(path: Path) -> Path:
+    try:
+        return _resolve_strict(path)
+    except RuntimeError as exc:
+        raise ValueError("model evidence path could not be resolved safely") from exc
+
+
+def _path_lstat(path: Path) -> os.stat_result:
+    return os.stat(path, follow_symlinks=False)
+
+
+def _huggingface_snapshot_repository(model_root: Path) -> Path | None:
+    try:
+        resolved_root = _resolve_strict(model_root)
+    except (OSError, RuntimeError):
+        return None
+    paths = _huggingface_snapshot_paths(resolved_root)
+    return paths[0] if paths is not None else None
+
+
+def _safe_windows_directory(value: os.stat_result) -> bool:
+    return stat.S_ISDIR(value.st_mode) and not _is_windows_reparse_point(value)
+
+
+def _windows_huggingface_snapshot_layout(
+    model_root: Path,
+) -> WindowsSnapshotLayout | None:
+    original_paths = _huggingface_snapshot_paths(model_root)
+    if original_paths is None:
+        return None
+    try:
+        original_stats = tuple(_path_lstat(path) for path in original_paths)
+    except OSError:
+        return None
+    if not all(_safe_windows_directory(value) for value in original_stats):
+        return None
+
+    try:
+        resolved_root = _resolve_strict(model_root)
+    except (OSError, RuntimeError):
+        return None
+    resolved_paths = _huggingface_snapshot_paths(resolved_root)
+    if resolved_paths is None:
+        return None
+    try:
+        resolved_stats = tuple(_path_lstat(path) for path in resolved_paths)
+    except OSError:
+        return None
+    if (
+        not all(_safe_windows_directory(value) for value in resolved_stats)
+        or tuple(_stat_identity(value) for value in original_stats)
+        != tuple(_stat_identity(value) for value in resolved_stats)
+    ):
+        return None
+    return WindowsSnapshotLayout(
+        repository=resolved_paths[0],
+        original_paths=original_paths,
+        resolved_paths=resolved_paths,
+        identities=tuple(_stat_identity(value) for value in original_stats),
+    )
+
+
+def _windows_snapshot_hierarchy_unchanged(layout: WindowsSnapshotLayout) -> bool:
+    try:
+        original_stats = tuple(_path_lstat(path) for path in layout.original_paths)
+        resolved_stats = tuple(_path_lstat(path) for path in layout.resolved_paths)
+    except OSError:
+        return False
+    return all(
+        all(_safe_windows_directory(value) for value in values)
+        and tuple(_stat_identity(value) for value in values) == layout.identities
+        for values in (original_stats, resolved_stats)
+    )
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _is_windows_reparse_point(value: os.stat_result) -> bool:
+    attributes = getattr(value, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+@contextmanager
+def _open_posix_huggingface_snapshot(model_root: Path) -> Iterator[tuple[int, int]]:
+    paths = _huggingface_snapshot_paths(model_root)
+    if paths is None:
+        raise ValueError("model root is not a Hugging Face snapshot")
+    repository, snapshots, revision = paths
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    directory_fds: list[int] = []
+
+    def open_directory(path: Path | str, dir_fd: int | None = None) -> int:
+        if dir_fd is None:
+            opened_fd = os.open(path, directory_flags)
+        else:
+            opened_fd = os.open(path, directory_flags, dir_fd=dir_fd)
+        if not stat.S_ISDIR(os.fstat(opened_fd).st_mode):
+            os.close(opened_fd)
+            raise ValueError("Hugging Face snapshot path is not a directory")
+        directory_fds.append(opened_fd)
+        return opened_fd
+
+    try:
+        anchor_fd = open_directory(repository.parent)
+        repository_fd = open_directory(repository.name, anchor_fd)
+        snapshots_fd = open_directory(snapshots.name, repository_fd)
+        revision_fd = open_directory(revision.name, snapshots_fd)
+        yield repository_fd, revision_fd
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+@contextmanager
+def _open_posix_huggingface_blob(
+    repository_fd: int,
+    revision_fd: int,
+    filename: str,
+    link_stat: os.stat_result,
+) -> Iterator[Any]:
+    link_target = os.readlink(filename, dir_fd=revision_fd)
+    digest = _parse_huggingface_blob_link_target(link_target)
+    if digest is None:
+        raise ValueError("model evidence symlink target is not a Hugging Face blob")
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    blobs_fd: int | None = None
+    blob_fd: int | None = None
+    try:
+        blobs_fd = os.open("blobs", directory_flags, dir_fd=repository_fd)
+        if not stat.S_ISDIR(os.fstat(blobs_fd).st_mode):
+            raise ValueError("Hugging Face blob directory is not a directory")
+        blob_fd = os.open(digest, file_flags, dir_fd=blobs_fd)
+        if not stat.S_ISREG(os.fstat(blob_fd).st_mode):
+            raise ValueError("model evidence blob is not regular")
+        link_after = os.stat(filename, dir_fd=revision_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISLNK(link_after.st_mode)
+            or _stat_identity(link_stat) != _stat_identity(link_after)
+            or os.readlink(filename, dir_fd=revision_fd) != link_target
+        ):
+            raise ValueError("model evidence symlink changed while opening")
+        with os.fdopen(blob_fd, "rb") as stream:
+            blob_fd = None
+            yield stream
+    finally:
+        if blob_fd is not None:
+            os.close(blob_fd)
+        if blobs_fd is not None:
+            os.close(blobs_fd)
+
+
+@contextmanager
+def _open_posix_model_file_at(
+    revision_fd: int,
+    filename: str,
+    repository_fd: int | None = None,
+) -> Iterator[Any]:
+    file_stat = os.stat(filename, dir_fd=revision_fd, follow_symlinks=False)
+    if stat.S_ISLNK(file_stat.st_mode):
+        if repository_fd is None:
+            raise ValueError("model evidence file is a symlink")
+        with _open_posix_huggingface_blob(
+            repository_fd, revision_fd, filename, file_stat
+        ) as stream:
+            yield stream
+        return
+
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(
+            filename,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=revision_fd,
+        )
+        opened_stat = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _stat_identity(file_stat) != _stat_identity(opened_stat)
+        ):
+            raise ValueError("model evidence file is not regular")
+        with os.fdopen(file_fd, "rb") as stream:
+            file_fd = None
+            yield stream
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+
+
+def _windows_link_target(target: str) -> str:
+    return target.replace("\\", "/")
+
+
+@contextmanager
+def _open_windows_huggingface_blob(
+    model_root: Path,
+    candidate: Path,
+    link_stat: os.stat_result,
+) -> Iterator[Any]:
+    layout = _windows_huggingface_snapshot_layout(model_root)
+    if layout is None:
+        raise ValueError("model evidence symlink is outside a Hugging Face snapshot")
+    raw_target = os.readlink(candidate)
+    digest = _parse_huggingface_blob_link_target(_windows_link_target(raw_target))
+    if digest is None:
+        raise ValueError("model evidence symlink target is not a Hugging Face blob")
+
+    blobs = layout.repository / "blobs"
+    blobs_before = os.stat(blobs, follow_symlinks=False)
+    if not stat.S_ISDIR(blobs_before.st_mode) or _is_windows_reparse_point(blobs_before):
+        raise ValueError("Hugging Face blob directory is not a regular directory")
+    blob = blobs / digest
+    blob_before = os.stat(blob, follow_symlinks=False)
+    if not stat.S_ISREG(blob_before.st_mode) or _is_windows_reparse_point(blob_before):
+        raise ValueError("model evidence blob is not regular")
+
+    with blob.open("rb") as stream:
+        opened_stat = os.fstat(stream.fileno())
+        blob_after = os.stat(blob, follow_symlinks=False)
+        blobs_after = os.stat(blobs, follow_symlinks=False)
+        link_after = os.stat(candidate, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or not stat.S_ISREG(blob_after.st_mode)
+            or not stat.S_ISDIR(blobs_after.st_mode)
+            or not stat.S_ISLNK(link_after.st_mode)
+            or _is_windows_reparse_point(blob_after)
+            or _is_windows_reparse_point(blobs_after)
+            or _stat_identity(blob_before) != _stat_identity(opened_stat)
+            or _stat_identity(blob_after) != _stat_identity(opened_stat)
+            or _stat_identity(blobs_before) != _stat_identity(blobs_after)
+            or _stat_identity(link_stat) != _stat_identity(link_after)
+            or os.readlink(candidate) != raw_target
+            or not _windows_snapshot_hierarchy_unchanged(layout)
+        ):
+            raise ValueError("model evidence blob changed while opening")
+        resolved_blob = _resolve_evidence_path(blob)
+        if resolved_blob != blob.absolute():
+            raise ValueError("model evidence blob is a symlink")
+        yield stream
+
+
+def iter_fences(card_text: str) -> Iterator[Fence]:
+    """Yield fenced blocks with one linear pass over the bounded card text."""
+    lines = card_text.splitlines(keepends=True)
+    offset = 0
+    index = 0
+    while index < len(lines):
+        opening = OPEN_FENCE_LINE.fullmatch(lines[index])
+        if opening is None:
+            offset += len(lines[index])
+            index += 1
+            continue
+        start = offset
+        language = opening.group("language")
+        offset += len(lines[index])
+        index += 1
+        body_parts: list[str] = []
+        closed = False
+        while index < len(lines):
+            line = lines[index]
+            if CLOSE_FENCE_LINE.fullmatch(line):
+                offset += len(line)
+                index += 1
+                closed = True
+                newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+                break
+            body_parts.append(line)
+            offset += len(line)
+            index += 1
+        if not closed:
+            newline = ""
+        yield Fence(language, "".join(body_parts), start, offset, closed, newline)
+
+
+@contextmanager
+def _open_model_file(model_root: Path, filename: str) -> Iterator[Any]:
+    if os.name == "posix":
+        if _huggingface_snapshot_paths(model_root) is not None:
+            with _open_posix_huggingface_snapshot(model_root) as (
+                repository_fd,
+                revision_fd,
+            ):
+                with _open_posix_model_file_at(
+                    revision_fd, filename, repository_fd
+                ) as stream:
+                    yield stream
+            return
+
+        root_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        root_fd = os.open(model_root, root_flags)
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            os.close(root_fd)
+            raise ValueError("model root is not a directory")
+        try:
+            with _open_posix_model_file_at(root_fd, filename) as stream:
+                yield stream
+        finally:
+            os.close(root_fd)
+        return
+
+    candidate = model_root / filename
+    root_stat = _path_lstat(model_root)
+    if not _safe_windows_directory(root_stat):
+        raise ValueError("model root is not a regular directory")
+    snapshot_paths = _huggingface_snapshot_paths(model_root)
+    snapshot_layout = None
+    if snapshot_paths is not None:
+        snapshot_layout = _windows_huggingface_snapshot_layout(model_root)
+        if snapshot_layout is None:
+            raise ValueError("model evidence snapshot hierarchy is unsafe")
+    file_stat = os.stat(candidate, follow_symlinks=False)
+    if stat.S_ISLNK(file_stat.st_mode):
+        with _open_windows_huggingface_blob(model_root, candidate, file_stat) as stream:
+            yield stream
+        return
+    with candidate.open("rb") as stream:
+        opened_stat = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or _stat_identity(file_stat) != _stat_identity(opened_stat)
+        ):
+            raise ValueError("model evidence file is not regular")
+        resolved = _resolve_evidence_path(candidate)
+        resolved_root = (
+            snapshot_layout.resolved_paths[2]
+            if snapshot_layout is not None
+            else _resolve_evidence_path(model_root)
+        )
+        if not resolved.is_relative_to(resolved_root):
+            raise ValueError("model evidence file escapes model directory")
+        opened_stat = os.fstat(stream.fileno())
+        resolved_stat = os.stat(resolved, follow_symlinks=True)
+        if (opened_stat.st_dev, opened_stat.st_ino) != (
+            resolved_stat.st_dev,
+            resolved_stat.st_ino,
+        ):
+            raise ValueError("model evidence file changed while opening")
+        if (
+            snapshot_layout is not None
+            and not _windows_snapshot_hierarchy_unchanged(snapshot_layout)
+        ):
+            raise ValueError("model evidence snapshot hierarchy changed while opening")
+        yield stream
+
+
+def _read_model_file(
+    model_root: Path, filename: str, max_bytes: int
+) -> tuple[bytes | None, str]:
+    try:
+        with _open_model_file(model_root, filename) as stream:
+            payload = stream.read(max_bytes + 1)
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, ValueError):
+        return None, "unreadable"
+    if len(payload) > max_bytes:
+        return payload, "too_large"
+    return payload, "ok"
+
+
+def _read_json_dict(model_root: Path, filename: str, warnings: list[str]) -> dict[str, Any]:
+    payload, status = _read_model_file(model_root, filename, MAX_JSON_BYTES)
+    if status == "missing":
+        return {}
+    if status == "unreadable":
+        warnings.append(f"{filename} is not a safe regular file")
+        return {}
+    if status == "too_large":
+        warnings.append(f"{filename} exceeds the size limit")
+        return {}
+    assert payload is not None
+    try:
+        value = json.loads(payload, parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        warnings.append(f"{filename} is not valid JSON")
+        return {}
+    if not isinstance(value, dict):
+        warnings.append(f"{filename} must contain a JSON object")
+        return {}
+    return value
+
+
+def _safe_nonempty_model_file_exists(
+    model_root: Path, filename: str, warnings: list[str]
+) -> bool:
+    try:
+        with _open_model_file(model_root, filename) as stream:
+            return os.fstat(stream.fileno()).st_size > 0
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        warnings.append(f"{filename} is not a safe regular file")
+        return False
+
+
+def _read_card(model_root: Path, max_chars: int, warnings: list[str]) -> str:
+    payload, status = _read_model_file(model_root, "README.md", max_chars * 4 + 1)
+    if status == "missing":
+        return ""
+    if status == "unreadable" or payload is None:
+        warnings.append("README.md is not a safe regular file")
+        return ""
+    text = payload.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) > max_chars:
+        warnings.append("README.md was truncated")
+    return text[:max_chars]
+
+
+def _tokenizer_fingerprint(model_root: Path) -> tuple[str | None, list[str]]:
+    digest = hashlib.sha256()
+    found = False
+    warnings: list[str] = []
+    for filename in sorted(TOKENIZER_FILES):
+        content, status = _read_model_file(model_root, filename, MAX_TOKENIZER_FILE_BYTES)
+        if status == "missing":
+            continue
+        if status == "too_large":
+            warnings.append(f"{filename} is too large for tokenizer fingerprint")
+            continue
+        if status != "ok" or content is None:
+            warnings.append(f"{filename} could not be read for tokenizer fingerprint")
+            continue
+        found = True
+        encoded_name = filename.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return (digest.hexdigest() if found else None), warnings
+
+
+def tokenizer_fingerprint(model_path: Path | str) -> str | None:
+    supplied_path = Path(model_path)
+    if not supplied_path.is_dir() or supplied_path.is_symlink():
+        raise ValueError("model directory must be a regular directory")
+    evidence_root = Path(os.path.abspath(supplied_path))
+    fingerprint, _warnings = _tokenizer_fingerprint(evidence_root)
+    return fingerprint
+
+
+def _normalize_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized if normalized > 0 else None
+
+
+def _normalize_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if normalized != normalized or normalized in {float("inf"), float("-inf")}:
+        return None
+    return normalized
+
+
+def _normalize_generation_value(key: str, value: Any) -> Any | None:
+    if key in {"top_k", "max_tokens"}:
+        return _normalize_int(value)
+    if key == "stop":
+        if isinstance(value, str):
+            return value[:256] if value else None
+        if isinstance(value, list) and 0 < len(value) <= 16:
+            normalized = [item[:256] for item in value if isinstance(item, str) and item]
+            return normalized or None
+        return None
+    return _normalize_float(value)
+
+
+def _extract_generation_values(value: dict[str, Any]) -> dict[str, Any]:
+    extracted: dict[str, Any] = {}
+    for key in GENERATION_KEYS:
+        if key not in value:
+            continue
+        normalized = _normalize_generation_value(key, value[key])
+        if normalized is not None:
+            extracted[key] = normalized
+    return extracted
+
+
+def _normalize_deployment_value(key: str, value: str) -> int | float | str | None:
+    if value.startswith("-"):
+        return None
+    if key in {
+        "context_length",
+        "max_concurrency",
+        "max_batched_tokens",
+        "num_speculative_tokens",
+    }:
+        return _normalize_int(value)
+    if key == "memory_fraction":
+        return _normalize_float(value)
+    if key == "quantization" and QUANTIZATION_VALUE.fullmatch(value):
+        return value
+    return None
+
+
+def _extract_shell_values(body: str) -> dict[str, int | float | bool | str]:
+    try:
+        tokens = shlex.split(body, posix=True)
+    except ValueError:
+        raise
+    extracted: dict[str, int | float | bool | str] = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        flag, separator, inline_value = token.partition("=")
+        destination = DEPLOYMENT_FLAGS.get(flag)
+        if destination is None:
+            index += 1
+            continue
+        if separator:
+            raw_value = inline_value
+        elif index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
+            index += 1
+            raw_value = tokens[index]
+        else:
+            index += 1
+            continue
+        normalized = _normalize_deployment_value(destination, raw_value)
+        if normalized is not None:
+            extracted[destination] = normalized
+        index += 1
+    return extracted
+
+
+def _sanitize_shell_fences(card_text: str) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for fence in iter_fences(card_text):
+        if fence.language.casefold() not in {"bash", "sh", "shell"}:
+            continue
+        parts.append(card_text[cursor : fence.start])
+        try:
+            values = _extract_shell_values(fence.body)
+        except ValueError:
+            values = {}
+        safe_lines = [f"{key}={json.dumps(value)}" for key, value in sorted(values.items())]
+        body = "\n".join(safe_lines)
+        parts.append(f"```{fence.language}\n{body}\n```{fence.newline}")
+        cursor = fence.end
+    if not parts:
+        return card_text
+    parts.append(card_text[cursor:])
+    return "".join(parts)
+
+
+def _deployment_fence_score(card_text: str, fence: Fence) -> int:
+    """Prefer the model-card recipe that explicitly targets DGX Spark/GB10."""
+    prefix = card_text[: fence.start]
+    headings = list(re.finditer(r"(?im)^\s*#{1,6}\s+(.+?)\s*$", prefix))
+    heading = headings[-1].group(1) if headings else ""
+    normalized_heading = re.sub(r"[`*_]", "", heading).casefold()
+    if "local ai" in normalized_heading:
+        return 0
+    if "dgx spark" in normalized_heading or "gb10" in normalized_heading:
+        return 4
+    section_start = headings[-1].end() if headings else 0
+    section = prefix[section_start:]
+    if re.search(r"\b(?:dgx\s+spark|gb10)\b", section, flags=re.I):
+        return 2
+    return 0
+
+
+def _safe_card_data(value: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key in SAFE_CARD_DATA_KEYS:
+        item = value.get(key)
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            if item is not None:
+                safe[key] = item
+        elif isinstance(item, list):
+            scalar_items = [
+                entry for entry in item if isinstance(entry, (str, int, float, bool))
+            ]
+            if scalar_items:
+                safe[key] = scalar_items[:100]
+    return safe
+
+
+def _extract_card_data(card_text: str, warnings: list[str]) -> dict[str, Any]:
+    if not card_text.startswith("---"):
+        return {}
+    try:
+        serialized = ModelCard(card_text).data.to_dict()
+    except (TypeError, ValueError, YAMLError):
+        warnings.append("README.md contains invalid model card metadata")
+        return {}
+    return _safe_card_data(serialized if isinstance(serialized, dict) else {})
+
+
+def _target_model_ids(card_data: dict[str, Any]) -> list[str]:
+    targets: list[str] = []
+    for key in TARGET_MODEL_KEYS:
+        value = card_data.get(key)
+        candidates = value if isinstance(value, list) else [value]
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            normalized = candidate.strip()
+            if not REPOSITORY_ID.fullmatch(normalized):
+                continue
+            if normalized not in targets:
+                targets.append(normalized)
+    return targets
+
+
+def _speculative_method(card_data: dict[str, Any]) -> str | None:
+    for key in SPECULATIVE_METHOD_KEYS:
+        value = card_data.get(key)
+        if isinstance(value, str):
+            normalized = value.strip().casefold().replace("-", "_")
+            if normalized in SPECULATIVE_METHODS:
+                return normalized
+    # DSpark and DFlash releases are external draft checkpoints. Their cards
+    # often describe the strategy in tags instead of a structured field.
+    hints: list[str] = []
+    model_name = card_data.get("model_name")
+    if isinstance(model_name, str):
+        hints.append(model_name)
+    tags = card_data.get("tags")
+    if isinstance(tags, list):
+        hints.extend(item for item in tags if isinstance(item, str))
+    hint_text = " ".join(hints).casefold().replace("-", "_")
+    if "dspark" in hint_text:
+        return "dspark"
+    if "dflash" in hint_text:
+        return "dflash"
+    return None
+
+
+def _card_values(
+    card_text: str, warnings: list[str]
+) -> tuple[dict[str, int | float | bool | str], dict[str, Any]]:
+    deployment: dict[str, int | float | bool | str] = {}
+    deployment_scores: dict[str, int] = {}
+    generation: dict[str, Any] = {}
+    for fence in iter_fences(card_text):
+        language = fence.language.casefold()
+        if not fence.closed and language in {"bash", "sh", "shell"}:
+            warnings.append("README.md contains a malformed shell fence")
+            continue
+        body = fence.body
+        if language in {"bash", "sh", "shell"}:
+            try:
+                shell_values = _extract_shell_values(body)
+                score = _deployment_fence_score(card_text, fence)
+                for key, value in shell_values.items():
+                    previous_score = deployment_scores.get(key, -1)
+                    if score > previous_score or (
+                        score == previous_score == 0 and key != "num_speculative_tokens"
+                    ):
+                        deployment[key] = value
+                        deployment_scores[key] = score
+            except ValueError:
+                warnings.append("README.md contains a malformed shell fence")
+        elif language == "json":
+            try:
+                value = json.loads(body, parse_constant=_reject_json_constant)
+            except (ValueError, RecursionError):
+                warnings.append("README.md contains a malformed JSON fence")
+                continue
+            if isinstance(value, dict):
+                generation.update(_extract_generation_values(value))
+    if any(score > 0 for score in deployment_scores.values()):
+        for key in list(deployment):
+            if deployment_scores.get(key) == 0:
+                del deployment[key]
+    return deployment, generation
+
+
+class ModelEvidenceLoader:
+    def __init__(self, card_max_chars: int = 100_000):
+        if (
+            isinstance(card_max_chars, bool)
+            or not isinstance(card_max_chars, int)
+            or not 1 <= card_max_chars <= MAX_CARD_CHARS
+        ):
+            raise ValueError(f"card_max_chars must be between 1 and {MAX_CARD_CHARS}")
+        self.card_max_chars = card_max_chars
+
+    def load(self, model_path: Path | str) -> ModelEvidence:
+        return self._load(model_path, card_text_override=None)
+
+    def load_with_card(
+        self, model_path: Path | str, card_text: str
+    ) -> ModelEvidence:
+        if not isinstance(card_text, str):
+            raise ValueError("card_text must be a string")
+        return self._load(model_path, card_text_override=card_text)
+
+    def _load(
+        self,
+        model_path: Path | str,
+        *,
+        card_text_override: str | None,
+    ) -> ModelEvidence:
+        supplied_path = Path(model_path)
+        if not supplied_path.exists() or not supplied_path.is_dir():
+            raise ValueError("model directory must exist")
+        if supplied_path.is_symlink():
+            raise ValueError("model directory must not be a symlink")
+        try:
+            model_root = supplied_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("model directory could not be resolved safely") from exc
+        evidence_root = Path(os.path.abspath(supplied_path))
+        warnings: list[str] = []
+        config = _read_json_dict(evidence_root, "config.json", warnings)
+        weight_index = _read_json_dict(
+            evidence_root, "model.safetensors.index.json", warnings
+        )
+        generation_config = _read_json_dict(
+            evidence_root, "generation_config.json", warnings
+        )
+        if card_text_override is None:
+            raw_card_text = _read_card(evidence_root, self.card_max_chars, warnings)
+        else:
+            raw_card_text = card_text_override[: self.card_max_chars]
+            if len(card_text_override) > self.card_max_chars:
+                warnings.append("Remote model card was truncated to configured limit")
+        card_data = _extract_card_data(raw_card_text, warnings)
+        card_deployment_values, card_generation_values = _card_values(raw_card_text, warnings)
+        card_text = _sanitize_shell_fences(raw_card_text)
+        local_generation_values = _extract_generation_values(generation_config)
+        fingerprint, tokenizer_warnings = _tokenizer_fingerprint(evidence_root)
+        warnings.extend(tokenizer_warnings)
+        targets = _target_model_ids(card_data)
+        method = _speculative_method(card_data)
+        weight_map = weight_index.get("weight_map")
+        embedded_mtp_available = (
+            isinstance(weight_map, dict)
+            and any(isinstance(key, str) and key.startswith("mtp.") for key in weight_map)
+        ) or _safe_nonempty_model_file_exists(
+            evidence_root, "model-mtp.safetensors", warnings
+        )
+        hash_payload = {
+            "config": config,
+            "generation_config": generation_config,
+            "tokenizer_fingerprint": fingerprint,
+            "card_text": card_text,
+            "card_data": card_data,
+            "card_deployment_values": card_deployment_values,
+            "card_generation_values": card_generation_values,
+            "local_generation_values": local_generation_values,
+            "target_model_ids": targets,
+            "speculative_method": method,
+            "embedded_mtp_available": embedded_mtp_available,
+        }
+        evidence_hash = hashlib.sha256(
+            json.dumps(
+                hash_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        return ModelEvidence(
+            model_path=str(model_root),
+            config=config,
+            generation_config=generation_config,
+            tokenizer_fingerprint=fingerprint,
+            card_text=card_text,
+            card_data=card_data,
+            card_deployment_values=card_deployment_values,
+            card_generation_values=card_generation_values,
+            local_generation_values=local_generation_values,
+            target_model_ids=targets,
+            speculative_method=method,
+            embedded_mtp_available=embedded_mtp_available,
+            evidence_hash=evidence_hash,
+            warnings=warnings,
+        )
