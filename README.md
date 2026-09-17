@@ -156,13 +156,17 @@ DGX Spark 的系统与 GPU 共用统一内存。部署时应同时考虑模型�
 
 | 接口 | 用途 |
 | --- | --- |
-| `GET /v1/models` | 获取运行中且健康的模型路由、上下文、输出上限和模态信息 |
+| `GET /v1/models` | 获取运行中且健康的模型路由、上下文、输出上限和模态信息；配置上游网关后一并列出上游模型 |
 | `GET /v1/models/{model}` | 获取指定路由的信息 |
 | `POST /v1/chat/completions` | 聊天、工具调用和 SSE 流式响应 |
 | `POST /v1/completions` | 文本补全 |
 | `POST /v1/embeddings` | 向支持嵌入能力的实例发送请求 |
 
-网关 Key 在创建时返回原文，数据库仅保存哈希；它与 Hugging Face Token、在线 AI 服务密钥分别管理。请求显式提供的生成参数优先，部署保存的默认值仅填充未提供且运行时支持的字段。
+网关 Key 在创建时返回原文，数据库仅保存哈希；它与 Hugging Face Token、在线 AI 服务密钥分别管理。
+
+本机没有的模型可以转发到上游 OpenAI 兼容网关：在「API 网关」页配置 Base URL 与密钥后，
+`/v1/models` 会同时列出上游模型（标记 `dgx_source: upstream`），本机同名路由优先；上游不可用时
+本地模型列表不受影响。未配置上游时，请求未知模型仍返回 404。请求显式提供的生成参数优先，部署保存的默认值仅填充未提供且运行时支持的字段。
 
 ### Python 流式调用
 
@@ -236,6 +240,8 @@ Compose 的常用配置位于 `.env`，完整示例见 [`.env.example`](.env.exa
 | `PUID` / `PGID` | 管理器进程用户与用户组 |
 | `DOCKER_GID` / `OPS_AGENT_GID` | Docker socket 和 Host Agent 访问组 |
 | `DGX_DEPLOYMENT_STARTUP_TIMEOUT_SECONDS` | 模型部署启动等待时间，默认 `1200` 秒 |
+| `DGX_FALLBACK_BASE_URL` / `DGX_FALLBACK_API_KEY` | 上游 OpenAI 兼容网关的默认值；通常直接在面板「API 网关」页配置，面板值优先且无需重启容器 |
+| `DGX_UPSTREAM_MODELS_CACHE_SECONDS` | 上游模型列表缓存时间，默认 `30` 秒 |
 
 Compose 数据库位于 `./data/manager.db`，模型文件保存在配置的宿主机目录。其他后端设置见 [`backend/app/config.py`](backend/app/config.py)；新增环境配置时，也需要将其显式传给 Compose 服务，不能仅假定写入 `.env` 就会进入容器。
 

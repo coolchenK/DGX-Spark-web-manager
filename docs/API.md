@@ -114,9 +114,32 @@ media request.
 | POST | `/api/keys` | Create and reveal a gateway key once |
 | DELETE | `/api/keys/{id}` | Revoke a gateway key |
 | GET | `/api/audit` | Audit history |
+| GET | `/api/gateway/upstream` | Effective upstream gateway configuration (never the key) |
+| PUT | `/api/gateway/upstream` | Store or clear the encrypted upstream base URL and key |
+| POST | `/api/gateway/upstream/test` | Probe the upstream `/v1/models` endpoint |
 | GET | `/api/settings` | Non-secret manager configuration |
 | PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
 | DELETE | `/api/settings/alerts-diagnostics-history` | Physically clear failed-task and AI operations history |
+
+### Upstream gateway
+
+When a request names a model this manager does not host, the gateway forwards it to an
+OpenAI-compatible upstream. Configure it from the panel or with the `DGX_FALLBACK_BASE_URL` /
+`DGX_FALLBACK_API_KEY` environment pair; a value stored through the API wins over the environment,
+and clearing it falls back to the environment again.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/gateway/upstream` | Returns `base_url`, `api_key_configured`, `source` (`database`/`environment`/`unset`) and `enabled`. Never returns the key. |
+| PUT | `/api/gateway/upstream` | `{"base_url": "https://host/v1", "api_key": "..."}`. An explicit `"base_url": null` clears the stored configuration. Omitting `api_key` keeps the stored key; sending `""` clears only the key. Invalid URLs are rejected with 422. |
+| POST | `/api/gateway/upstream/test` | Probes `{base_url}/v1/models` and returns `status` (`ok`/`unavailable`/`unset`), `latency_ms`, `model_count` and a bounded `detail`. |
+
+Both a bare host and a value already carrying `/v1` are accepted: `https://host` and
+`https://host/v1` both resolve to `https://host/v1/<endpoint>` on the wire.
+
+Configuration changes are recorded as the `gateway.upstream.update` audit action and probe results
+as `gateway.upstream.test`. Individual forwarded requests are not audited; they are accounted for
+by gateway request metrics instead.
 
 ### Deployment TPS benchmarks
 
@@ -559,10 +582,20 @@ and resource checks. An edit uses a health-gated container replacement and rollb
 - `POST /v1/completions`
 - `POST /v1/embeddings` for deployments advertising `embedding`
 
-`GET /v1/models` lists only running, healthy deployments. The gateway replaces the requested route
-name with the selected deployment's upstream `api_model_name`. SSE bytes are relayed without
-buffering, upstream status/content types are preserved, and manager-generated failures use the
-standard OpenAI `error` object.
+`GET /v1/models` lists running, healthy local deployments, and appends the models published by the
+configured upstream gateway. Upstream entries carry `owned_by: "upstream"` and
+`dgx_source: "upstream"`; a local route with the same name always wins, so an upstream model can
+never shadow a hosted instance. Only the model id is known for an upstream entry, so its
+capability and limit fields are reported as empty or null rather than guessed. The response also
+carries an additive `upstream` object with `status` (`ok`/`unavailable`/`unset`) and a bounded
+`detail`; an unreachable upstream never removes local models from the list. Results are cached for
+`DGX_UPSTREAM_MODELS_CACHE_SECONDS` (default 30).
+
+The gateway replaces the requested route name with the selected deployment's upstream
+`api_model_name`. SSE bytes are relayed without buffering, upstream status/content types are
+preserved, and manager-generated failures use the standard OpenAI `error` object. Requests for an
+unknown model are forwarded verbatim to the upstream gateway when one is configured, and return
+404 otherwise.
 
 The public Chat Completions contract accepts OpenAI `developer` messages. A runtime adapter converts
 that role to the legacy `system` equivalent only in requests sent to local SGLang, vLLM, and
