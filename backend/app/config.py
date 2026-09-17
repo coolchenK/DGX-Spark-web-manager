@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     fallback_base_url: str | None = None
     fallback_api_key: str | None = None
     upstream_models_cache_seconds: int = Field(default=30, ge=5, le=600)
+    # Window used for the gateway token-throughput reading. A one-minute window
+    # reads zero for any interactive workload that pauses between turns.
+    gateway_throughput_window_seconds: int = Field(default=300, ge=60, le=3600)
     model_roots: str = "/models,/root/.cache/huggingface/hub"
     model_root_mappings: str = ""
     hf_cache_dir: Path = Path("/root/.cache/huggingface/hub")

@@ -112,6 +112,7 @@ export interface GatewayStats {
   completion_tokens: number
   requests_last_minute: number
   tokens_per_second: number
+  throughput_window_seconds: number
   active_requests: number
 }
 

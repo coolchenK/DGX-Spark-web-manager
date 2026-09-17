@@ -242,6 +242,7 @@ Compose 的常用配置位于 `.env`，完整示例见 [`.env.example`](.env.exa
 | `DGX_DEPLOYMENT_STARTUP_TIMEOUT_SECONDS` | 模型部署启动等待时间，默认 `1200` 秒 |
 | `DGX_FALLBACK_BASE_URL` / `DGX_FALLBACK_API_KEY` | 上游 OpenAI 兼容网关的默认值；通常直接在面板「API 网关」页配置，面板值优先且无需重启容器 |
 | `DGX_UPSTREAM_MODELS_CACHE_SECONDS` | 上游模型列表缓存时间，默认 `30` 秒 |
+| `DGX_GATEWAY_THROUGHPUT_WINDOW_SECONDS` | API 网关 Token 吞吐的采样窗口，默认 `300` 秒；面板标签会显示该窗口 |
 
 Compose 数据库位于 `./data/manager.db`，模型文件保存在配置的宿主机目录。其他后端设置见 [`backend/app/config.py`](backend/app/config.py)；新增环境配置时，也需要将其显式传给 Compose 服务，不能仅假定写入 `.env` 就会进入容器。
 

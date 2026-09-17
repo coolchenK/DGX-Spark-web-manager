@@ -121,6 +121,18 @@ media request.
 | PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
 | DELETE | `/api/settings/alerts-diagnostics-history` | Physically clear failed-task and AI operations history |
 
+### Gateway metrics
+
+`GET /api/gateway/stats` aggregates `request_metrics` rows. Every inference entry point is
+metered, including local `/v1/responses` traffic and requests forwarded to the upstream gateway,
+and each records the OpenAI `usage` when the response or SSE stream carries it. `active_requests`
+is the live in-flight count across local, Responses, and forwarded requests, so it reads 0 for an
+idle gateway.
+
+`tokens_per_second` is averaged over the last `DGX_GATEWAY_THROUGHPUT_WINDOW_SECONDS` (default
+300) and the response reports that window as `throughput_window_seconds`; the panel labels the
+reading with it. `requests_last_minute` always uses a fixed one-minute window.
+
 ### Upstream gateway
 
 When a request names a model this manager does not host, the gateway forwards it to an

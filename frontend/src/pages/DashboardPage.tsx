@@ -84,7 +84,7 @@ export function DashboardPage() {
         <div><span>最近一分钟请求</span><strong>{stats.data?.requests_last_minute ?? 0}</strong></div>
         <div><span>当前并发</span><strong>{stats.data?.active_requests ?? 0}</strong></div>
         <div><span>错误率</span><strong>{((stats.data?.error_rate ?? 0) * 100).toFixed(1)}%</strong></div>
-        <div><span>Token 吞吐</span><strong>{stats.data?.tokens_per_second ?? 0}/s</strong></div>
+        <div><span>Token 吞吐（{Math.round((stats.data?.throughput_window_seconds ?? 300) / 60)} 分钟）</span><strong>{stats.data?.tokens_per_second ?? 0}/s</strong></div>
       </section>
       {(tasks.data?.some((task) => task.status === 'failed') || diagnostics.data?.[0]) && <section className="content-section"><div className="section-heading"><div><h2>告警与诊断</h2><p>仅显示真实任务和 AI 诊断记录</p></div></div><Space direction="vertical" size={10} className="dashboard-alerts">{tasks.data?.filter((task) => task.status === 'failed').slice(0, 2).map((task) => <Alert key={task.id} type="error" showIcon message={task.title} description={task.error ?? '任务执行失败'} />)}{diagnostics.data?.slice(0, 2).map((plan) => <Alert key={plan.id} type={plan.status === 'pending' ? 'warning' : 'info'} showIcon message={plan.summary} description={`${plan.status} · ${plan.diagnosis}`} />)}</Space></section>}
     </div>

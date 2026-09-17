@@ -20,6 +20,7 @@ const stats: GatewayStats = {
   completion_tokens: 0,
   requests_last_minute: 0,
   tokens_per_second: 0,
+  throughput_window_seconds: 300,
   active_requests: 0,
 }
 

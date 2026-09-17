@@ -1,7 +1,7 @@
 import json
 import time
 from collections import defaultdict
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from threading import Lock
 from typing import Annotated, Any
@@ -717,11 +717,58 @@ async def openai_model(model: str, request: Request, key: GatewayKey, db: Gatewa
     return openai_error(f"Model '{model}' was not found or is not healthy", status_code=404)
 
 
+def _track_activity(request: Request) -> Callable[[], None]:
+    """Count one in-flight gateway request and return an idempotent release.
+
+    Every inference entry point uses this so local, Responses, and forwarded
+    upstream traffic all contribute to the reported concurrency.
+    """
+    activity: GatewayActivity = request.app.state.gateway_activity
+    activity.start()
+    finished = False
+    finish_lock = Lock()
+
+    def finish() -> None:
+        nonlocal finished
+        with finish_lock:
+            if finished:
+                return
+            finished = True
+        activity.finish()
+
+    return finish
+
+
 async def _proxy(
     endpoint: str,
     request: Request,
     db: Session,
     required_capability: str,
+) -> Any:
+    """Track concurrency across every routing outcome of one inference request.
+
+    Streaming responses release the slot when their relay finishes, so the
+    handler itself only releases the non-streaming paths.
+    """
+    finish_request = _track_activity(request)
+    try:
+        response = await _dispatch_proxy(
+            endpoint, request, db, required_capability, finish_request
+        )
+    except Exception:
+        finish_request()
+        raise
+    if not isinstance(response, StreamingResponse):
+        finish_request()
+    return response
+
+
+async def _dispatch_proxy(
+    endpoint: str,
+    request: Request,
+    db: Session,
+    required_capability: str,
+    on_finished: Callable[[], None],
 ) -> Any:
     try:
         body = await request.json()
@@ -758,7 +805,9 @@ async def _proxy(
                 status_code=400,
             )
         # Not hosted here: forward to the configured upstream gateway.
-        return await _proxy_fallback(request, db, endpoint, normalized_body)
+        return await _proxy_fallback(
+            request, db, endpoint, normalized_body, on_finished=on_finished
+        )
     adapter = adapter_for_runtime(deployment.runtime)
     normalized_body = adapter.adapt_request(endpoint, normalized_body).body
     defaults, supported = deployment_generation_settings(deployment)
@@ -788,31 +837,14 @@ async def _proxy(
             },
         )
         db.commit()
-    activity: GatewayActivity = request.app.state.gateway_activity
-    activity.start()
-    finished = False
-    finish_lock = Lock()
-
-    def finish_request() -> None:
-        nonlocal finished
-        with finish_lock:
-            if finished:
-                return
-            finished = True
-        activity.finish()
-
-    try:
-        return await proxy_openai_request(
-            request,
-            deployment,
-            endpoint,
-            merged_body,
-            adapter,
-            on_finished=finish_request,
-        )
-    except Exception:
-        finish_request()
-        raise
+    return await proxy_openai_request(
+        request,
+        deployment,
+        endpoint,
+        merged_body,
+        adapter,
+        on_finished=on_finished,
+    )
 
 
 def _fallback_headers(config: UpstreamGatewayConfig) -> dict[str, str]:
@@ -827,6 +859,7 @@ async def _proxy_fallback(
     db: GatewayDb,
     endpoint: str,
     body: Mapping[str, Any],
+    on_finished: Callable[[], None] | None = None,
 ) -> Response:
     """Forward a request for a non-local model to the configured upstream gateway.
 
@@ -876,6 +909,8 @@ async def _proxy_fallback(
             status_code=502,
             started_at=started_at,
         )
+        if on_finished:
+            on_finished()
         return openai_error(
             f"Fallback gateway is unavailable: {exc}", status_code=502
         )
@@ -894,6 +929,8 @@ async def _proxy_fallback(
             started_at=started_at,
             usage=extract_usage_from_json(content),
         )
+        if on_finished:
+            on_finished()
         return Response(content=content, status_code=status_code, media_type=content_type)
 
     scanner = UsageScanner()
@@ -914,6 +951,8 @@ async def _proxy_fallback(
                 started_at=started_at,
                 usage=scanner.usage,
             )
+            if on_finished:
+                on_finished()
 
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     if content_type := upstream.headers.get("content-type"):
@@ -943,14 +982,21 @@ async def embeddings(request: Request, _: GatewayKey, db: GatewayDb):
 async def _translate_responses_stream(
     upstream: httpx.Response,
     translator: ResponsesStreamTranslator,
+    on_raw_chunk: Callable[[bytes], None] | None = None,
 ) -> AsyncIterator[bytes]:
-    """Re-express an upstream chat SSE stream as Responses SSE frames."""
+    """Re-express an upstream chat SSE stream as Responses SSE frames.
+
+    `on_raw_chunk` observes the untouched upstream bytes so callers can meter
+    usage without altering what is relayed.
+    """
     for frame in translator.start():
         yield frame
 
     buffer = b""
     try:
         async for chunk in upstream.aiter_bytes():
+            if on_raw_chunk is not None:
+                on_raw_chunk(chunk)
             buffer += chunk
             events, buffer = parse_chat_sse_frames(buffer)
             for event in events:
@@ -972,10 +1018,27 @@ async def _translate_responses_stream(
 @router.post(RESPONSES_ENDPOINT)
 async def responses(
     request: Request,
-    _: GatewayKey,
+    key: GatewayKey,
     db: GatewayDb,
 ):
     """OpenAI Responses API endpoint backed by the managed chat runtimes."""
+    finish_request = _track_activity(request)
+    try:
+        response = await _dispatch_responses(request, key, db, finish_request)
+    except Exception:
+        finish_request()
+        raise
+    if not isinstance(response, StreamingResponse):
+        finish_request()
+    return response
+
+
+async def _dispatch_responses(
+    request: Request,
+    _: GatewayKey,
+    db: GatewayDb,
+    on_finished: Callable[[], None],
+) -> Any:
     try:
         body = await request.json()
     except ValueError:
@@ -990,7 +1053,9 @@ async def responses(
     if not deployment:
         # Not hosted here: hand the request to the configured upstream gateway,
         # which speaks the same Responses wire API.
-        return await _proxy_fallback(request, db, RESPONSES_ENDPOINT, body)
+        return await _proxy_fallback(
+            request, db, RESPONSES_ENDPOINT, body, on_finished=on_finished
+        )
 
     config = deployment.config if isinstance(deployment.config, Mapping) else {}
     spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
@@ -1019,10 +1084,19 @@ async def responses(
     upstream_request = client.build_request(
         "POST", f"{deployment.endpoint_url}/v1/chat/completions", json=upstream_body
     )
+    started_at = time.perf_counter()
     try:
         upstream = await client.send(upstream_request, stream=bool(upstream_body.get("stream")))
     except httpx.HTTPError as exc:
         await client.aclose()
+        record_request_metric(
+            request.app.state.database.session_factory,
+            model=deployment.api_model_name,
+            endpoint=RESPONSES_ENDPOINT,
+            status_code=502,
+            started_at=started_at,
+        )
+        on_finished()
         return openai_error(
             f"Upstream inference service is unavailable: {exc}", status_code=502
         )
@@ -1031,6 +1105,14 @@ async def responses(
         content = await upstream.aread()
         await upstream.aclose()
         await client.aclose()
+        record_request_metric(
+            request.app.state.database.session_factory,
+            model=deployment.api_model_name,
+            endpoint=RESPONSES_ENDPOINT,
+            status_code=upstream.status_code,
+            started_at=started_at,
+        )
+        on_finished()
         return Response(
             content=adapter.normalize_error(content, status_code=upstream.status_code),
             status_code=upstream.status_code,
@@ -1046,12 +1128,29 @@ async def responses(
         try:
             parsed = json.loads(payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
+            record_request_metric(
+                request.app.state.database.session_factory,
+                model=deployment.api_model_name,
+                endpoint=RESPONSES_ENDPOINT,
+                status_code=502,
+                started_at=started_at,
+            )
+            on_finished()
             return openai_error(
                 "Upstream inference service returned an unreadable response", status_code=502
             )
         translated = ResponsesTurnTranslator(model=deployment.api_model_name).from_chat_response(
             parsed
         )
+        record_request_metric(
+            request.app.state.database.session_factory,
+            model=deployment.api_model_name,
+            endpoint=RESPONSES_ENDPOINT,
+            status_code=upstream.status_code,
+            started_at=started_at,
+            usage=extract_usage_from_json(payload),
+        )
+        on_finished()
         return JSONResponse(content=translated)
 
     translator = ResponsesStreamTranslator(model=deployment.api_model_name)
@@ -1060,8 +1159,27 @@ async def responses(
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
     }
+    scanner = UsageScanner()
+
+    async def relay() -> AsyncIterator[bytes]:
+        try:
+            async for frame in _translate_responses_stream(
+                upstream, translator, scanner.feed
+            ):
+                yield frame
+        finally:
+            record_request_metric(
+                request.app.state.database.session_factory,
+                model=deployment.api_model_name,
+                endpoint=RESPONSES_ENDPOINT,
+                status_code=upstream.status_code,
+                started_at=started_at,
+                usage=scanner.usage,
+            )
+            on_finished()
+
     return StreamingResponse(
-        _translate_responses_stream(upstream, translator),
+        relay(),
         status_code=upstream.status_code,
         headers=headers,
     )
@@ -1091,16 +1209,20 @@ def gateway_stats(request: Request, _: Admin, db: GatewayDb) -> dict[str, Any]:
         db.scalar(select(func.count(RequestMetric.id)).where(RequestMetric.created_at >= cutoff))
         or 0
     )
+    window_seconds = request.app.state.settings.gateway_throughput_window_seconds
+    window_cutoff = datetime.now(UTC) - timedelta(seconds=window_seconds)
     recent_prompt_tokens = (
         db.scalar(
-            select(func.sum(RequestMetric.prompt_tokens)).where(RequestMetric.created_at >= cutoff)
+            select(func.sum(RequestMetric.prompt_tokens)).where(
+                RequestMetric.created_at >= window_cutoff
+            )
         )
         or 0
     )
     recent_completion_tokens = (
         db.scalar(
             select(func.sum(RequestMetric.completion_tokens)).where(
-                RequestMetric.created_at >= cutoff
+                RequestMetric.created_at >= window_cutoff
             )
         )
         or 0
@@ -1114,8 +1236,9 @@ def gateway_stats(request: Request, _: Admin, db: GatewayDb) -> dict[str, Any]:
         "completion_tokens": completion_tokens,
         "requests_last_minute": requests_last_minute,
         "tokens_per_second": round(
-            (recent_prompt_tokens + recent_completion_tokens) / 60,
+            (recent_prompt_tokens + recent_completion_tokens) / window_seconds,
             2,
         ),
+        "throughput_window_seconds": window_seconds,
         "active_requests": request.app.state.gateway_activity.current,
     }

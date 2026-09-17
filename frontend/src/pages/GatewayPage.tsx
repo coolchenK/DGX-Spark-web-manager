@@ -75,7 +75,7 @@ export function GatewayPage() {
   return (
     <div className="page-stack">
       <PageHeader title="API 网关" description="使用一个 OpenAI 兼容入口访问所有健康部署" extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>创建 API Key</Button>} />
-      <section className="gateway-summary"><Descriptions column={{ xs: 1, sm: 2, lg: 5 }} items={[{ key: 'base', label: 'Base URL', children: <Typography.Text code copyable>{baseUrl}</Typography.Text> }, { key: 'requests', label: '累计请求', children: stats.data?.total_requests ?? 0 }, { key: 'active', label: '当前并发', children: stats.data?.active_requests ?? 0 }, { key: 'throughput', label: 'Token 吞吐', children: `${stats.data?.tokens_per_second ?? 0}/s` }, { key: 'error', label: '错误率', children: `${((stats.data?.error_rate ?? 0) * 100).toFixed(1)}%` }]} /></section>
+      <section className="gateway-summary"><Descriptions column={{ xs: 1, sm: 2, lg: 5 }} items={[{ key: 'base', label: 'Base URL', children: <Typography.Text code copyable>{baseUrl}</Typography.Text> }, { key: 'requests', label: '累计请求', children: stats.data?.total_requests ?? 0 }, { key: 'active', label: '当前并发', children: stats.data?.active_requests ?? 0 }, { key: 'throughput', label: `Token 吞吐（${Math.round((stats.data?.throughput_window_seconds ?? 300) / 60)} 分钟）`, children: `${stats.data?.tokens_per_second ?? 0}/s` }, { key: 'error', label: '错误率', children: `${((stats.data?.error_rate ?? 0) * 100).toFixed(1)}%` }]} /></section>
       <section className="content-section">
         <div className="section-heading">
           <div>

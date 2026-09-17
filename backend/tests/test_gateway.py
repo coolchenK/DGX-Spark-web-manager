@@ -748,6 +748,140 @@ def test_gateway_activity_tracks_concurrent_requests():
     assert activity.current == 1
 
 
+def test_track_activity_counts_in_flight_request_and_releases_once():
+    from types import SimpleNamespace
+
+    activity = gateway.GatewayActivity()
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(gateway_activity=activity))
+    )
+
+    finish = gateway._track_activity(request)
+    assert activity.current == 1
+
+    finish()
+    finish()
+    assert activity.current == 0
+
+
+@respx.mock
+def test_fallback_request_is_counted_while_in_flight(client, settings):
+    settings.fallback_base_url = "https://upstream.test/v1"
+    key = _create_gateway_key(client)
+    observed: dict[str, int] = {}
+
+    def capture(_request):
+        observed["active"] = client.app.state.gateway_activity.current
+        return Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    respx.post("https://upstream.test/v1/chat/completions").mock(side_effect=capture)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "remote-only", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 200
+    assert observed["active"] == 1
+    assert client.app.state.gateway_activity.current == 0
+
+
+@respx.mock
+def test_local_responses_request_is_counted_while_in_flight(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    observed: dict[str, int] = {}
+
+    def capture(_request):
+        observed["active"] = client.app.state.gateway_activity.current
+        return Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 4},
+            },
+        )
+
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(side_effect=capture)
+
+    response = client.post(
+        "/v1/responses",
+        json={"model": "qwen-upstream", "input": "hi"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 200
+    assert observed["active"] == 1
+    assert client.app.state.gateway_activity.current == 0
+
+
+@respx.mock
+def test_local_responses_records_metric_with_token_usage(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 4},
+            },
+        )
+    )
+
+    response = client.post(
+        "/v1/responses",
+        json={"model": "qwen-upstream", "input": "hi"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 200
+
+    with client.app.state.database.session_factory() as db:
+        metric = db.query(RequestMetric).order_by(RequestMetric.created_at.desc()).first()
+        assert metric.endpoint == "/v1/responses"
+        assert metric.status_code == 200
+        assert metric.prompt_tokens == 7
+        assert metric.completion_tokens == 4
+
+
+@respx.mock
+def test_local_responses_stream_records_metric_and_releases_activity(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client)
+    sse = (
+        b'data: {"choices":[{"delta":{"content":"he"}}]}\n\n'
+        b'data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
+        return_value=Response(200, content=sse, headers={"content-type": "text/event-stream"})
+    )
+
+    response = client.post(
+        "/v1/responses",
+        json={"model": "qwen-upstream", "input": "hi", "stream": True},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 200
+    assert client.app.state.gateway_activity.current == 0
+
+    with client.app.state.database.session_factory() as db:
+        metric = db.query(RequestMetric).order_by(RequestMetric.created_at.desc()).first()
+        assert metric.endpoint == "/v1/responses"
+        assert metric.prompt_tokens == 9
+        assert metric.completion_tokens == 3
+
+
+
 def test_gateway_stats_include_recent_request_and_token_throughput(authenticated_client):
     with authenticated_client.app.state.database.session_factory() as db:
         db.add(
@@ -766,7 +900,9 @@ def test_gateway_stats_include_recent_request_and_token_throughput(authenticated
 
     assert response.status_code == 200
     assert response.json()["requests_last_minute"] == 1
-    assert response.json()["tokens_per_second"] == 3.0
+    # 180 tokens spread over the configured window (default 300 s).
+    assert response.json()["throughput_window_seconds"] == 300
+    assert response.json()["tokens_per_second"] == 0.6
     assert response.json()["active_requests"] == 0
 
 
