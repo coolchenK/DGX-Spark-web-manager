@@ -78,6 +78,60 @@ def openai_error(message: str, *, status_code: int, code: str | None = None) -> 
     )
 
 
+def extract_usage_from_json(content: bytes) -> dict[str, Any] | None:
+    """Return the OpenAI usage mapping from a JSON response body, if present."""
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if isinstance(parsed, dict) and isinstance(parsed.get("usage"), dict):
+        return parsed["usage"]
+    return None
+
+
+class UsageScanner:
+    """Collect the last usage mapping from an SSE byte stream without altering it.
+
+    The buffer only ever holds the unterminated tail of the stream, so memory
+    stays bounded even for very long completions. Callers forward every chunk
+    verbatim and read :attr:`usage` once the stream is complete.
+    """
+
+    MAX_BUFFER = 64 * 1024
+
+    def __init__(self) -> None:
+        self._buffer = b""
+        self.usage: dict[str, Any] | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        self._buffer += chunk
+        while True:
+            positions = [
+                (self._buffer.find(b"\n\n"), 2),
+                (self._buffer.find(b"\r\n\r\n"), 4),
+            ]
+            positions = [(index, length) for index, length in positions if index >= 0]
+            if not positions:
+                break
+            index, delimiter_length = min(positions)
+            frame = self._buffer[:index]
+            self._buffer = self._buffer[index + delimiter_length:]
+            for line in frame.replace(b"\r\n", b"\n").split(b"\n"):
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == b"[DONE]":
+                    continue
+                try:
+                    event = json.loads(payload)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(event, dict) and isinstance(event.get("usage"), dict):
+                    self.usage = event["usage"]
+        if len(self._buffer) > self.MAX_BUFFER:
+            self._buffer = self._buffer[-self.MAX_BUFFER:]
+
+
 def record_request_metric(
     session_factory: sessionmaker,
     *,
@@ -238,14 +292,7 @@ async def proxy_openai_request(
     content = await upstream.aread()
     await upstream.aclose()
     await client.aclose()
-    usage: dict[str, Any] | None = None
-    try:
-        parsed = json.loads(content)
-        if isinstance(parsed, dict):
-            if isinstance(parsed.get("usage"), dict):
-                usage = parsed["usage"]
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        pass
+    usage = extract_usage_from_json(content)
     record_request_metric(
         request.app.state.database.session_factory,
         model=deployment.api_model_name,

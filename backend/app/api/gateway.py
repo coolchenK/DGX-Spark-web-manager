@@ -17,6 +17,8 @@ from app.dependencies import Admin, get_db
 from app.gateway.adapters import adapter_for_runtime
 from app.gateway.proxy import (
     GENERATION_KEYS,
+    UsageScanner,
+    extract_usage_from_json,
     merge_generation_defaults,
     openai_error,
     proxy_openai_request,
@@ -41,6 +43,7 @@ from app.services.model_capabilities import (
     input_modalities,
     runtime_multimodal_parameters,
 )
+from app.services.upstream_gateway import upstream_request_url
 
 router = APIRouter(tags=["openai-gateway"])
 GatewayDb = Annotated[Session, Depends(get_db)]
@@ -814,7 +817,7 @@ async def _proxy_fallback(
     client = httpx.AsyncClient(timeout=upstream_inference_timeout(), trust_env=False)
     upstream_request = client.build_request(
         "POST",
-        f"{base_url}{endpoint}",
+        upstream_request_url(base_url, endpoint),
         json=forward_body,
         headers=forward_headers,
     )
@@ -845,12 +848,16 @@ async def _proxy_fallback(
             endpoint=endpoint,
             status_code=status_code,
             started_at=started_at,
+            usage=extract_usage_from_json(content),
         )
         return Response(content=content, status_code=status_code, media_type=content_type)
+
+    scanner = UsageScanner()
 
     async def relay() -> AsyncIterator[bytes]:
         try:
             async for chunk in upstream.aiter_bytes():
+                scanner.feed(chunk)
                 yield chunk
         finally:
             await upstream.aclose()
@@ -861,6 +868,7 @@ async def _proxy_fallback(
                 endpoint=endpoint,
                 status_code=upstream.status_code,
                 started_at=started_at,
+                usage=scanner.usage,
             )
 
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}

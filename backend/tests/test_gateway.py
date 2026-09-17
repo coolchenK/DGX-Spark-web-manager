@@ -1981,3 +1981,44 @@ def test_responses_stream_survives_upstream_error_status(client):
     assert response.status_code == 400
     assert response.json()["error"]["message"] == "Unexpected reasoning effort minimal."
 
+
+
+def test_extract_usage_from_json_returns_usage_mapping():
+    content = b'{"usage": {"prompt_tokens": 11, "completion_tokens": 7}}'
+
+    assert gateway_proxy.extract_usage_from_json(content) == {
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+    }
+
+
+def test_extract_usage_from_json_tolerates_non_json_and_missing_usage():
+    assert gateway_proxy.extract_usage_from_json(b"not json") is None
+    assert gateway_proxy.extract_usage_from_json(b'{"choices": []}') is None
+
+
+def test_usage_scanner_reads_usage_from_split_sse_frames():
+    scanner = gateway_proxy.UsageScanner()
+    scanner.feed(b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n')
+    assert scanner.usage is None
+
+    scanner.feed(b'data: {"choices":[],"usage":{"prompt_tokens":3,')
+    scanner.feed(b'"completion_tokens":9}}\n\n')
+    scanner.feed(b"data: [DONE]\n\n")
+
+    assert scanner.usage == {"prompt_tokens": 3, "completion_tokens": 9}
+
+
+def test_usage_scanner_ignores_frames_without_usage():
+    scanner = gateway_proxy.UsageScanner()
+    scanner.feed(b": keepalive\n\n")
+    scanner.feed(b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n')
+
+    assert scanner.usage is None
+
+
+def test_usage_scanner_keeps_buffer_bounded():
+    scanner = gateway_proxy.UsageScanner()
+    scanner.feed(b"x" * (gateway_proxy.UsageScanner.MAX_BUFFER * 2))
+
+    assert len(scanner._buffer) <= gateway_proxy.UsageScanner.MAX_BUFFER
