@@ -1,7 +1,5 @@
-import asyncio
 import json
 
-import httpx
 import respx
 from app.api import gateway
 from app.gateway import proxy as gateway_proxy

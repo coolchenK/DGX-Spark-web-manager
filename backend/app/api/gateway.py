@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.audit import record_audit
 from app.dependencies import Admin, get_db
@@ -43,7 +44,15 @@ from app.services.model_capabilities import (
     input_modalities,
     runtime_multimodal_parameters,
 )
-from app.services.upstream_gateway import upstream_request_url
+from app.services.upstream_gateway import (
+    UpstreamGatewayConfig,
+    UpstreamModelCache,
+    bounded_probe_detail,
+    fetch_upstream_models,
+    resolve_upstream_gateway,
+    upstream_model_entry,
+    upstream_request_url,
+)
 
 router = APIRouter(tags=["openai-gateway"])
 GatewayDb = Annotated[Session, Depends(get_db)]
@@ -468,7 +477,9 @@ def _model_catalog_entry(
 
 
 @router.get("/v1/models")
-def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
+async def openai_models(
+    request: Request, _: GatewayKey, db: GatewayDb
+) -> dict[str, Any]:
     deployments = _healthy_gateway_deployments(db)
     context_limits = {
         deployment.id: deployment_context_limits(deployment) for deployment in deployments
@@ -656,15 +667,51 @@ def openai_models(_: GatewayKey, db: GatewayDb) -> dict[str, Any]:
             "max_concurrency": route["max_concurrency"],
         }
         route["capability_names"] = capability_names
+
+    upstream_status = await _merge_upstream_models(request, db, routes)
     return {
         "object": "list",
         "data": list(routes.values()),
+        "upstream": upstream_status,
     }
 
 
+async def _merge_upstream_models(
+    request: Request,
+    db: Session,
+    routes: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Append upstream models to the local routes, local routes always winning.
+
+    An unreachable upstream must never break local model discovery, so failures
+    only surface through the additive `upstream` status field.
+    """
+    config = resolve_upstream_gateway(
+        db, request.app.state.secret_box, request.app.state.settings
+    )
+    if config is None:
+        return {"status": "unset", "detail": None}
+
+    cache: UpstreamModelCache = request.app.state.upstream_model_cache
+    models = cache.get(config.cache_key)
+    if models is None:
+        try:
+            models = await run_in_threadpool(fetch_upstream_models, config)
+        except (httpx.HTTPError, ValueError) as exc:
+            return {"status": "unavailable", "detail": bounded_probe_detail(exc)}
+        cache.set(config.cache_key, models)
+
+    for raw in models:
+        route_name = raw["id"]
+        if route_name in routes:
+            continue
+        routes[route_name] = upstream_model_entry(raw)
+    return {"status": "ok", "detail": None}
+
+
 @router.get("/v1/models/{model:path}")
-def openai_model(model: str, key: GatewayKey, db: GatewayDb) -> Any:
-    for item in openai_models(key, db)["data"]:
+async def openai_model(model: str, request: Request, key: GatewayKey, db: GatewayDb) -> Any:
+    for item in (await openai_models(request, key, db))["data"]:
         if item["id"] == model:
             return item
     return openai_error(f"Model '{model}' was not found or is not healthy", status_code=404)
@@ -768,16 +815,11 @@ async def _proxy(
         raise
 
 
-def _fallback_upstream(settings: Any) -> tuple[str, dict[str, str]] | None:
-    """Resolve the upstream gateway used for models this manager does not host."""
-    base_url = (getattr(settings, "fallback_base_url", None) or "").strip().rstrip("/")
-    if not base_url:
-        return None
-    headers: dict[str, str] = {}
-    api_key = (getattr(settings, "fallback_api_key", None) or "").strip()
-    if api_key:
-        headers["authorization"] = f"Bearer {api_key}"
-    return base_url, headers
+def _fallback_headers(config: UpstreamGatewayConfig) -> dict[str, str]:
+    """Build the upstream authorization header from the resolved configuration."""
+    if not config.api_key:
+        return {}
+    return {"authorization": f"Bearer {config.api_key}"}
 
 
 async def _proxy_fallback(
@@ -792,14 +834,16 @@ async def _proxy_fallback(
     verbatim. `authorization` is supplied by the fallback key when configured,
     otherwise the caller's own bearer token is reused.
     """
-    settings = request.app.state.settings
-    upstream_target = _fallback_upstream(settings)
-    if upstream_target is None:
+    config = resolve_upstream_gateway(
+        db, request.app.state.secret_box, request.app.state.settings
+    )
+    if config is None:
         return openai_error(
             f"Model '{body.get('model')}' was not found or is not healthy",
             status_code=404,
         )
-    base_url, fallback_headers = upstream_target
+    base_url = config.base_url
+    fallback_headers = _fallback_headers(config)
 
     forward_body = dict(body)
     forward_headers = {

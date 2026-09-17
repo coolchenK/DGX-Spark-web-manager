@@ -1,5 +1,4 @@
 import pytest
-import pytest
 import respx
 from httpx import Response
 
@@ -295,4 +294,138 @@ def test_config_change_invalidates_the_model_cache(authenticated_client):
     authenticated_client.put("/api/gateway/upstream", json={"base_url": "https://cache2.test/v1"})
 
     assert cache.get("whatever") is None
+
+def _seed_healthy_deployment(client, *, api_model_name="local-chat"):
+    from app.models import Deployment
+
+    with client.app.state.database.session_factory() as db:
+        db.add(
+            Deployment(
+                name=api_model_name,
+                # vLLM keeps the models endpoint free of the SGLang runtime
+                # capacity probe; the merge logic is runtime independent.
+                runtime="vllm",
+                endpoint_url="http://127.0.0.1:8001",
+                api_model_name=api_model_name,
+                status="running",
+                health="healthy",
+                managed=False,
+                config={},
+                capabilities=["chat", "completion"],
+            )
+        )
+        db.commit()
+    return api_model_name
+
+
+def _models(authenticated_client, key):
+    return authenticated_client.get(
+        "/v1/models", headers={"Authorization": f"Bearer {key}"}
+    ).json()
+
+
+@respx.mock
+def test_models_include_upstream_entries(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    _seed_healthy_deployment(authenticated_client)
+    authenticated_client.put(
+        "/api/gateway/upstream", json={"base_url": "https://up.test/v1", "api_key": "k"}
+    )
+    respx.get("https://up.test/v1/models").mock(
+        return_value=Response(
+            200, json={"object": "list", "data": [{"id": "remote-a"}, {"id": "remote-b"}]}
+        )
+    )
+
+    data = _models(authenticated_client, key)
+    ids = [item["id"] for item in data["data"]]
+    upstream = [item for item in data["data"] if item.get("dgx_source") == "upstream"]
+
+    assert {"local-chat", "remote-a", "remote-b"} <= set(ids)
+    assert len(upstream) == 2
+    assert all(item["owned_by"] == "upstream" for item in upstream)
+    assert all(item["capabilities"] == [] for item in upstream)
+    assert all(item["input_modalities"] == [] for item in upstream)
+    assert all(item["context_window"] is None for item in upstream)
+    assert data["upstream"] == {"status": "ok", "detail": None}
+
+
+@respx.mock
+def test_local_route_wins_over_a_same_named_upstream_model(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    _seed_healthy_deployment(authenticated_client, api_model_name="shared-name")
+    authenticated_client.put(
+        "/api/gateway/upstream", json={"base_url": "https://up.test/v1", "api_key": "k"}
+    )
+    respx.get("https://up.test/v1/models").mock(
+        return_value=Response(200, json={"object": "list", "data": [{"id": "shared-name"}]})
+    )
+
+    data = _models(authenticated_client, key)
+    matches = [item for item in data["data"] if item["id"] == "shared-name"]
+
+    assert len(matches) == 1
+    assert matches[0].get("dgx_source") != "upstream"
+    assert matches[0]["runtime"] == "vllm"
+
+
+@respx.mock
+def test_upstream_failure_keeps_local_models_available(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    _seed_healthy_deployment(authenticated_client)
+    authenticated_client.put(
+        "/api/gateway/upstream", json={"base_url": "https://up.test/v1", "api_key": "k"}
+    )
+    respx.get("https://up.test/v1/models").mock(return_value=Response(503, text="boom"))
+
+    data = _models(authenticated_client, key)
+
+    assert [item["id"] for item in data["data"]] == ["local-chat"]
+    assert data["upstream"]["status"] == "unavailable"
+
+
+def test_models_report_unset_upstream(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    _seed_healthy_deployment(authenticated_client)
+
+    data = _models(authenticated_client, key)
+
+    assert data["upstream"] == {"status": "unset", "detail": None}
+
+
+@respx.mock
+def test_upstream_models_come_from_cache_within_the_ttl(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    _seed_healthy_deployment(authenticated_client)
+    authenticated_client.put(
+        "/api/gateway/upstream", json={"base_url": "https://up.test/v1", "api_key": "k"}
+    )
+    route = respx.get("https://up.test/v1/models").mock(
+        return_value=Response(200, json={"object": "list", "data": [{"id": "remote-a"}]})
+    )
+
+    _models(authenticated_client, key)
+    _models(authenticated_client, key)
+
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_upstream_single_model_lookup_resolves(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    authenticated_client.put(
+        "/api/gateway/upstream", json={"base_url": "https://up.test/v1", "api_key": "k"}
+    )
+    respx.get("https://up.test/v1/models").mock(
+        return_value=Response(200, json={"object": "list", "data": [{"id": "remote-only"}]})
+    )
+
+    response = authenticated_client.get(
+        "/v1/models/remote-only", headers={"Authorization": f"Bearer {key}"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "remote-only"
+    assert response.json()["dgx_source"] == "upstream"
+
 
