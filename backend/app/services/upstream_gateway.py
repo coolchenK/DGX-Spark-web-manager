@@ -13,8 +13,10 @@ remain supported as the default seed for existing installations.
 
 from __future__ import annotations
 
+import json
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -28,10 +30,25 @@ from app.security import SecretBox
 
 BASE_URL_KEY = "upstream_base_url"
 API_KEY_KEY = "upstream_api_key"
+EXPOSURE_KEY = "upstream_model_exposure"
 MAX_BASE_URL_LENGTH = 500
+MAX_SELECTED_MODELS = 500
+MAX_MODEL_ID_LENGTH = 255
+MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 MODELS_TIMEOUT_SECONDS = 10.0
 MAX_PROBE_DETAIL_CHARS = 200
 V1_SUFFIX = "/v1"
+
+
+@dataclass(frozen=True)
+class UpstreamExposure:
+    """Which upstream models this gateway is allowed to advertise and serve."""
+
+    expose_all: bool = True
+    selected_models: frozenset[str] = field(default_factory=frozenset)
+
+    def allows(self, model_id: str) -> bool:
+        return self.expose_all or model_id in self.selected_models
 
 
 @dataclass(frozen=True)
@@ -39,11 +56,15 @@ class UpstreamGatewayConfig:
     base_url: str
     api_key: str | None
     source: Literal["database", "environment"]
+    exposure: UpstreamExposure = field(default_factory=UpstreamExposure)
 
     @property
     def cache_key(self) -> str:
         """Separate cache entries per upstream without storing the key itself."""
         return f"{self.base_url}|{len(self.api_key or '')}"
+
+    def allows_model(self, model_id: str) -> bool:
+        return self.exposure.allows(model_id)
 
 
 def upstream_api_root(base_url: str) -> str:
@@ -85,6 +106,73 @@ def validate_upstream_base_url(value: str) -> str:
     return candidate
 
 
+def validate_selected_models(values: Any) -> tuple[str, ...]:
+    """Validate the explicitly selected upstream model ids."""
+    if values is None:
+        return ()
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        raise ValueError("selected_models 必须是模型名列表")
+    normalized: list[str] = []
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError("selected_models 只能包含字符串")
+        name = item.strip()
+        if not name or len(name) > MAX_MODEL_ID_LENGTH or not MODEL_ID_PATTERN.fullmatch(name):
+            raise ValueError(f"非法的模型名：{item!r}")
+        if name not in normalized:
+            normalized.append(name)
+    if len(normalized) > MAX_SELECTED_MODELS:
+        raise ValueError(f"最多只能选择 {MAX_SELECTED_MODELS} 个上游模型")
+    return tuple(sorted(normalized))
+
+
+def read_upstream_exposure(db: Session, secret_box: SecretBox) -> UpstreamExposure:
+    """Read the stored exposure selection, defaulting to offering every model."""
+    stored = db.get(SecretSetting, EXPOSURE_KEY)
+    if stored is None:
+        return UpstreamExposure()
+    try:
+        payload = json.loads(secret_box.decrypt(stored.encrypted_value))
+    except (ValueError, json.JSONDecodeError):
+        return UpstreamExposure()
+    if not isinstance(payload, dict):
+        return UpstreamExposure()
+    expose_all = payload.get("expose_all")
+    try:
+        selected = validate_selected_models(payload.get("selected_models"))
+    except ValueError:
+        selected = ()
+    return UpstreamExposure(
+        expose_all=bool(expose_all) if isinstance(expose_all, bool) else True,
+        selected_models=frozenset(selected),
+    )
+
+
+def write_upstream_exposure(
+    db: Session,
+    secret_box: SecretBox,
+    *,
+    expose_all: bool,
+    selected_models: Any,
+) -> UpstreamExposure:
+    """Persist the exposure selection and return the normalized result."""
+    exposure = UpstreamExposure(
+        expose_all=bool(expose_all),
+        selected_models=frozenset(validate_selected_models(selected_models)),
+    )
+    payload = json.dumps(
+        {
+            "expose_all": exposure.expose_all,
+            "selected_models": sorted(exposure.selected_models),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    _write_secret(db, secret_box, EXPOSURE_KEY, payload)
+    db.flush()
+    return exposure
+
+
 def _read_secret(box: SecretBox, row: SecretSetting | None) -> str | None:
     if row is None:
         return None
@@ -102,12 +190,14 @@ def resolve_upstream_gateway(
     A value stored from the panel wins; environment variables are the default
     seed so installations configured through `.env` keep working.
     """
+    exposure = read_upstream_exposure(db, secret_box)
     stored_url = db.get(SecretSetting, BASE_URL_KEY)
     if stored_url is not None:
         return UpstreamGatewayConfig(
             base_url=secret_box.decrypt(stored_url.encrypted_value).rstrip("/"),
             api_key=_read_secret(secret_box, db.get(SecretSetting, API_KEY_KEY)),
             source="database",
+            exposure=exposure,
         )
     env_url = (settings.fallback_base_url or "").strip()
     if not env_url:
@@ -116,6 +206,7 @@ def resolve_upstream_gateway(
         base_url=env_url.rstrip("/"),
         api_key=(settings.fallback_api_key or "").strip() or None,
         source="environment",
+        exposure=exposure,
     )
 
 

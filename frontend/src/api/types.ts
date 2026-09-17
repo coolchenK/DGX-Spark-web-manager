@@ -131,6 +131,19 @@ export interface UpstreamGateway {
   api_key_configured: boolean
   source: 'database' | 'environment' | 'unset'
   enabled: boolean
+  expose_all: boolean
+  selected_models: string[]
+}
+
+export interface UpstreamModel {
+  id: string
+  exposed: boolean
+}
+
+export interface UpstreamModels {
+  status: 'ok' | 'unavailable' | 'unset'
+  detail: string | null
+  models: UpstreamModel[]
 }
 
 export interface UpstreamTestResult {

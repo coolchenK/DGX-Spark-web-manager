@@ -705,6 +705,9 @@ async def _merge_upstream_models(
         route_name = raw["id"]
         if route_name in routes:
             continue
+        if not config.allows_model(route_name):
+            # Hidden upstream models are neither advertised nor served.
+            continue
         routes[route_name] = upstream_model_entry(raw)
     return {"status": "ok", "detail": None}
 
@@ -870,9 +873,13 @@ async def _proxy_fallback(
     config = resolve_upstream_gateway(
         db, request.app.state.secret_box, request.app.state.settings
     )
-    if config is None:
+    requested_model = str(body.get("model"))
+    if config is None or not config.allows_model(requested_model):
+        # Not configured, or deliberately not offered by this gateway.
+        if on_finished:
+            on_finished()
         return openai_error(
-            f"Model '{body.get('model')}' was not found or is not healthy",
+            f"Model '{requested_model}' was not found or is not healthy",
             status_code=404,
         )
     base_url = config.base_url

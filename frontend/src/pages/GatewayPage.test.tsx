@@ -32,6 +32,7 @@ function renderPage(
 ) {
   vi.spyOn(api, 'get').mockImplementation((path: string) => {
     if (path === '/api/gateway/upstream') return Promise.resolve(upstream)
+    if (path === '/api/gateway/upstream/models') return Promise.resolve(discoveredModels)
     if (path === '/api/gateway/stats') return Promise.resolve(stats)
     return Promise.resolve(keys)
   })
@@ -64,6 +65,8 @@ const unsetUpstream: UpstreamGateway = {
   api_key_configured: false,
   source: 'unset',
   enabled: false,
+  expose_all: true,
+  selected_models: [],
 }
 
 const configuredUpstream: UpstreamGateway = {
@@ -71,6 +74,17 @@ const configuredUpstream: UpstreamGateway = {
   api_key_configured: true,
   source: 'database',
   enabled: true,
+  expose_all: true,
+  selected_models: [],
+}
+
+const discoveredModels = {
+  status: 'ok' as const,
+  detail: null,
+  models: [
+    { id: 'gpt-6-astra', exposed: true },
+    { id: 'gpt-5.6-luna', exposed: true },
+  ],
 }
 
 
@@ -156,6 +170,84 @@ describe('GatewayPage upstream section', () => {
       })
     })
   })
+
+describe('GatewayPage upstream model exposure', () => {
+  it('offers every discovered model and locks the individual switches in "all" mode', async () => {
+    renderPage(configuredUpstream)
+
+    expect(await screen.findByText('当前提供上游解析出的全部 2 个模型。')).toBeInTheDocument()
+    const switches = await screen.findAllByRole('switch')
+    expect(switches).toHaveLength(2)
+    for (const item of switches) {
+      expect(item).toBeChecked()
+      expect(item).toBeDisabled()
+    }
+  })
+
+  it('enables per-model选择 after switching to "仅提供所选"', async () => {
+    const { user } = renderPage(configuredUpstream)
+
+    await user.click(await screen.findByText('仅提供所选'))
+
+    const target = screen.getByRole('switch', { name: '在本网关提供 gpt-6-astra' })
+    expect(target).toBeEnabled()
+    expect(await screen.findByText('已选择 0 / 2 个模型。')).toBeInTheDocument()
+  })
+
+  it('keeps saving disabled until the selection changes', async () => {
+    const { user } = renderPage(configuredUpstream)
+
+    const saveButton = await screen.findByRole('button', { name: /保\s*存范围/ })
+    expect(saveButton).toBeDisabled()
+
+    await user.click(screen.getByText('仅提供所选'))
+
+    expect(saveButton).toBeEnabled()
+  })
+
+  it('saves the remaining selection after deselecting a model', async () => {
+    const { putSpy, user } = renderPage({
+      ...configuredUpstream,
+      expose_all: false,
+      selected_models: ['gpt-6-astra', 'gpt-5.6-luna'],
+    })
+
+    await user.click(await screen.findByRole('switch', { name: '在本网关提供 gpt-5.6-luna' }))
+    await user.click(screen.getByRole('button', { name: /保\s*存范围/ }))
+
+    await waitFor(() => {
+      expect(putSpy).toHaveBeenCalledWith('/api/gateway/upstream/exposure', {
+        expose_all: false,
+        selected_models: ['gpt-6-astra'],
+      })
+    })
+  })
+
+  it('warns when the selection would expose no model at all', async () => {
+    const { user } = renderPage({
+      ...configuredUpstream,
+      expose_all: false,
+      selected_models: ['gpt-6-astra'],
+    })
+
+    await user.click(await screen.findByRole('switch', { name: '在本网关提供 gpt-6-astra' }))
+
+    expect(await screen.findByText('当前没有选择任何模型')).toBeInTheDocument()
+  })
+
+  it('restores the stored selection for a partially exposed upstream', async () => {
+    renderPage({
+      ...configuredUpstream,
+      expose_all: false,
+      selected_models: ['gpt-6-astra'],
+    })
+
+    expect(await screen.findByText('已选择 1 / 2 个模型。')).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: '在本网关提供 gpt-6-astra' })).toBeChecked()
+    expect(screen.getByRole('switch', { name: '在本网关提供 gpt-5.6-luna' })).not.toBeChecked()
+    expect(screen.getByText('不提供')).toBeInTheDocument()
+  })
+})
 
   it('clears the configuration after confirmation', async () => {
     const { putSpy, user } = renderPage(configuredUpstream, {

@@ -117,6 +117,8 @@ media request.
 | GET | `/api/gateway/upstream` | Effective upstream gateway configuration (never the key) |
 | PUT | `/api/gateway/upstream` | Store or clear the encrypted upstream base URL and key |
 | POST | `/api/gateway/upstream/test` | Probe the upstream `/v1/models` endpoint |
+| GET | `/api/gateway/upstream/models` | Discovered upstream models with their `exposed` state |
+| PUT | `/api/gateway/upstream/exposure` | Choose which upstream models this gateway offers |
 | GET | `/api/settings` | Non-secret manager configuration |
 | PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
 | DELETE | `/api/settings/alerts-diagnostics-history` | Physically clear failed-task and AI operations history |
@@ -152,6 +154,20 @@ Both a bare host and a value already carrying `/v1` are accepted: `https://host`
 Configuration changes are recorded as the `gateway.upstream.update` audit action and probe results
 as `gateway.upstream.test`. Individual forwarded requests are not audited; they are accounted for
 by gateway request metrics instead.
+
+#### Model exposure
+
+`expose_all` defaults to `true`, which offers every model the upstream publishes and preserves the
+original forwarding behaviour. Setting `expose_all` to `false` restricts the gateway to
+`selected_models`; a newly published upstream model is then not offered until it is selected.
+
+`PUT /api/gateway/upstream/exposure` takes `{"expose_all": bool, "selected_models": [str]}`, is
+audited as `gateway.upstream.exposure.update`, and invalidates the cached model list. Model ids are
+validated for length and characters and the selection is capped.
+
+The selection gates discovery **and** calls: an unexposed model is absent from `GET /v1/models`,
+returns 404 from `GET /v1/models/{model}`, and is no longer forwarded upstream, so a client that
+already knows the name cannot bypass the choice.
 
 ### Deployment TPS benchmarks
 

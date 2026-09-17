@@ -163,3 +163,44 @@
 
 另修复了 `backend/tests/test_gateway.py` 中两个既有的未使用导入（`asyncio`、`httpx`），
 它们会让当前 main 的 CI `ruff check` 步骤失败。
+## 上游模型暴露选择（2026-09-18 追加）
+
+上游解析出的模型默认全部在本网关提供；管理员可以在「API 网关」页逐个选择是否提供。
+
+### 语义与默认值
+
+存储两种模式，在「新上游模型自动对外」的不可预期性与「升级即断流」之间取折中：
+
+- `expose_all = true`（默认）：提供上游解析出的全部模型，转发路径保持「未知模型一律转发」的既有行为。
+  默认取该值是为了不破坏已经依赖上游模型的现有部署，例如 Codex 使用的远程模型。
+- `expose_all = false`：只提供 `selected_models` 中的模型。
+
+新出现的上游模型在 `expose_all = false` 时不会自动提供，需要管理员显式选择。
+
+### 生效范围
+
+暴露选择同时约束**发现**与**调用**，否则开关只是装饰：
+
+- `GET /v1/models` 不列出未提供的上游模型。
+- `GET /v1/models/{model}` 对未提供的模型返回 404。
+- 请求未提供的上游模型**不再转发**，返回与其他隐藏部署一致的 404。
+
+### API 契约
+
+- `GET /api/gateway/upstream` 增加 `expose_all` 与 `selected_models`。
+- `GET /api/gateway/upstream/models` 返回实时解析到的模型及其 `exposed` 状态，供界面渲染开关；
+  上游不可用时返回 `status: unavailable`，不影响已保存的选择。
+- `PUT /api/gateway/upstream/exposure`：`{ "expose_all": bool, "selected_models": [str] }`。
+  模型名做长度与字符校验，数量有上界；写入审计 `gateway.upstream.exposure.update`。
+
+### 前端
+
+「上游网关」区块增加暴露选择：模式开关（提供全部 / 仅提供所选）+ 实时模型列表逐项开关 + 保存。
+`expose_all` 为真时列表显示为全部提供且不允许逐项取消，避免出现「全部提供但该项关闭」的矛盾状态。
+
+### 测试
+
+- 默认 `expose_all` 为真，升级后 `/v1/models` 与转发行为不变。
+- `expose_all = false` 时只列出且只转发所选模型，未选模型返回 404。
+- 选择持久化到数据库，重新读取一致；非法模型名与超量选择被拒绝。
+- 暴露变更写入审计，并使模型列表缓存失效。

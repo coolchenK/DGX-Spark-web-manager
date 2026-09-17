@@ -158,6 +158,10 @@ def test_get_reports_unset_when_nothing_is_configured(authenticated_client):
         "api_key_configured": False,
         "source": "unset",
         "enabled": False,
+        # Offering every discovered upstream model is the default so an upgrade
+        # never silently stops serving a model a client already uses.
+        "expose_all": True,
+        "selected_models": [],
     }
 
 
@@ -174,6 +178,8 @@ def test_database_configuration_wins_over_environment(authenticated_client, sett
         "api_key_configured": True,
         "source": "database",
         "enabled": True,
+        "expose_all": True,
+        "selected_models": [],
     }
 
 
@@ -193,6 +199,8 @@ def test_clearing_database_configuration_falls_back_to_environment(
         "api_key_configured": True,
         "source": "environment",
         "enabled": True,
+        "expose_all": True,
+        "selected_models": [],
     }
 
 
@@ -408,6 +416,209 @@ def test_upstream_models_come_from_cache_within_the_ttl(authenticated_client):
     _models(authenticated_client, key)
 
     assert route.call_count == 1
+
+
+def _configure_upstream(authenticated_client, base_url="https://up.test/v1"):
+    authenticated_client.put(
+        "/api/gateway/upstream", json={"base_url": base_url, "api_key": "k"}
+    )
+
+
+def _mock_models(ids, base_url="https://up.test/v1"):
+    respx.get(f"{base_url}/models").mock(
+        return_value=Response(200, json={"object": "list", "data": [{"id": i} for i in ids]})
+    )
+
+
+def test_exposure_defaults_to_offering_every_upstream_model(authenticated_client):
+    _configure_upstream(authenticated_client)
+    _mock_models(["a", "b"])
+
+    body = authenticated_client.get("/api/gateway/upstream").json()
+
+    assert body["expose_all"] is True
+    assert body["selected_models"] == []
+
+
+@respx.mock
+def test_upstream_models_endpoint_reports_exposure_state(authenticated_client):
+    _configure_upstream(authenticated_client)
+    _mock_models(["a", "b"])
+
+    body = authenticated_client.get("/api/gateway/upstream/models").json()
+
+    assert body["status"] == "ok"
+    assert body["models"] == [
+        {"id": "a", "exposed": True},
+        {"id": "b", "exposed": True},
+    ]
+
+
+def test_upstream_models_endpoint_reports_unset_without_configuration(authenticated_client):
+    assert authenticated_client.get("/api/gateway/upstream/models").json() == {
+        "status": "unset",
+        "models": [],
+        "detail": None,
+    }
+
+
+@respx.mock
+def test_upstream_models_endpoint_reports_unavailable_upstream(authenticated_client):
+    _configure_upstream(authenticated_client)
+    respx.get("https://up.test/v1/models").mock(return_value=Response(503))
+
+    body = authenticated_client.get("/api/gateway/upstream/models").json()
+
+    assert body["status"] == "unavailable"
+    assert body["models"] == []
+
+
+@respx.mock
+def test_selected_exposure_hides_and_blocks_unselected_models(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    _configure_upstream(authenticated_client)
+    _mock_models(["keep-me", "hide-me"])
+
+    updated = authenticated_client.put(
+        "/api/gateway/upstream/exposure",
+        json={"expose_all": False, "selected_models": ["keep-me"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json() == {"expose_all": False, "selected_models": ["keep-me"]}
+
+    listed = _models(authenticated_client, key)
+    upstream_ids = [m["id"] for m in listed["data"] if m.get("dgx_source") == "upstream"]
+    assert upstream_ids == ["keep-me"]
+
+    hidden = authenticated_client.get(
+        "/v1/models/hide-me", headers={"Authorization": f"Bearer {key}"}
+    )
+    assert hidden.status_code == 404
+
+    blocked = authenticated_client.post(
+        "/v1/chat/completions",
+        json={"model": "hide-me", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert blocked.status_code == 404
+    assert "hide-me" in blocked.json()["error"]["message"]
+
+
+@respx.mock
+def test_selected_model_is_still_forwarded(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    _configure_upstream(authenticated_client)
+    _mock_models(["keep-me"])
+    authenticated_client.put(
+        "/api/gateway/upstream/exposure",
+        json={"expose_all": False, "selected_models": ["keep-me"]},
+    )
+    respx.post("https://up.test/v1/chat/completions").mock(
+        return_value=Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            },
+        )
+    )
+
+    response = authenticated_client.post(
+        "/v1/chat/completions",
+        json={"model": "keep-me", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 200
+
+
+@respx.mock
+def test_selected_exposure_also_blocks_undiscovered_models(authenticated_client):
+    key = _create_gateway_key(authenticated_client)
+    _configure_upstream(authenticated_client)
+    _mock_models(["keep-me"])
+    authenticated_client.put(
+        "/api/gateway/upstream/exposure",
+        json={"expose_all": False, "selected_models": ["keep-me"]},
+    )
+
+    response = authenticated_client.post(
+        "/v1/chat/completions",
+        json={"model": "never-selected", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_exposure_rejects_invalid_model_names(authenticated_client):
+    response = authenticated_client.put(
+        "/api/gateway/upstream/exposure",
+        json={"expose_all": False, "selected_models": ["bad name!"]},
+    )
+
+    assert response.status_code == 422
+
+
+def test_exposure_rejects_too_many_models(authenticated_client):
+    response = authenticated_client.put(
+        "/api/gateway/upstream/exposure",
+        json={"expose_all": False, "selected_models": [f"m{i}" for i in range(501)]},
+    )
+
+    assert response.status_code == 422
+
+
+def test_exposure_selection_persists_and_is_deduplicated(authenticated_client):
+    authenticated_client.put(
+        "/api/gateway/upstream/exposure",
+        json={"expose_all": False, "selected_models": ["b", "a", "b"]},
+    )
+
+    assert authenticated_client.get("/api/gateway/upstream").json()["selected_models"] == ["a", "b"]
+
+
+def test_exposure_change_is_audited_and_invalidates_the_cache(authenticated_client):
+    cache = authenticated_client.app.state.upstream_model_cache
+    cache.set("stale", [{"id": "x"}])
+
+    authenticated_client.put(
+        "/api/gateway/upstream/exposure",
+        json={"expose_all": False, "selected_models": ["a"]},
+    )
+
+    assert cache.get("stale") is None
+    with authenticated_client.app.state.database.session_factory() as db:
+        from app.models import AuditEvent
+
+        actions = {row.action for row in db.query(AuditEvent).all()}
+    assert "gateway.upstream.exposure.update" in actions
+
+
+def test_exposure_requires_admin(client):
+    assert (
+        client.put(
+            "/api/gateway/upstream/exposure",
+            json={"expose_all": True, "selected_models": []},
+        ).status_code
+        == 401
+    )
+    assert client.get("/api/gateway/upstream/models").status_code == 401
+
+
+def test_exposure_requires_csrf(client):
+    login = client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "Test-password-1234"},
+    )
+    assert login.status_code == 200
+
+    response = client.put(
+        "/api/gateway/upstream/exposure", json={"expose_all": True, "selected_models": []}
+    )
+
+    assert response.status_code == 403
+
 
 
 @respx.mock

@@ -7,6 +7,7 @@ import { api } from '../api/client'
 import type { ApiKeyRecord, GatewayStats, UpstreamGateway, UpstreamTestResult } from '../api/types'
 import { PageHeader } from '../components/PageHeader'
 import { QueryState } from '../components/QueryState'
+import { UpstreamModelPicker } from '../components/UpstreamModelPicker'
 import { ResponsiveDataView } from '../components/ResponsiveDataView'
 import { formatDate } from '../utils/format'
 
@@ -112,6 +113,7 @@ export function GatewayPage() {
           )}
         </QueryState>
       </section>
+      <UpstreamModelPicker upstream={upstream.data} />
       <section className="content-section"><div className="section-heading"><div><h2>访问密钥</h2><p>密钥只在创建后显示一次</p></div></div><QueryState loading={keys.isLoading} error={keys.error} empty={!keys.data?.length}><ResponsiveDataView data={keys.data ?? []} rowKey="id" columns={[{ title: '名称', dataIndex: 'name' }, { title: '前缀', dataIndex: 'prefix', render: (value) => <Typography.Text code>{value}...</Typography.Text> }, { title: '创建时间', dataIndex: 'created_at', render: formatDate }, { title: '最后使用', dataIndex: 'last_used_at', render: formatDate }, { title: '状态', dataIndex: 'revoked_at', render: (value) => value ? '已吊销' : '有效' }, { title: '', render: (_, item) => !item.revoked_at && <Popconfirm title={`吊销 ${item.name}`} description="使用该密钥的客户端将立即无法调用网关。" onConfirm={() => revoke.mutate(item.id)}><Button danger size="small" icon={<DeleteOutlined />}>吊销</Button></Popconfirm> }]} renderMobile={(item) => <div className="mobile-record"><div className="primary-cell"><strong>{item.name}</strong><Typography.Text code>{item.prefix}...</Typography.Text></div><dl><div><dt>状态</dt><dd>{item.revoked_at ? '已吊销' : '有效'}</dd></div><div><dt>最后使用</dt><dd>{formatDate(item.last_used_at)}</dd></div></dl>{!item.revoked_at && <Popconfirm title={`吊销 ${item.name}`} description="使用该密钥的客户端将立即无法调用网关。" onConfirm={() => revoke.mutate(item.id)}><Button danger block icon={<DeleteOutlined />}>吊销</Button></Popconfirm>}</div>} /></QueryState></section>
       <section className="code-section"><div className="section-heading"><div><h2>Python SDK</h2><p>修改模型名称即可调用</p></div><Space wrap><Segmented value={exampleMode} onChange={(value) => setExampleMode(value as 'text' | 'image' | 'video')} options={[{ value: 'text', label: '文本', icon: <FileTextOutlined /> }, { value: 'image', label: '图片', icon: <PictureOutlined /> }, { value: 'video', label: '视频', icon: <VideoCameraOutlined /> }]} /><Button icon={<CopyOutlined />} aria-label="复制 API 示例" onClick={() => navigator.clipboard.writeText(example)} /></Space></div><pre><code>{example}</code></pre></section>
       <Modal title="创建 API Key" open={open} footer={null} onCancel={() => setOpen(false)} destroyOnClose><Form layout="vertical" onFinish={(values) => create.mutate(values)}><Form.Item name="name" label="名称" rules={[{ required: true }]}><Input prefix={<KeyOutlined />} placeholder="例如：开发机 SDK" /></Form.Item><Button type="primary" htmlType="submit" loading={create.isPending} block>创建</Button></Form></Modal>
