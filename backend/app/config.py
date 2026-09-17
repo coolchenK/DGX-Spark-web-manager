@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     admin_username: str = "admin"
     admin_password: str = Field(min_length=12)
     data_dir: Path = Path("./data")
+    # Upstream OpenAI-compatible gateway used for models this manager does not
+    # host. Requests for unknown model routes are forwarded verbatim so a single
+    # provider can expose both local and remote models.
+    fallback_base_url: str | None = None
+    fallback_api_key: str | None = None
     model_roots: str = "/models,/root/.cache/huggingface/hub"
     model_root_mappings: str = ""
     hf_cache_dir: Path = Path("/root/.cache/huggingface/hub")
@@ -40,8 +45,13 @@ class Settings(BaseSettings):
     memory_reserve_fraction: float = Field(default=0.10, ge=0.05, le=0.30)
     memory_reserve_min_bytes: int = Field(default=8 * 1024**3, ge=1024**3)
     allowed_vllm_images: str = (
-        "vllm/vllm-openai:v0.27.1,vllm/vllm-openai:muse-glimmer,"
+        "vllm/vllm-openai:v0.27.1,vllm/vllm-openai:muse-glimmer,vllm/vllm-openai:latest,"
         "ghcr.io/aeon-7/aeon-vllm-ultimate:latest,"
+        "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-07-reasoning-eos,"
+        "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-11-v0.29.0-omni,"
+        "dgx-local/aeon-vllm-ultimate:2026-09-11-dflash2-fix,"
+        "ghcr.io/lancelind/qwen38-flash-dgx:latest,"
+        "dgx-local/qwen38-shinrali-fp8-lmhead:870a7fc,"
         "dgx-local/supergemma4-awq:c4b36f"
     )
     allowed_sglang_images: str = (

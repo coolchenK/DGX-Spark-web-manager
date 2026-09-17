@@ -1,4 +1,5 @@
 import json
+import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from app.gateway.proxy import (
     merge_generation_defaults,
     openai_error,
     proxy_openai_request,
+    record_request_metric,
     upstream_inference_timeout,
 )
 from app.gateway.responses import (
@@ -705,7 +707,8 @@ async def _proxy(
                 f"runtime parameters: {requested}",
                 status_code=400,
             )
-        return openai_error(f"Model '{model}' was not found or is not healthy", status_code=404)
+        # Not hosted here: forward to the configured upstream gateway.
+        return await _proxy_fallback(request, db, endpoint, normalized_body)
     adapter = adapter_for_runtime(deployment.runtime)
     normalized_body = adapter.adapt_request(endpoint, normalized_body).body
     defaults, supported = deployment_generation_settings(deployment)
@@ -760,6 +763,110 @@ async def _proxy(
     except Exception:
         finish_request()
         raise
+
+
+def _fallback_upstream(settings: Any) -> tuple[str, dict[str, str]] | None:
+    """Resolve the upstream gateway used for models this manager does not host."""
+    base_url = (getattr(settings, "fallback_base_url", None) or "").strip().rstrip("/")
+    if not base_url:
+        return None
+    headers: dict[str, str] = {}
+    api_key = (getattr(settings, "fallback_api_key", None) or "").strip()
+    if api_key:
+        headers["authorization"] = f"Bearer {api_key}"
+    return base_url, headers
+
+
+async def _proxy_fallback(
+    request: Request,
+    db: GatewayDb,
+    endpoint: str,
+    body: Mapping[str, Any],
+) -> Response:
+    """Forward a request for a non-local model to the configured upstream gateway.
+
+    The fallback target speaks the same wire API, so the body is forwarded
+    verbatim. `authorization` is supplied by the fallback key when configured,
+    otherwise the caller's own bearer token is reused.
+    """
+    settings = request.app.state.settings
+    upstream_target = _fallback_upstream(settings)
+    if upstream_target is None:
+        return openai_error(
+            f"Model '{body.get('model')}' was not found or is not healthy",
+            status_code=404,
+        )
+    base_url, fallback_headers = upstream_target
+
+    forward_body = dict(body)
+    forward_headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in {"host", "content-length", "authorization", "accept-encoding"}
+    }
+    forward_headers.update(fallback_headers)
+    if "authorization" not in forward_headers:
+        caller_auth = request.headers.get("authorization")
+        if caller_auth:
+            forward_headers["authorization"] = caller_auth
+
+    started_at = time.perf_counter()
+    client = httpx.AsyncClient(timeout=upstream_inference_timeout(), trust_env=False)
+    upstream_request = client.build_request(
+        "POST",
+        f"{base_url}{endpoint}",
+        json=forward_body,
+        headers=forward_headers,
+    )
+    try:
+        upstream = await client.send(upstream_request, stream=bool(forward_body.get("stream")))
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        record_request_metric(
+            request.app.state.database.session_factory,
+            model=str(body.get("model")),
+            endpoint=endpoint,
+            status_code=502,
+            started_at=started_at,
+        )
+        return openai_error(
+            f"Fallback gateway is unavailable: {exc}", status_code=502
+        )
+
+    if not forward_body.get("stream"):
+        content = await upstream.aread()
+        status_code = upstream.status_code
+        content_type = upstream.headers.get("content-type", "application/json")
+        await upstream.aclose()
+        await client.aclose()
+        record_request_metric(
+            request.app.state.database.session_factory,
+            model=str(body.get("model")),
+            endpoint=endpoint,
+            status_code=status_code,
+            started_at=started_at,
+        )
+        return Response(content=content, status_code=status_code, media_type=content_type)
+
+    async def relay() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+            record_request_metric(
+                request.app.state.database.session_factory,
+                model=str(body.get("model")),
+                endpoint=endpoint,
+                status_code=upstream.status_code,
+                started_at=started_at,
+            )
+
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    if content_type := upstream.headers.get("content-type"):
+        headers["content-type"] = content_type
+    return StreamingResponse(relay(), status_code=upstream.status_code, headers=headers)
 
 
 @router.post("/v1/chat/completions")
@@ -829,9 +936,9 @@ async def responses(
 
     deployment = select_routed_deployment(db, str(model), "chat")
     if not deployment:
-        return openai_error(
-            f"Model '{model}' was not found or is not healthy", status_code=404
-        )
+        # Not hosted here: hand the request to the configured upstream gateway,
+        # which speaks the same Responses wire API.
+        return await _proxy_fallback(request, db, RESPONSES_ENDPOINT, body)
 
     config = deployment.config if isinstance(deployment.config, Mapping) else {}
     spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}

@@ -289,6 +289,22 @@ def _join_system_text(chunks: list[str]) -> str:
     return "\n\n".join(chunk for chunk in chunks if chunk)
 
 
+def _tool_arguments_payload(value: Any) -> str:
+    """Return `value` as a JSON document suitable for `tool_calls.arguments`.
+
+    Chat templates parse this field with a JSON decoder, so a freeform payload
+    (Codex's `custom_tool_call` sends raw code in `input`) must be carried as a
+    JSON string rather than passed through verbatim.
+    """
+    if isinstance(value, str):
+        try:
+            json.loads(value)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return json.dumps({"input": value}, ensure_ascii=False)
+        return value
+    return json.dumps(value if value is not None else {}, ensure_ascii=False)
+
+
 def responses_input_to_chat_messages(
     input_value: Any,
     *,
@@ -338,9 +354,7 @@ def responses_input_to_chat_messages(
                             "type": "function",
                             "function": {
                                 "name": str(name or ""),
-                                "arguments": arguments
-                                if isinstance(arguments, str)
-                                else json.dumps(arguments or {}, ensure_ascii=False),
+                                "arguments": _tool_arguments_payload(arguments),
                             },
                         }
                     ],
