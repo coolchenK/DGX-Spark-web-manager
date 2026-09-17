@@ -125,6 +125,20 @@ export interface ApiKeyRecord {
   revoked_at: string | null
 }
 
+export interface UpstreamGateway {
+  base_url: string | null
+  api_key_configured: boolean
+  source: 'database' | 'environment' | 'unset'
+  enabled: boolean
+}
+
+export interface UpstreamTestResult {
+  status: 'ok' | 'unavailable' | 'unset' | 'error'
+  latency_ms: number
+  model_count: number
+  detail: string | null
+}
+
 export interface Provider {
   id: string
   name: string
