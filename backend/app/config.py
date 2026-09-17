@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # provider can expose both local and remote models.
     fallback_base_url: str | None = None
     fallback_api_key: str | None = None
+    upstream_models_cache_seconds: int = Field(default=30, ge=5, le=600)
     model_roots: str = "/models,/root/.cache/huggingface/hub"
     model_root_mappings: str = ""
     hf_cache_dir: Path = Path("/root/.cache/huggingface/hub")

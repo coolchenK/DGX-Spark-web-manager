@@ -21,6 +21,7 @@ from app.api.providers import router as providers_router
 from app.api.settings import router as settings_router
 from app.api.system import router as system_router
 from app.api.tasks import router as tasks_router
+from app.api.upstream import router as upstream_router
 from app.audit import router as audit_router
 from app.auth import router as auth_router
 from app.config import Settings
@@ -47,6 +48,7 @@ from app.services.providers import ProviderService
 from app.services.resource_estimator import ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilityService
 from app.services.system import SystemService
+from app.services.upstream_gateway import UpstreamModelCache
 from app.tasks.engine import TaskEngine
 from app.tasks.huggingface import HuggingFaceService
 
@@ -264,6 +266,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ops_tool_registry = ops_tool_registry
     app.state.ops_orchestrator = ops_orchestrator
     app.state.gateway_activity = GatewayActivity()
+    app.state.upstream_model_cache = UpstreamModelCache(
+        ttl_seconds=app_settings.upstream_models_cache_seconds
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_origins,
@@ -298,6 +303,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(providers_router)
     app.include_router(diagnostics_router)
     app.include_router(settings_router)
+    app.include_router(upstream_router)
 
     @app.get("/api/health")
     def health(request: Request) -> dict[str, str]:
