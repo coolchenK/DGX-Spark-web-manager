@@ -14,3 +14,10 @@ frontend/dist
 **/test-results
 *.pyc
 .env
+
+# Host-only artifacts and dependency caches
+.pnpm-store/
+frontend/.pnpm-store/
+certs/
+recipe/
+compose.override.yaml

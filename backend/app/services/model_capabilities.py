@@ -92,6 +92,9 @@ def infer_model_capabilities(
     ):
         return []
 
+    if "rl_agent_config.json" in files:
+        return ["decision"]
+
     capabilities: list[str] = []
     if any("causallm" in architecture for architecture in architectures) or any(
         "conditionalgeneration" in architecture for architecture in architectures
@@ -140,7 +143,7 @@ def merge_runtime_model_capabilities(
 
 def input_modalities(capabilities: Iterable[str]) -> list[str]:
     names = set(capabilities)
-    modalities = ["text"] if names.intersection({"chat", "completion"}) else []
+    modalities = ["text"] if names.intersection({"chat", "completion", "decision"}) else []
     return [*modalities, *(item for item in MULTIMODAL_CAPABILITIES if item in names)]
 
 

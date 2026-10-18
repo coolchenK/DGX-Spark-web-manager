@@ -241,6 +241,14 @@ export function RecommendationStep({
       <Form.Item name="trust_remote_code" label="信任远程代码" valuePropName="checked">
         <Switch />
       </Form.Item>
+      <Form.Item
+        name="disable_cuda_graph"
+        label="关闭 CUDA Graph"
+        valuePropName="checked"
+        tooltip="仅用于 SGLang，减少图捕获预分配内存，可能降低生成速度。"
+      >
+        <Switch disabled={runtime !== 'sglang'} />
+      </Form.Item>
       <Collapse items={generationItems} defaultActiveKey={['generation-defaults']} />
     </section>
   )

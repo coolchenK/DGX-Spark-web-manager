@@ -298,10 +298,12 @@ describe('llama.cpp deployment restoration', () => {
       config: {
         command: [
           '/opt/llamacpp/llama-server',
-          '--ctx-size', '262144',
-          '--parallel', '1',
+          '--ctx-size', '1310720',
+          '--parallel', '5',
         ],
         spec: {
+          context_length: 262144,
+          max_concurrency: 5,
           quantization: 'gguf',
           llama_cpp: {
             model_file: 'model-Q8_0.gguf',
@@ -310,7 +312,12 @@ describe('llama.cpp deployment restoration', () => {
             jinja: true,
             continuous_batching: true,
             mtp_enabled: true,
-            mtp_tokens: 3,
+            mtp_tokens: 2,
+            flash_attention: 'on',
+            cache_type_k: 'q4_0',
+            cache_type_v: 'q4_0',
+            cache_ram_mib: 0,
+            context_checkpoints: 4,
           },
         },
       },
@@ -319,14 +326,19 @@ describe('llama.cpp deployment restoration', () => {
     expect(deploymentToFormValues(llamaDeployment, model, 'edit')).toMatchObject({
       runtime: 'llama_cpp',
       context_length: 262144,
-      max_concurrency: 1,
+      max_concurrency: 5,
       quantization: 'gguf',
       llama_cpp: {
         model_file: 'model-Q8_0.gguf',
         mmproj_file: 'mmproj-F16.gguf',
         gpu_layers: 'all',
         mtp_enabled: true,
-        mtp_tokens: 3,
+        mtp_tokens: 2,
+        flash_attention: 'on',
+        cache_type_k: 'q4_0',
+        cache_type_v: 'q4_0',
+        cache_ram_mib: 0,
+        context_checkpoints: 4,
       },
     })
   })

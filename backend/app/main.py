@@ -15,6 +15,7 @@ from app.api.diagnostics import router as diagnostics_router
 from app.api.gateway import GatewayActivity, GatewayAuthError
 from app.api.gateway import router as gateway_router
 from app.api.huggingface import router as huggingface_router
+from app.api.images import router as images_router
 from app.api.inventory import router as inventory_router
 from app.api.ops_agent import router as ops_agent_router
 from app.api.providers import router as providers_router
@@ -28,8 +29,10 @@ from app.config import Settings
 from app.db import Database
 from app.models import SecretSetting
 from app.operations.executor import OperationExecutor
+from app.runtime.laya import LayaAdapter
 from app.runtime.llama_cpp import LlamaCppAdapter
 from app.runtime.sglang import SGLangAdapter
+from app.runtime.viggle import ViggleAdapter
 from app.runtime.vllm import VllmAdapter
 from app.security import PasswordManager, SecretBox, SessionManager
 from app.services.deployment_memory import DeploymentMemoryService
@@ -38,13 +41,15 @@ from app.services.deployments import DeploymentService, run_deployment_tps_bench
 from app.services.diagnostics import DiagnosticService
 from app.services.discovery import DiscoveryService
 from app.services.draft_models import DraftCompatibilityService
+from app.services.image_studio import ImageStudioService, image_runtime_token
+from app.services.magpie_providers import MagpieProviderSync, resolve_magpie_provider_endpoint
 from app.services.model_evidence import ModelEvidenceLoader
 from app.services.model_lifecycle import ModelLifecycleService
 from app.services.ops_agent import OpsAgentClient
 from app.services.ops_orchestrator import OpsOrchestrator
 from app.services.ops_provider import OpsProviderClient
 from app.services.ops_tools import OpsToolRegistry
-from app.services.providers import ProviderService
+from app.services.providers import ProviderService, resolve_provider_endpoint
 from app.services.resource_estimator import ResourceEstimator
 from app.services.runtime_capabilities import RuntimeCapabilityService
 from app.services.system import SystemService
@@ -109,7 +114,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app_settings.data_dir, os_release_path=app_settings.host_os_release
     )
     secret_box = SecretBox(app_settings.secret_key)
-    ops_provider_client = OpsProviderClient(secret_box)
+    provider_endpoint_resolver = (
+        resolve_magpie_provider_endpoint
+        if app_settings.magpie_enabled
+        else resolve_provider_endpoint
+    )
+    ops_provider_client = OpsProviderClient(
+        secret_box, endpoint_resolver=provider_endpoint_resolver
+    )
     provider_service = ProviderService(secret_box, ops_provider_client)
     lazy_docker_client = _LazyDockerClient()
     evidence_loader = ModelEvidenceLoader(card_max_chars=app_settings.recommendation_card_max_chars)
@@ -124,8 +136,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         evidence_loader=evidence_loader,
         resource_estimator=resource_estimator,
     )
+    image_studio_service = ImageStudioService(
+        data_dir=app_settings.data_dir, session_factory=database.session_factory,
+        runtime_token=image_runtime_token(app_settings.secret_key),
+    )
     deployment_service = DeploymentService(
         adapters={
+            "viggle": ViggleAdapter(
+                allowed_images=app_settings.viggle_images,
+                model_roots=app_settings.model_root_paths,
+                runtime_token=image_studio_service.runtime_token,
+            ),
+            "laya": LayaAdapter(
+                allowed_images=app_settings.laya_images,
+                model_roots=app_settings.model_root_paths,
+            ),
             "vllm": VllmAdapter(
                 allowed_images=app_settings.vllm_images,
                 model_roots=app_settings.model_root_paths,
@@ -162,6 +187,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         system_snapshot=system_service.snapshot,
         huggingface_service=huggingface_service,
         provider_service=provider_service,
+        endpoint_resolver=provider_endpoint_resolver,
         cache_ttl_seconds=app_settings.recommendation_cache_ttl_seconds,
         card_max_chars=app_settings.recommendation_card_max_chars,
     )
@@ -202,6 +228,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             discovery_service.scan_models(db)
         return result
 
+    task_engine.register("image.generate", image_studio_service.generate)
     task_engine.register("model.download", download_and_discover)
     task_engine.register("model.delete", model_lifecycle_service.delete_handler)
     task_engine.register("deployment.create", deployment_service.create_handler)
@@ -254,9 +281,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.discovery_service = discovery_service
     app.state.model_lifecycle_service = model_lifecycle_service
     app.state.huggingface_service = huggingface_service
+    app.state.image_studio_service = image_studio_service
     app.state.task_engine = task_engine
     app.state.deployment_service = deployment_service
     app.state.deployment_memory_service = deployment_memory_service
+    app.state.magpie_provider_sync = (
+        MagpieProviderSync(secret_box, app_settings.magpie_web_key, app_settings.magpie_gateway_key)
+        if app_settings.magpie_enabled else None
+    )
     app.state.provider_service = provider_service
     app.state.ops_provider_client = ops_provider_client
     app.state.deployment_recommendation_service = deployment_recommendation_service
@@ -269,6 +301,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.upstream_model_cache = UpstreamModelCache(
         ttl_seconds=app_settings.upstream_models_cache_seconds
     )
+    from app.gateway.magpie import MagpieGatewayMiddleware
+    app.add_middleware(MagpieGatewayMiddleware, settings=app_settings)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_origins,
@@ -291,6 +325,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
 
+    from app.api.magpie import router as magpie_router
+    app.include_router(magpie_router)
     app.include_router(auth_router)
     app.include_router(audit_router)
     app.include_router(system_router)
@@ -298,6 +334,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(ops_agent_router)
     app.include_router(tasks_router)
     app.include_router(huggingface_router)
+    app.include_router(images_router)
     app.include_router(deployments_router)
     app.include_router(gateway_router)
     app.include_router(providers_router)

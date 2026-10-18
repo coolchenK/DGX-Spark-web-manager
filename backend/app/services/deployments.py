@@ -79,28 +79,84 @@ def run_deployment_tps_benchmark(
         "messages": [{"role": "user", "content": "只回答 OK"}],
         "max_tokens": 16,
     }
+    request["stream"] = True
+    request["stream_options"] = {"include_usage": True}
+    if runtime == "vllm":
+        # MTP can emit several tokens in one chunk; count tokens, not SSE chunks.
+        request["stream_options"]["continuous_usage_stats"] = True
+    first_token_at = last_token_at = None
+    first_chunk_tokens = None
+    completion_tokens = 0
+    finish_reason = None
+    done = False
     timeout = httpx.Timeout(connect=5, read=360, write=30, pool=5)
     with httpx.Client(base_url=endpoint, timeout=timeout, trust_env=False) as client:
         warmup_response = client.post("/v1/chat/completions", json=warmup)
         warmup_response.raise_for_status()
         started_at = time.perf_counter()
-        response = client.post("/v1/chat/completions", json=request)
-        duration_seconds = time.perf_counter() - started_at
-        response.raise_for_status()
-    payload = response.json()
-    usage = payload.get("usage") if isinstance(payload, dict) else None
-    completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
-    if not isinstance(completion_tokens, int) or completion_tokens <= 0:
+        with client.stream("POST", "/v1/chat/completions", json=request) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    done = True
+                    break
+                payload = json.loads(data)
+                if payload.get("error"):
+                    raise RuntimeError("TPS benchmark stream returned an error")
+                usage = payload.get("usage") or {}
+                count = usage.get("completion_tokens")
+                has_count = type(count) is int and count >= 0
+                choices = payload.get("choices") or []
+                emitted = False
+                for choice in choices:
+                    delta = choice.get("delta") or {}
+                    emitted |= bool(
+                        delta.get("content") or delta.get("reasoning_content")
+                        or delta.get("reasoning")
+                    )
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                counted_stream = has_count and (
+                    first_chunk_tokens is not None or first_token_at is None
+                )
+                generated = (count > completion_tokens) if counted_stream else emitted
+                # A delayed usage-only trailer must not extend decode time.
+                if choices and generated:
+                    now = time.perf_counter()
+                    if first_token_at is None:
+                        first_token_at = now
+                        first_chunk_tokens = count if has_count else None
+                    last_token_at = now
+                if has_count:
+                    completion_tokens = max(completion_tokens, count)
+        request_seconds = time.perf_counter() - started_at
+    if not done or finish_reason is None:
+        raise RuntimeError("TPS benchmark stream did not finish")
+    if completion_tokens <= 0:
         raise RuntimeError("TPS benchmark response did not include completion_tokens")
-    if duration_seconds <= 0:
+    if first_token_at is None or last_token_at is None or last_token_at <= first_token_at:
         raise RuntimeError("TPS benchmark duration is invalid")
-    choice = (payload.get("choices") or [{}])[0]
+    # Without per-chunk usage, the first chunk is conventionally one token;
+    # expose that fallback as an estimate in the benchmark result.
+    decode_tokens = completion_tokens - (first_chunk_tokens or 1)
+    duration_seconds = last_token_at - first_token_at
+    if decode_tokens <= 0:
+        raise RuntimeError("TPS benchmark did not include tokens after its first chunk")
     return {
         "status": "succeeded",
-        "tps": round(completion_tokens / duration_seconds, 3),
+        "tps": round(decode_tokens / duration_seconds, 3),
         "completion_tokens": completion_tokens,
         "duration_seconds": round(duration_seconds, 3),
-        "finish_reason": choice.get("finish_reason") if isinstance(choice, dict) else None,
+        "measurement": (
+            "stream_decode" if first_chunk_tokens is not None else "stream_decode_estimate"
+        ),
+        "decode_tokens": decode_tokens,
+        "time_to_first_token_seconds": round(first_token_at - started_at, 3),
+        "request_duration_seconds": round(request_seconds, 3),
+        "request_tokens_per_second": round(completion_tokens / request_seconds, 3),
+        "finish_reason": finish_reason,
         "max_tokens": TPS_BENCHMARK_MAX_TOKENS,
     }
 
@@ -454,8 +510,8 @@ class DeploymentService:
             if not runtime_method:
                 raise ValueError("Speculative method mapping is unavailable")
             if method == "mtp" and spec.speculative.draft_model_id is None:
-                if spec.runtime != "vllm":
-                    raise ValueError("Embedded MTP is only supported by vLLM")
+                if spec.runtime not in {"vllm", "sglang"}:
+                    raise ValueError("Embedded MTP requires a supported vLLM or SGLang runtime")
                 try:
                     evidence = self.evidence_loader.load(base_path)
                 except Exception as exc:
@@ -982,6 +1038,7 @@ class DeploymentService:
             evidence = self.evidence_loader.load(resolved.model_path)
             estimate = self.resource_estimator.estimate(
                 model_size_bytes=adapter.resident_model_size(model_path),
+                kv_cache_budget_bytes=adapter.kv_cache_budget(resolved),
                 draft_size_bytes=draft.size_bytes if draft is not None else 0,
                 config=evidence.config,
                 context_length=resolved.context_length,
@@ -1167,7 +1224,7 @@ class DeploymentService:
         api_model_name: str,
         runtime: str,
     ) -> dict[str, Any] | None:
-        if self.benchmark_runner is None:
+        if runtime in {"laya", "viggle"} or self.benchmark_runner is None:
             return None
         with self.session_factory() as db:
             deployment = db.get(Deployment, deployment_id)
@@ -1337,7 +1394,10 @@ class DeploymentService:
                     managed=True,
                     image=resolved.image,
                     port=resolved.port,
-                    benchmark_status="pending" if self.benchmark_runner is not None else None,
+                    benchmark_status=(
+                        "pending" if self.benchmark_runner is not None
+                        and resolved.runtime not in {"laya", "viggle"} else None
+                    ),
                     config=preview,
                     capabilities=list(preview["capabilities"]),
                 )
@@ -1395,8 +1455,12 @@ class DeploymentService:
             if conflict:
                 raise ValueError("Another deployment uses this name or API model name")
             if self._deployment_matches_spec(deployment, spec):
-                committed = deployment
-            else:
+                resolved = self.resolve_spec(db, spec)
+                # Adapter defaults can change without a change to the saved form.
+                command = self.adapter(resolved.runtime).command(resolved)
+                if (deployment.config or {}).get("command") == command:
+                    committed = deployment
+            if committed is None:
                 resolved, preview = self._preflight(
                     db,
                     spec,

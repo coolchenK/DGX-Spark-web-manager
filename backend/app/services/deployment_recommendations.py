@@ -1514,7 +1514,7 @@ class DeploymentRecommendationService:
             speculative_defaults=speculative_defaults,
             embedded_mtp_available=(
                 evidence.embedded_mtp_available
-                and request.runtime == "vllm"
+                and request.runtime in {"vllm", "sglang"}
                 and "mtp" in capabilities.speculative_methods
             ),
             resource_snapshot=resource_snapshot,

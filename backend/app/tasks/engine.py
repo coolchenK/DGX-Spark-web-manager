@@ -94,6 +94,7 @@ class TaskEngine:
     # download worker prevents competing downloads from saturating storage,
     # while the control worker keeps deployment/uninstall operations ordered.
     DOWNLOAD_TASK_TYPES = frozenset({"model.download"})
+    IMAGE_TASK_TYPES = frozenset({"image.generate"})
 
     def __init__(self, session_factory: sessionmaker[Session] | Callable[[], Any]):
         self.session_factory = session_factory
@@ -174,7 +175,7 @@ class TaskEngine:
         self.recover_interrupted()
         self._stop.clear()
         self._threads = []
-        for lane in ("control", "download"):
+        for lane in ("control", "download", "image"):
             thread = threading.Thread(
                 target=self._run,
                 args=(lane,),
@@ -198,9 +199,11 @@ class TaskEngine:
                 statement = statement.where(
                     TaskRecord.type.in_(self.DOWNLOAD_TASK_TYPES)
                 )
+            elif lane == "image":
+                statement = statement.where(TaskRecord.type.in_(self.IMAGE_TASK_TYPES))
             else:
                 statement = statement.where(
-                    ~TaskRecord.type.in_(self.DOWNLOAD_TASK_TYPES)
+                    ~TaskRecord.type.in_(self.DOWNLOAD_TASK_TYPES | self.IMAGE_TASK_TYPES)
                 )
             task = db.scalar(statement.order_by(TaskRecord.created_at))
             if task is None:

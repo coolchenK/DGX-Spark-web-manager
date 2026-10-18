@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Deployment, Provider
+from app.services.magpie_providers import GATEWAY_BASE
 from app.services.provider_errors import OpsProviderError, ProviderConfigurationChanged
 from app.services.providers import ProviderService
 
@@ -171,6 +172,13 @@ class DiagnosticService:
         return {"system": self.system_service.snapshot(), "deployments": deployment_rows}
 
     def ensure_provider_ready(self, db: Session, provider: Provider) -> None:
+        if provider.base_url == GATEWAY_BASE and provider.last_test_status != "healthy":
+            try:
+                self.provider_service.test(db, provider)
+            except (OpsProviderError, ProviderConfigurationChanged, ValueError):
+                raise ProviderReadinessError(
+                    "Magpie 默认模型测试失败，请检查服务商配置后重试"
+                ) from None
         result = dict(provider.last_test_result or {})
         if result:
             default_model = result.get("default_model")

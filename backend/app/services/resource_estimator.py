@@ -194,6 +194,7 @@ class ResourceEstimator:
         max_concurrency: int,
         system_memory: Mapping[str, Any],
         draft_size_bytes: int = 0,
+        kv_cache_budget_bytes: int | None = None,
     ) -> ResourceEstimate:
         model_size = _size_bytes(model_size_bytes, name="model_size_bytes")
         draft_size = _size_bytes(draft_size_bytes, name="draft_size_bytes")
@@ -219,7 +220,14 @@ class ResourceEstimator:
             available = total
             reasons.append("available memory exceeded total memory and was clamped")
 
-        kv_result = _estimate_kv_cache(config, context, concurrency)
+        if kv_cache_budget_bytes is None:
+            kv_result = _estimate_kv_cache(config, context, concurrency)
+        else:
+            kv_result = _KvCacheResult(bytes=_bounded_int(
+                kv_cache_budget_bytes, name="kv_cache_budget_bytes", minimum=1,
+                maximum=MAX_KV_CACHE_BYTES,
+            ), status="ok")
+            reasons.append("Explicit KV cache budget is shared across concurrent requests")
         kv_cache = MAX_KV_CACHE_BYTES if kv_result.status == "overflow" else kv_result.bytes
         confidence: Literal["high", "low"] = "high"
         if kv_result.status == "missing":

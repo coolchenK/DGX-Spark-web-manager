@@ -13,11 +13,11 @@ import { useAuthStore } from './stores/auth'
 import { resolveTheme, useThemeStore } from './stores/theme'
 import './styles.css'
 
+const ImagesPage = lazy(() => import('./pages/ImagesPage').then((module) => ({ default: module.ImagesPage })))
 const ModelsPage = lazy(() => import('./pages/ModelsPage').then((module) => ({ default: module.ModelsPage })))
 const HuggingFacePage = lazy(() => import('./pages/HuggingFacePage').then((module) => ({ default: module.HuggingFacePage })))
 const DeploymentsPage = lazy(() => import('./pages/DeploymentsPage').then((module) => ({ default: module.DeploymentsPage })))
 const GatewayPage = lazy(() => import('./pages/GatewayPage').then((module) => ({ default: module.GatewayPage })))
-const ProvidersPage = lazy(() => import('./pages/ProvidersPage').then((module) => ({ default: module.ProvidersPage })))
 const DiagnosticsPage = lazy(() => import('./pages/DiagnosticsPage').then((module) => ({ default: module.DiagnosticsPage })))
 const TasksPage = lazy(() => import('./pages/TasksPage').then((module) => ({ default: module.TasksPage })))
 const AuditPage = lazy(() => import('./pages/AuditPage').then((module) => ({ default: module.AuditPage })))
@@ -63,11 +63,12 @@ function AuthenticatedApp() {
       <Suspense fallback={<main className="route-loading"><Spin /></main>}>
         <Routes>
           <Route path="/" element={<DashboardPage />} />
+          <Route path="/images" element={<ImagesPage />} />
           <Route path="/models" element={<ModelsPage />} />
           <Route path="/huggingface" element={<HuggingFacePage />} />
           <Route path="/deployments" element={<DeploymentsPage />} />
           <Route path="/gateway" element={<GatewayPage />} />
-          <Route path="/providers" element={<ProvidersPage />} />
+          <Route path="/providers" element={<Navigate to="/gateway" replace />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/audit" element={<AuditPage />} />

@@ -184,6 +184,26 @@ def test_dflash_matches_quantized_derivative_base_model() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("target_repo", "declared_target", "status"),
+    [
+        ("ornith-ai/Ornith-1.5-35B-A3B-NVFP4", "ornith-ai/Ornith-1.5-35B-A3B", "compatible"),
+        ("other/Ornith-1.5-35B-A3B-NVFP4", "ornith-ai/Ornith-1.5-35B-A3B", "incompatible"),
+        ("ornith-ai/Ornith-1.5-35B-A3B-NVFP4", "ornith-ai/Other-Model", "incompatible"),
+    ],
+)
+def test_official_ornith_nvfp4_dflash_pair(target_repo, declared_target, status) -> None:
+    target = asset(target_repo, model_id="target")
+    draft = asset("ornith-ai/Ornith-1.5-35B-A3B-DFlash", model_id="draft")
+    result = classify(
+        target,
+        draft,
+        draft_evidence=evidence(draft, targets=[declared_target], method="dflash"),
+        supported={"dflash"},
+    )
+    assert result.status == status
+
+
 def test_dspark_without_target_pairing_requires_review() -> None:
     target = asset("org/Target-NVFP4", model_id="target")
     draft = asset("org/Target-NVFP4-DSpark", model_id="draft")

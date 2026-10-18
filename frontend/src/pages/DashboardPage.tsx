@@ -29,6 +29,7 @@ export function DashboardPage() {
 
   const snapshot = system.data
   const gpu = snapshot?.gpus[0]
+  const runningDeployments = (deployments.data ?? []).filter((deployment) => deployment.status === 'running')
   const metrics = snapshot ? [
     { label: 'CPU', value: `${snapshot.cpu.percent.toFixed(0)}%`, detail: `${snapshot.cpu.cores} 核心`, percent: snapshot.cpu.percent, icon: <ThunderboltOutlined /> },
     { label: '统一内存', value: formatBytes(snapshot.memory.used_bytes), detail: `共 ${formatBytes(snapshot.memory.total_bytes)}`, percent: percent(snapshot.memory.used_bytes, snapshot.memory.total_bytes), icon: <DatabaseOutlined /> },
@@ -60,9 +61,9 @@ export function DashboardPage() {
 
       <section className="dashboard-grid">
         <div className="content-section deployment-section">
-          <div className="section-heading"><div><h2>推理服务</h2><p>已发现并接入网关的本机端点</p></div><Typography.Text type="secondary">{deployments.data?.length ?? 0} 个实例</Typography.Text></div>
-          <QueryState loading={deployments.isLoading} error={deployments.error} empty={!deployments.data?.length}>
-            <ResponsiveDataView data={deployments.data ?? []} rowKey="id" columns={[
+          <div className="section-heading"><div><h2>推理服务</h2><p>当前正在运行的本机模型服务</p></div><Typography.Text type="secondary">{runningDeployments.length} 个实例</Typography.Text></div>
+          <QueryState loading={deployments.isLoading} error={deployments.error} empty={!runningDeployments.length}>
+            <ResponsiveDataView data={runningDeployments} rowKey="id" columns={[
               { title: '实例', dataIndex: 'name', render: (_, item) => <div className="primary-cell"><strong>{item.name}</strong><small>{item.api_model_name}</small></div> },
               { title: '运行时', dataIndex: 'runtime', width: 100 },
               { title: '端点', dataIndex: 'endpoint_url', responsive: ['lg'] },

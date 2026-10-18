@@ -57,6 +57,21 @@ class LlamaCppConfig(BaseModel):
     continuous_batching: bool = True
     mtp_enabled: bool = False
     mtp_tokens: int = Field(default=3, ge=1, le=64)
+    flash_attention: Literal["auto", "on", "off"] = "auto"
+    cache_type_k: Literal["f16", "q8_0", "q4_0"] = "f16"
+    cache_type_v: Literal["f16", "q8_0", "q4_0"] = "f16"
+    batch_size: int = Field(default=2048, ge=32, le=8192)
+    ubatch_size: int = Field(default=512, ge=32, le=8192)
+    cache_ram_mib: int = Field(default=8192, ge=0, le=65536)
+    context_checkpoints: int = Field(default=32, ge=0, le=64)
+
+    @model_validator(mode="after")
+    def validate_cache_settings(self):
+        if self.ubatch_size > self.batch_size:
+            raise ValueError("ubatch_size cannot exceed batch_size")
+        if self.cache_type_v != "f16" and self.flash_attention != "on":
+            raise ValueError("Quantized V cache requires flash_attention='on'")
+        return self
 
     @field_validator("model_file", "mmproj_file")
     @classmethod
@@ -170,6 +185,7 @@ class DeploymentSpec(BaseModel):
     memory_fraction: float = Field(default=0.8, ge=0.05, le=0.98)
     max_concurrency: int = Field(default=8, ge=1, le=1024)
     max_batched_tokens: int | None = Field(default=None, ge=1024, le=1_048_576)
+    disable_cuda_graph: bool = False
     quantization: QuantizationMethod | None = None
     trust_remote_code: bool = False
     generation_defaults: GenerationDefaults = Field(default_factory=GenerationDefaults)
@@ -551,6 +567,10 @@ class RuntimeAdapter(ABC):
     def resident_model_size(self, model_path: Path) -> int:
         """Return model bytes expected to occupy unified memory at runtime."""
         return self.model_size(model_path)
+
+    def kv_cache_budget(self, spec: DeploymentSpec) -> int | None:
+        """Return an explicit shared KV allocation, if the runtime profile sets one."""
+        return None
 
     def openai_capabilities(self) -> list[str]:
         return ["chat", "completion"]

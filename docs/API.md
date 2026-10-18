@@ -114,11 +114,6 @@ media request.
 | POST | `/api/keys` | Create and reveal a gateway key once |
 | DELETE | `/api/keys/{id}` | Revoke a gateway key |
 | GET | `/api/audit` | Audit history |
-| GET | `/api/gateway/upstream` | Effective upstream gateway configuration (never the key) |
-| PUT | `/api/gateway/upstream` | Store or clear the encrypted upstream base URL and key |
-| POST | `/api/gateway/upstream/test` | Probe the upstream `/v1/models` endpoint |
-| GET | `/api/gateway/upstream/models` | Discovered upstream models with their `exposed` state |
-| PUT | `/api/gateway/upstream/exposure` | Choose which upstream models this gateway offers |
 | GET | `/api/settings` | Non-secret manager configuration |
 | PATCH | `/api/settings/huggingface` | Set or clear the encrypted HF token |
 | DELETE | `/api/settings/alerts-diagnostics-history` | Physically clear failed-task and AI operations history |
@@ -132,13 +127,14 @@ is the live in-flight count across local, Responses, and forwarded requests, so 
 idle gateway.
 
 `tokens_per_second` is averaged over the last `DGX_GATEWAY_THROUGHPUT_WINDOW_SECONDS` (default
-300) and the response reports that window as `throughput_window_seconds`; the panel labels the
-reading with it. `requests_last_minute` always uses a fixed one-minute window.
+300) and the response reports that window as `throughput_window_seconds`. This is a legacy
+traffic-window statistic, not model decode TPS. With Magpie enabled, consult its usage records
+for the public gateway; the local bridge records only local inference traffic. `requests_last_minute` always uses a fixed one-minute window.
 
 ### Upstream gateway
 
 When a request names a model this manager does not host, the gateway forwards it to an
-OpenAI-compatible upstream. Configure it from the panel or with the `DGX_FALLBACK_BASE_URL` /
+OpenAI-compatible upstream. Configure the legacy upstream through the management API or with the `DGX_FALLBACK_BASE_URL` /
 `DGX_FALLBACK_API_KEY` environment pair; a value stored through the API wins over the environment,
 and clearing it falls back to the environment again.
 
@@ -169,11 +165,52 @@ The selection gates discovery **and** calls: an unexposed model is absent from `
 returns 404 from `GET /v1/models/{model}`, and is no longer forwarded upstream, so a client that
 already knows the name cannot bypass the choice.
 
+## Magpie integration
+
+The panel has one **API 网关与 AI 服务** page at `/gateway`; `/providers` redirects there.
+See the [README](../README.md#接入-magpie) for independent service setup and environment variables.
+Magpie itself is not installed by the manager's install script.
+
+- `GET /api/magpie/status`: administrator-only readiness check.
+- `/magpie/*`: administrator-session proxy to `127.0.0.1:3430`; mutations require same-origin
+  requests. Internal web credentials stay server-side.
+- `/_magpie/local/v1/*`: private bridge using `DGX_MAGPIE_BRIDGE_KEY`. It cannot discover or fall
+  back to upstream providers and must be the `dgx-local` provider's base URL, avoiding recursion.
+- Public `/v1/*` and `/v1beta/*` use Magpie at `127.0.0.1:3425` for native keys. Valid legacy keys
+  retain compatibility, with chat/completions/responses forwarded through the internal gateway key.
+- New external keys are managed in Magpie. The collapsed legacy-key section lists and revokes
+  existing `dgx_` keys. `/api/gateway/upstream*` remains available for legacy configuration; its
+  saved settings take priority over the fallback environment variables.
+
+## Image studio
+
+All image studio routes require an administrator session; mutations also require CSRF.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/images` | Latest 50 image tasks and results |
+| POST | `/api/images` | Queue generation, editing, or enhancement (202) |
+| GET | `/api/images/{id}/output` | Download a completed PNG |
+
+`POST /api/images` requires `deployment_id` pointing to a managed running `viggle` deployment,
+plus the fields in [`ImageRequest`](../backend/app/image_schema.py). Up to three Base64 image
+data URLs (PNG/JPEG/WebP, 16 MiB each) are accepted. For enhancement, use `source_task_id` from
+a successful image task and `operation: "upscale"`, with `sr_engine: "realesrgan"` or `"supir"`;
+the original is preserved. At most four image tasks may be queued or running. Tasks and files
+persist under the manager data directory. The dedicated image runtime and SR weights must be
+prepared separately; this repository only supplies the panel-side integration.
+
+## Deployment management
+
 ### Deployment TPS benchmarks
 
 After a newly created deployment passes its runtime health check, the same task sends one warmup
-request and one fixed non-streaming chat-completion request to the local endpoint. The measured
-completion-token throughput is persisted on the deployment. A benchmark failure does not roll back
+request and one fixed streamed chat-completion request (up to 256 tokens) to the local endpoint.
+Decode TPS is `(completion_tokens - first_chunk_tokens) / (last_chunk_at - first_chunk_at)`.
+Without per-chunk usage, the first chunk is estimated as one token and the task result labels the
+measurement `stream_decode_estimate`. TTFT and whole-request throughput are separate task-result
+fields. Incomplete streams, missing usage, or invalid decode intervals fail the benchmark.
+The measured decode throughput is persisted on the deployment. A benchmark failure does not roll back
 an otherwise healthy deployment.
 
 `GET /api/deployments` exposes `benchmark_status` (`pending`, `running`, `succeeded`, `failed`, or
@@ -540,6 +577,10 @@ It is distinct from the model's advertised context window and from `generation_d
 SSD Stream deployments pass it to `--max-total-tokens`; omitting it preserves the prior behavior of
 using `context_length` for the requested pool size.
 
+`disable_cuda_graph` is an optional boolean. SGLang deployments pass it as
+`--disable-cuda-graph` when enabled, allowing low-memory co-resident deployments to avoid CUDA
+Graph capture overhead. It defaults to `false` and does not change other runtime commands.
+
 For SGLang, replace `num_speculative_tokens` with all three grouped values `num_steps`,
 `eagle_top_k`, and `num_draft_tokens`, or omit all three. These tuning groups are mutually exclusive
 by runtime. A SGLang DSpark candidate uses `method: "dspark"`; the adapter maps it to `DSPARK`,
@@ -610,20 +651,15 @@ and resource checks. An edit uses a health-gated container replacement and rollb
 - `POST /v1/completions`
 - `POST /v1/embeddings` for deployments advertising `embedding`
 
-`GET /v1/models` lists running, healthy local deployments, and appends the models published by the
-configured upstream gateway. Upstream entries carry `owned_by: "upstream"` and
-`dgx_source: "upstream"`; a local route with the same name always wins, so an upstream model can
-never shadow a hosted instance. Only the model id is known for an upstream entry, so its
-capability and limit fields are reported as empty or null rather than guessed. The response also
-carries an additive `upstream` object with `status` (`ok`/`unavailable`/`unset`) and a bounded
-`detail`; an unreachable upstream never removes local models from the list. Results are cached for
-`DGX_UPSTREAM_MODELS_CACHE_SECONDS` (default 30).
+Without Magpie, `GET /v1/models` lists running, healthy local deployments and exposed upstream
+models. Local names take precedence. An unavailable upstream does not remove local models; the
+additive `upstream` object reports its status. With Magpie enabled, native keys use Magpie's catalog
+and provider-qualified IDs, while legacy `dgx_` keys retain local metadata and suppress duplicate
+`dgx-local/` entries for the same local route. Local `tokensPerSecond` is the latest successful
+benchmark, not live throughput. Magpie's native catalog may not expose every manager extension.
 
-The gateway replaces the requested route name with the selected deployment's upstream
-`api_model_name`. SSE bytes are relayed without buffering, upstream status/content types are
-preserved, and manager-generated failures use the standard OpenAI `error` object. Requests for an
-unknown model are forwarded verbatim to the upstream gateway when one is configured, and return
-404 otherwise.
+The local gateway replaces the requested route with its deployment's `api_model_name`. Streaming
+remains incremental; manager-generated failures use the standard OpenAI `error` object.
 
 The public Chat Completions contract accepts OpenAI `developer` messages. A runtime adapter converts
 that role to the legacy `system` equivalent only in requests sent to local SGLang, vLLM, and
@@ -643,9 +679,21 @@ name. Healthy instances are selected round-robin. `/v1/models` reports `instance
 capabilities shared by every instance. Preview rejects members of one effective route when their
 normalized `generation_defaults` differ.
 
-For `/v1/chat/completions` and `/v1/completions`, the gateway fills only missing saved defaults that
-also appear in the deployment's saved runtime-capability snapshot. Explicit request values,
-including `0`, `false`, and an empty `stop`, win. `max_completion_tokens` also prevents the saved
-`max_tokens` default from being inserted. Invalid, unknown, or unsupported saved values are ignored;
+For `/v1/chat/completions` and `/v1/completions` (including streaming), sampling is controlled by
+server defaults. Client `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`,
+`presence_penalty`, `frequency_penalty`, `seed`, and `logit_bias` are discarded, including raw
+`extra_body` copies. The gateway then applies validated saved defaults supported by the deployment's
+runtime-capability snapshot. Unconfigured sampling fields use the runtime's defaults.
+Client `max_tokens` / `max_completion_tokens`, `stop` (including an empty list), and reasoning
+options retain their existing handling. Invalid, unknown, or unsupported saved values are ignored;
 embeddings are unchanged. Applied field names, not their values or prompts, are recorded under the
-`gateway.defaults.apply` audit action.
+`gateway.defaults.apply` audit action. This policy applies to the gateway, not direct runtime ports.
+
+
+Inference requests use standard OpenAI tools and reasoning fields. The gateway does not extract
+XML tool schemas, append continuation prompts, replace tool results with external searches, or
+force thinking off after a tool result. Client-specific provider option aliases are not interpreted.
+Successful responses retain the upstream tool arguments, reasoning fields, finish reasons, and
+stream data. Empty or planning-only answers are returned without semantic retries or generated
+fallback text. SSE heartbeats and usage metrics remain; sampling still uses server defaults.
+Model catalog/discovery metadata remains available to all clients.

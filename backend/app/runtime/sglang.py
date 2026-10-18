@@ -75,6 +75,7 @@ REASONING_PARSER_MARKERS = (("qwen3", ("<think>",)),)
 MAMBA_STATE_SLOTS_PER_REQUEST = 5
 MAMBA_RADIX_CACHE_STRATEGY = "extra_buffer"
 SGLANG_SSD_STREAM_IMAGE = "dgx-local/sglang-ssd-stream:5aeffa3-sm121-r3"
+SGLANG_ORNITH_DFLASH_IMAGE = "dgx-local/sglang-ornith-dflash:0.5.18-cu130-r2"
 SSD_STREAM_MANIFEST = "ssd-stream.json"
 SSD_STREAM_MAMBA_STATE_SLOTS_PER_REQUEST = 5
 
@@ -237,6 +238,9 @@ class SGLangAdapter(RuntimeAdapter):
             cache_root = _hf_cache_root_from_container_path(draft_path) or cache_root
         env["HF_HOME"] = cache_root
         env["HF_HUB_CACHE"] = cache_root
+        if spec.image == SGLANG_ORNITH_DFLASH_IMAGE:
+            # SGLang counts the closing </think> token in API reasoning usage.
+            env["SGLANG_MAX_THINK_TOKENS"] = "8191"
         if _ssd_stream_manifest(self.validate(spec)) is not None:
             env["SGLANG_PLUGINS"] = "ssd_stream"
         return env
@@ -277,8 +281,22 @@ class SGLangAdapter(RuntimeAdapter):
             str(spec.max_concurrency),
             "--weight-loader-prefetch-num-threads",
             "20",
+            "--enable-cache-report",
         ]
         resolved_model_path = self.validate(spec)
+        # The selected EfficientThink package uses the author's BF16 KV/MTP path.
+        efficientthink_repository = (
+            "models--nerkyor--Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-"
+            "Grok4.6-GPT5.6Sol-SFT-SimPO-MTP-NVFP4"
+        )
+        if (efficientthink_repository in resolved_model_path.parts and
+                json.loads((resolved_model_path / "config.json").read_text()).get(
+                    "quantization_config", {}).get("quant_algo") == "MIXED_PRECISION"):
+            command.extend([
+                "--quantization", "modelopt_mixed", "--dtype", "bfloat16",
+                "--kv-cache-dtype", "bfloat16", "--enable-linear-replayssm-spec",
+                "--enable-metrics",
+            ])
         ssd_stream = _ssd_stream_manifest(resolved_model_path) is not None
         if ssd_stream:
             command.extend(
@@ -320,6 +338,8 @@ class SGLangAdapter(RuntimeAdapter):
                     str(spec.max_concurrency * MAMBA_STATE_SLOTS_PER_REQUEST),
                 ]
             )
+        if spec.disable_cuda_graph:
+            command.append("--disable-cuda-graph")
         if not ssd_stream and _is_nvfp4_moe(resolved_model_path):
             command.extend(["--moe-runner-backend", "flashinfer_cutlass"])
         template, template_path = effective_chat_template(spec, resolved_model_path)
@@ -332,6 +352,8 @@ class SGLangAdapter(RuntimeAdapter):
         )
         if tool_call_parser:
             command.extend(["--tool-call-parser", tool_call_parser])
+        if tool_call_parser == "minicpm5":
+            command.extend(["--dtype", "bfloat16"])
         reasoning_parser = "auto" if ssd_stream else match_parser(
             template, REASONING_PARSER_MARKERS
         )
@@ -342,6 +364,8 @@ class SGLangAdapter(RuntimeAdapter):
         command.extend(default_chat_template_kwargs_flags(spec))
         if spec.trust_remote_code:
             command.append("--trust-remote-code")
+        if spec.image == SGLANG_ORNITH_DFLASH_IMAGE:
+            command.append("--enable-strict-thinking")
         if ssd_stream and spec.speculative is None:
             command.extend(
                 [
@@ -382,6 +406,8 @@ class SGLangAdapter(RuntimeAdapter):
                         or draft_container_path,
                     ]
                 )
+            elif spec.speculative.method == "mtp" and spec.speculative.draft_model_id is None:
+                command.extend(["--speculative-algorithm", runtime_method])
             else:
                 command.extend(
                     [
@@ -423,7 +449,11 @@ class SGLangAdapter(RuntimeAdapter):
                         str(spec.speculative.num_draft_tokens),
                     ]
                 )
-        if spec.speculative is not None and spec.speculative.method == "dspark":
+        if (
+            spec.speculative is not None
+            and spec.speculative.method == "dspark"
+            and _is_hybrid_gdn(resolved_model_path)
+        ):
             # Remaining tuning from the SGLang cookbook's DGX Spark recipe.
             command.extend(list(SGLANG_DSPARK_FLAGS))
         return command

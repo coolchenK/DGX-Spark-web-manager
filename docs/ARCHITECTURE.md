@@ -18,6 +18,21 @@ before the Docker API creates a runtime container. This prevents container-local
 
 The manager container does not replace or wrap inference containers. Runtime adapters create normal NVIDIA containers using the same host GPU and model caches.
 
+## Magpie and image services
+
+When enabled, Magpie is a separate loopback service: API port 3425 and admin port 3430.
+The single `/gateway` page embeds its admin interface through `/magpie/`, protected by
+manager administrator authentication and same-origin checks. `/providers` redirects to
+`/gateway`. Native public API keys are verified by Magpie; legacy `dgx_` keys retain
+manager authentication. Magpie's `dgx-local` provider uses the separately authenticated
+`/_magpie/local/v1` bridge, which never falls back to Magpie and therefore cannot recurse.
+Provider synchronization supplies remote models to recommendations and operations sessions.
+
+Image studio requests use administrator sessions and a dedicated task lane. The manager
+validates requests, stores source/result files in `data/image-studio`, and relays progress
+from the authenticated `viggle` runtime. The image execution environment and optional
+super-resolution weights are supplied separately from the manager container.
+
 ## Host Operations Agent
 
 The non-root manager container does not implement the privileged host command execution path.
@@ -185,9 +200,9 @@ in the selected deployment's saved capability snapshot.
 
 The gateway uses the same boundary as a channel-based AI relay: API handlers own the public OpenAI
 contract and routing, runtime adapters own request/error translation, and the HTTP proxy owns
-transport, SSE heartbeats, timeouts, response normalization, and metrics. This keeps local chat
-template limitations out of clients while preserving the existing tool-continuation and
-multimodal transformations.
+transport, SSE heartbeats, timeouts, and metrics. Standard role and multimodal translation remains
+in place. Inference messages and successful response payloads are not rewritten for individual
+clients: there is no prompt injection, tool repair, search substitution, or continuation retry.
 
 ## Trust Boundaries
 

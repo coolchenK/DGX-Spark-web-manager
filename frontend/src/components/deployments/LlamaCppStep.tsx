@@ -40,6 +40,31 @@ export function LlamaCppStep() {
           ]}
         />
       </Form.Item>
+      <Typography.Paragraph type="secondary">
+        上下文长度按每个并发会话计算。量化 KV 缓存可降低内存占用，但可能影响精度；量化 V 缓存需要开启 Flash Attention。
+      </Typography.Paragraph>
+      <div className="form-grid">
+        <Form.Item name={['llama_cpp', 'flash_attention']} label="Flash Attention" initialValue="auto">
+          <Segmented options={['auto', 'on', 'off']} />
+        </Form.Item>
+        {(['cache_type_k', 'cache_type_v'] as const).map((field) => (
+          <Form.Item key={field} name={['llama_cpp', field]} label={field === 'cache_type_k' ? 'K 缓存精度' : 'V 缓存精度'} initialValue="f16">
+            <Segmented options={['f16', 'q8_0', 'q4_0']} />
+          </Form.Item>
+        ))}
+        <Form.Item name={['llama_cpp', 'batch_size']} label="逻辑批大小" initialValue={2048}>
+          <InputNumber min={32} max={8192} />
+        </Form.Item>
+        <Form.Item name={['llama_cpp', 'ubatch_size']} label="物理批大小" initialValue={512}>
+          <InputNumber min={32} max={8192} />
+        </Form.Item>
+        <Form.Item name={['llama_cpp', 'cache_ram_mib']} label="提示词 RAM 缓存 (MiB，0 关闭)" initialValue={8192}>
+          <InputNumber min={0} max={65536} />
+        </Form.Item>
+        <Form.Item name={['llama_cpp', 'context_checkpoints']} label="每会话上下文检查点" initialValue={32}>
+          <InputNumber min={0} max={64} />
+        </Form.Item>
+      </div>
       <div className="form-grid">
         <Form.Item name={['llama_cpp', 'jinja']} label="Jinja 对话模板" valuePropName="checked">
           <Switch />

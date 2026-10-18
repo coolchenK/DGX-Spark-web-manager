@@ -114,6 +114,21 @@ def classify_draft_candidate(
         )
         if target.repository_id is not None:
             target_repository_ids.add(target.repository_id)
+        # The AEON author explicitly pairs this fine-tune with z-lab's DFlash2.
+        if (
+            target.repository_id == "AEON-7/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-NVFP4-MIXED"
+            and draft.repository_id == "z-lab/Qwen3.8-27B-DFlash2"
+            and raw_method == "dflash"
+        ):
+            target_repository_ids.add("Qwen/Qwen3.8-27B")
+        # Ornith's official NVFP4 export has no base_model metadata; its
+        # official DFlash checkpoint names the unquantized target instead.
+        if (
+            target.repository_id == "ornith-ai/Ornith-1.5-35B-A3B-NVFP4"
+            and draft.repository_id == "ornith-ai/Ornith-1.5-35B-A3B-DFlash"
+            and raw_method == "dflash"
+        ):
+            target_repository_ids.add("ornith-ai/Ornith-1.5-35B-A3B")
         if not target_repository_ids:
             target_repository_missing = True
         elif target_repository_ids.intersection(draft_evidence.target_model_ids):

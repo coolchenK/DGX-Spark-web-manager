@@ -79,7 +79,7 @@ def test_llama_cpp_command_preserves_gguf_mmproj_and_mtp_settings(tmp_path):
     assert command[command.index("--mmproj") + 1] == "/models/qwen/mmproj-F16.gguf"
     assert command[command.index("--ctx-size") + 1] == "262144"
     assert command[command.index("--spec-type") + 1] == "draft-mtp"
-    assert command[command.index("--spec-draft-model") + 1] == command[1]
+    assert "--spec-draft-model" not in command
     assert command[command.index("--spec-draft-n-max") + 1] == "3"
     assert "--jinja" in command
     assert "--cont-batching" in command
@@ -197,3 +197,30 @@ def test_llama_cpp_capabilities_use_manifest_without_probe(tmp_path):
     assert capabilities.source == "manifest"
     assert capabilities.quantization_methods == ["auto", "gguf"]
     assert capabilities.speculative_methods == []
+
+
+def test_llama_cpp_five_full_context_slots_and_bounded_cache(tmp_path):
+    adapter, model_path, _ = _adapter(tmp_path)
+    (model_path / "model.gguf").write_bytes(b"model")
+    spec = _spec(model_path, max_concurrency=5, llama_cpp={
+        "model_file": "model.gguf", "mtp_enabled": True, "mtp_tokens": 2,
+        "flash_attention": "on", "cache_type_k": "q4_0", "cache_type_v": "q4_0",
+        "cache_ram_mib": 0, "context_checkpoints": 4,
+    })
+    command = adapter.command(spec)
+    assert spec.context_length == 262144
+    assert command[command.index("--ctx-size") + 1] == "1310720"
+    assert command[command.index("--parallel") + 1] == "5"
+    assert "--no-kv-unified" in command
+    assert "--spec-draft-model" not in command
+    for flag, value in {
+        "--flash-attn": "on", "--cache-type-k": "q4_0", "--cache-type-v": "q4_0",
+        "--spec-draft-type-k": "q4_0", "--spec-draft-type-v": "q4_0",
+        "--spec-draft-n-max": "2", "--cache-ram": "0", "--ctx-checkpoints": "4",
+        "--batch-size": "2048", "--ubatch-size": "512",
+    }.items():
+        assert command[command.index(flag) + 1] == value
+    with pytest.raises(ValueError, match="requires flash_attention"):
+        _spec(model_path, llama_cpp={"cache_type_v": "q4_0", "flash_attention": "off"})
+    with pytest.raises(ValueError, match="cannot exceed"):
+        _spec(model_path, llama_cpp={"batch_size": 512, "ubatch_size": 1024})

@@ -7,8 +7,10 @@ import stat
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fnmatch import fnmatch
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any
 from urllib.parse import quote
 
@@ -153,6 +155,15 @@ def _safe_file_size(path: Path) -> int:
         return 0
 
 
+def _downloaded_file_bytes(path: Path) -> int:
+    try:
+        info = path.stat()
+        # aria2 writes sparse ranges; logical size includes unwritten holes.
+        return min(info.st_size, info.st_blocks * 512) if stat.S_ISREG(info.st_mode) else 0
+    except OSError:
+        return 0
+
+
 def _stop_aria2(process: subprocess.Popen[Any]) -> None:
     if process.poll() is not None:
         return
@@ -219,6 +230,7 @@ def huggingface_environment(cache_dir: Path, base_environment: dict[str, str]) -
 def sanitize_cli_output(value: str) -> str:
     sanitized = ANSI_ESCAPE.sub("", value)
     sanitized = HF_TOKEN_PATTERN.sub("[REDACTED_HF_TOKEN]", sanitized)
+    sanitized = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[REDACTED_QUERY]", sanitized)
     sanitized = "".join(
         character
         for character in sanitized
@@ -448,15 +460,6 @@ class HuggingFaceService:
             sizes[name] if sizes[name] else _safe_file_size(source)
             for name, source in existing_sources.items()
         )
-        disk = shutil.disk_usage(self.cache_dir)
-        validate_disk_capacity(
-            total_bytes=total_bytes,
-            existing_bytes=existing_bytes,
-            free_bytes=disk.free,
-        )
-        executable = shutil.which("aria2c")
-        if not executable:
-            raise RuntimeError("aria2c is not installed")
         commit_hash = str(info.get("sha") or revision)
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", commit_hash):
             commit_hash = re.sub(r"[^A-Za-z0-9._-]+", "-", commit_hash)[:128]
@@ -466,17 +469,38 @@ class HuggingFaceService:
             / f"models--{repository_id.replace('/', '--')}"
             / commit_hash
         )
+        staged_bytes = sum(
+            min(_downloaded_file_bytes(staging / safe_relative_file_path(name)), sizes[name])
+            for name in selected_names if name not in existing_sources
+        )
+        disk = shutil.disk_usage(self.cache_dir)
+        validate_disk_capacity(
+            total_bytes=total_bytes,
+            existing_bytes=existing_bytes + staged_bytes,
+            free_bytes=disk.free,
+        )
+        executable = shutil.which("aria2c")
+        if not executable:
+            raise RuntimeError("aria2c is not installed")
         staging.mkdir(parents=True, exist_ok=True)
         cache_home = self.cache_dir.parent
         (cache_home / "xet").mkdir(parents=True, exist_ok=True)
         (cache_home / ".cache").mkdir(parents=True, exist_ok=True)
         env = huggingface_environment(self.cache_dir, dict(os.environ))
-        completed_by_name = dict(existing_sources)
+        completed_by_name = {
+            name: existing_sources.get(name) or staging / safe_relative_file_path(name)
+            for name in selected_names
+        }
+        stop_downloads = Event()
+        progress_lock = Lock()
         context.update(
             total_bytes=total_bytes,
-            completed_bytes=existing_bytes,
-            progress=(existing_bytes / total_bytes * 100 if total_bytes else 0),
-            message=f"Downloading {repository_id}@{revision} with aria2",
+            completed_bytes=existing_bytes + staged_bytes,
+            progress=((existing_bytes + staged_bytes) / total_bytes * 100 if total_bytes else 0),
+            message=(
+                f"Downloading {repository_id}@{revision} with aria2 "
+                "(3 files, 16 connections each)"
+            ),
         )
 
         def completed_bytes() -> int:
@@ -484,21 +508,32 @@ class HuggingFaceService:
             for name, path in completed_by_name.items():
                 if name in existing_sources:
                     continue
-                size = _safe_file_size(path)
+                size = _downloaded_file_bytes(path)
                 total += min(size, sizes[name]) if sizes[name] else size
             return total
 
-        for name in selected_names:
-            if name in existing_sources:
-                continue
+        def update_progress(message: str | None = None) -> None:
+            with progress_lock:
+                current = completed_bytes()
+                context.update(
+                    progress=(current / total_bytes * 100 if total_bytes else 0),
+                    completed_bytes=current,
+                    total_bytes=total_bytes,
+                    message=message,
+                )
+
+        def download_file(name: str) -> None:
+            if name in existing_sources or stop_downloads.is_set():
+                return
+            context.check_control()
             relative = safe_relative_file_path(name)
             destination = staging / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             expected_size = sizes[name]
             current_size = _safe_file_size(destination)
-            if expected_size and current_size == expected_size:
-                completed_by_name[name] = destination
-                continue
+            if (expected_size and current_size == expected_size
+                    and not destination.with_name(destination.name + ".aria2").exists()):
+                return
             if expected_size and current_size > expected_size:
                 destination.unlink(missing_ok=True)
                 destination.with_name(destination.name + ".aria2").unlink(missing_ok=True)
@@ -506,6 +541,9 @@ class HuggingFaceService:
             command = [
                 executable,
                 url,
+                "--max-connection-per-server=16",
+                "--split=16",
+                "--min-split-size=16M",
                 "--continue=true",
                 "--always-resume=true",
                 "--auto-file-renaming=false",
@@ -514,6 +552,7 @@ class HuggingFaceService:
                 "--max-tries=5",
                 "--retry-wait=5",
                 "--timeout=60",
+                "--lowest-speed-limit=64K",
                 "--connect-timeout=30",
                 "--summary-interval=1",
                 "--console-log-level=warn",
@@ -523,51 +562,73 @@ class HuggingFaceService:
             ]
             if self.token:
                 command.append(f"--header=Authorization: Bearer {self.token}")
-            # Count the active staging file while aria2 grows it. Keeping the
-            # path in this map also makes resumed bytes visible immediately;
-            # only files with the exact expected size are published later.
-            completed_by_name[name] = destination
-            with tempfile.TemporaryFile() as cli_output:
-                process = subprocess.Popen(
-                    command,
-                    env=env,
-                    stdout=cli_output,
-                    stderr=subprocess.STDOUT,
-                )
-                try:
-                    while process.poll() is None:
-                        context.check_control()
-                        current = completed_bytes()
-                        context.update(
-                            progress=(current / total_bytes * 100 if total_bytes else 0),
-                            completed_bytes=current,
-                            total_bytes=total_bytes,
+            peak_rate = 0.0
+            for attempt in range(32):
+                context.check_control()
+                if stop_downloads.is_set():
+                    return
+                with tempfile.TemporaryFile() as cli_output:
+                    process = subprocess.Popen(
+                        command,
+                        env=env,
+                        stdout=cli_output,
+                        stderr=subprocess.STDOUT,
+                    )
+                    last_bytes = _downloaded_file_bytes(destination)
+                    last_check = time.monotonic()
+                    slow_transfer = False
+                    try:
+                        while process.poll() is None:
+                            context.check_control()
+                            if stop_downloads.is_set():
+                                return
+                            update_progress()
+                            now = time.monotonic()
+                            if now - last_check >= 30:
+                                current_bytes = _downloaded_file_bytes(destination)
+                                # Re-open all ranges when surviving connections crawl.
+                                rate = (current_bytes - last_bytes) / (now - last_check)
+                                peak_rate = max(peak_rate, rate)
+                                if rate < min(1024**2, peak_rate / 10):
+                                    slow_transfer = True
+                                    break
+                                last_bytes, last_check = current_bytes, now
+                            time.sleep(1)
+                    finally:
+                        _stop_aria2(process)
+                    if process.returncode == 0:
+                        break
+                    if (slow_transfer or process.returncode in {5, 6, 7, 19, 29}) and attempt < 31:
+                        update_progress(
+                            f"Reconnecting {name} from saved pieces (attempt {attempt + 2}/32)"
                         )
-                        time.sleep(1)
-                finally:
-                    _stop_aria2(process)
-                if process.returncode != 0:
-                    cli_output.seek(0)
-                    details = sanitize_cli_output(
-                        cli_output.read().decode("utf-8", errors="replace")
-                    )
-                    suffix = f": {details}" if details else ""
-                    raise RuntimeError(
-                        f"aria2 download exited with code {process.returncode}{suffix}"
-                    )
+                        continue
+                    if process.returncode != 0:
+                        cli_output.seek(0)
+                        details = sanitize_cli_output(
+                            cli_output.read().decode("utf-8", errors="replace")
+                        )
+                        suffix = f": {details}" if details else ""
+                        raise RuntimeError(
+                            f"aria2 download exited with code {process.returncode}{suffix}"
+                        )
             if expected_size and _safe_file_size(destination) != expected_size:
                 raise RuntimeError(
                     f"aria2 downloaded an unexpected size for {name}: "
                     f"{_safe_file_size(destination)} != {expected_size}"
                 )
-            completed_by_name[name] = destination
-            current = completed_bytes()
-            context.update(
-                progress=(current / total_bytes * 100 if total_bytes else 100),
-                completed_bytes=current,
-                total_bytes=total_bytes,
-                message=f"Downloaded {name}",
-            )
+            update_progress(f"Downloaded {name}")
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(download_file, name) for name in selected_names]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                stop_downloads.set()
+                for future in futures:
+                    future.cancel()
+                raise
 
         if not selected_names:
             raise RuntimeError("Downloaded repository has no valid snapshot")

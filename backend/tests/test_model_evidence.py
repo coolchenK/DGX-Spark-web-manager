@@ -1102,3 +1102,17 @@ def test_missing_tokenizer_files_returns_none(tmp_path):
 def test_loader_rejects_unbounded_card_limits(card_max_chars):
     with pytest.raises(ValueError, match="card_max_chars"):
         ModelEvidenceLoader(card_max_chars=card_max_chars)
+
+
+@pytest.mark.parametrize(
+    ("architectures", "method"),
+    [(["Qwen3DSparkModel"], "dspark"), (["DSparkDraftModel"], "dspark"),
+     (["LlamaForCausalLM"], None), (None, None)],
+)
+def test_model_evidence_detects_dspark_without_card_tags(tmp_path, architectures, method):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": architectures}), encoding="utf-8"
+    )
+    evidence = ModelEvidenceLoader().load(tmp_path)
+    assert evidence.speculative_method == method
+    assert evidence.target_model_ids == []

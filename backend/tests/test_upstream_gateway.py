@@ -640,3 +640,39 @@ def test_upstream_single_model_lookup_resolves(authenticated_client):
     assert response.json()["dgx_source"] == "upstream"
 
 
+
+
+@pytest.mark.parametrize(
+    ('magpie_enabled', 'base_url', 'local_alias_visible'),
+    [
+        (True, 'http://127.0.0.1:3425/v1', False),
+        (False, 'http://127.0.0.1:3425/v1', True),
+        (True, 'https://other-upstream.test/v1', True),
+    ],
+)
+@respx.mock
+def test_magpie_catalog_deduplicates_only_its_local_bridge(
+    authenticated_client, settings, magpie_enabled, base_url, local_alias_visible
+):
+    key = _create_gateway_key(authenticated_client)
+    settings.magpie_enabled = magpie_enabled
+    _seed_healthy_deployment(authenticated_client, api_model_name='local-chat')
+    authenticated_client.put(
+        '/api/gateway/upstream', json={'base_url': base_url, 'api_key': 'internal'}
+    )
+    respx.get(base_url + '/models').respond(200, json={
+        'data': [
+            {'id': 'dgx-local/local-chat'},
+            {'id': 'cloud-a/local-chat'},
+            {'id': 'cloud-b/local-chat'},
+        ]
+    })
+
+    data = _models(authenticated_client, key)['data']
+    ids = [item['id'] for item in data]
+    assert ('dgx-local/local-chat' in ids) is local_alias_visible
+    assert ids.count('local-chat') == 1
+    assert {'cloud-a/local-chat', 'cloud-b/local-chat'} <= set(ids)
+    local = next(item for item in data if item['id'] == 'local-chat')
+    assert local['runtime'] == 'vllm'
+    assert local.get('dgx_source') != 'upstream'

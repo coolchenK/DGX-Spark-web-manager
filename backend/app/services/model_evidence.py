@@ -910,6 +910,13 @@ class ModelEvidenceLoader:
         warnings.extend(tokenizer_warnings)
         targets = _target_model_ids(card_data)
         method = _speculative_method(card_data)
+        # Some official DSpark cards omit strategy tags; the draft architecture
+        # still identifies the method. Target pairing remains a separate check.
+        architectures = config.get("architectures")
+        if method is None and isinstance(architectures, list) and any(
+            name in ("Qwen3DSparkModel", "DSparkDraftModel") for name in architectures
+        ):
+            method = "dspark"
         weight_map = weight_index.get("weight_map")
         embedded_mtp_available = (
             isinstance(weight_map, dict)

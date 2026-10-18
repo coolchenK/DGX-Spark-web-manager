@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import Settings
 
-RuntimeName = Literal["vllm", "sglang", "llama_cpp"]
+RuntimeName = Literal["vllm", "sglang", "llama_cpp", "laya", "viggle"]
 
 GENERATION_DEFAULTS = (
     "temperature",
@@ -62,6 +62,16 @@ class RuntimeCapabilities(BaseModel):
 
 
 CONSERVATIVE_MANIFESTS: dict[RuntimeName, dict[str, Any]] = {
+    "viggle": {
+        "generation_defaults": [], "quantization_methods": [],
+        "quantization_mapping": {}, "speculative_methods": [],
+        "method_mapping": {}, "speculative_transport": "none",
+    },
+    "laya": {
+        "generation_defaults": [], "quantization_methods": [],
+        "quantization_mapping": {}, "speculative_methods": [],
+        "method_mapping": {}, "speculative_transport": "none",
+    },
     "vllm": {
         "generation_defaults": list(GENERATION_DEFAULTS),
         "quantization_methods": list(QUANTIZATION_METHODS),
@@ -407,7 +417,7 @@ class RuntimeCapabilityService:
                 return cached.model_copy(update={"image": image}, deep=True)
 
             try:
-                if runtime == "llama_cpp":
+                if runtime in {"llama_cpp", "laya", "viggle"}:
                     capabilities = RuntimeCapabilities(
                         runtime=runtime,
                         image=image,

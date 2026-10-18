@@ -592,12 +592,16 @@ def normalize_usage(usage: Any) -> dict[str, Any]:
         candidate = details.get("reasoning_tokens")
         if isinstance(candidate, int) and not isinstance(candidate, bool):
             reasoning_tokens = candidate
+    input_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+    cached = input_details.get("cached_tokens") if isinstance(input_details, Mapping) else 0
+    if not isinstance(cached, int) or isinstance(cached, bool) or cached < 0:
+        cached = 0
     output_details: dict[str, Any] = {"reasoning_tokens": reasoning_tokens}
     if isinstance(details, Mapping) and isinstance(details.get("accepted_prediction_tokens"), int):
         output_details["accepted_prediction_tokens"] = details["accepted_prediction_tokens"]
     return {
         "input_tokens": int(prompt) if isinstance(prompt, (int, float)) else 0,
-        "input_tokens_details": {"cached_tokens": 0},
+        "input_tokens_details": {"cached_tokens": cached},
         "output_tokens": int(completion) if isinstance(completion, (int, float)) else 0,
         "output_tokens_details": output_details,
         "total_tokens": int(prompt or 0) + int(completion or 0),

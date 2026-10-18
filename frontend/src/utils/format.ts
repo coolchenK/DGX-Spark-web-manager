@@ -18,5 +18,13 @@ export function formatDuration(seconds: number): string {
 }
 
 export function formatDate(value: string | null | undefined): string {
-  return value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value)) : '从未'
+  if (!value) return '从未'
+  // SQLite-backed API timestamps are UTC even when their timezone suffix is missing.
+  const timestamp = value.replace(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/, '$1T$2Z')
+  const date = new Date(timestamp.replace(/(\.\d{3})\d+(?=Z|[+-]\d{2}:\d{2}$)/, '$1'))
+  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(date)
+}
+
+export function formatLogLine(line: string): string {
+  return line.replace(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))(?=\s|$)/, (timestamp) => formatDate(timestamp))
 }

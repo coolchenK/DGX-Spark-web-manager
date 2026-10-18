@@ -1349,6 +1349,52 @@ describe('DeploymentsPage assisted deployment wizard', () => {
     })
   })
 
+  it('submits SGLang embedded MTP with grouped tuning and no external draft', async () => {
+    const { user, postSpy } = renderDeploymentsPage({
+      recommendations: async (_path, body) => recommendationFixture({
+        model_id: String(body.model_id),
+        runtime: body.runtime as 'sglang',
+        embedded_mtp_available: true,
+        speculative_defaults: {
+          num_speculative_tokens: {
+            value: 6,
+            source: 'model_card',
+            confidence: 'high',
+            reason: '模型卡推荐 MTP n=6',
+            warning: null,
+          },
+        },
+        draft_candidates: [],
+        runtime_capabilities: {
+          ...recommendationFixture().runtime_capabilities,
+          runtime: 'sglang',
+          image: String(body.image),
+          speculative_methods: ['mtp'],
+          method_mapping: { mtp: 'NEXTN' },
+        },
+      }),
+    })
+    await openCreateAndSelectModel(user)
+    await user.click(screen.getByText('SGLang'))
+    await goToDraftStep(user)
+    await user.click(screen.getByRole('radio', { name: /内置 MTP Head/ }))
+
+    expect(screen.queryByLabelText('每轮推测 Token')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '生成部署预览' }))
+    await screen.findByRole('heading', { name: '部署预览' })
+
+    const payload = postSpy.mock.calls.find(
+      ([path]) => String(path).startsWith('/api/deployments/preview'),
+    )?.[1] as Record<string, unknown>
+    expect(payload.speculative).toEqual({
+      method: 'mtp',
+      num_steps: 3,
+      eagle_top_k: 1,
+      num_draft_tokens: 4,
+      manual_review_acknowledged: false,
+    })
+  })
+
   it('rejects an out-of-range vLLM speculative token value before preview', async () => {
     const { user, postSpy } = renderDeploymentsPage()
     await openCreateAndSelectModel(user)

@@ -46,6 +46,13 @@ export interface LlamaCppSettings {
   continuous_batching: boolean
   mtp_enabled: boolean
   mtp_tokens: number
+  flash_attention?: 'auto' | 'on' | 'off'
+  cache_type_k?: 'f16' | 'q8_0' | 'q4_0'
+  cache_type_v?: 'f16' | 'q8_0' | 'q4_0'
+  batch_size?: number
+  ubatch_size?: number
+  cache_ram_mib?: number
+  context_checkpoints?: number
 }
 
 
@@ -63,6 +70,7 @@ export interface DeploymentFormValues {
   memory_fraction: number
   max_concurrency: number
   max_batched_tokens?: number
+  disable_cuda_graph: boolean
   quantization?: QuantizationMethod
   trust_remote_code: boolean
   generation_defaults: GenerationDefaults
@@ -172,6 +180,13 @@ function normalizeLlamaCppSettings(value: unknown): LlamaCppSettings | null {
     continuous_batching: saved.continuous_batching !== false,
     mtp_enabled: saved.mtp_enabled === true,
     mtp_tokens: finiteNumber(saved.mtp_tokens, 3),
+    flash_attention: (saved.flash_attention ?? 'auto') as LlamaCppSettings['flash_attention'],
+    cache_type_k: (saved.cache_type_k ?? 'f16') as LlamaCppSettings['cache_type_k'],
+    cache_type_v: (saved.cache_type_v ?? 'f16') as LlamaCppSettings['cache_type_v'],
+    batch_size: finiteNumber(saved.batch_size, 2048),
+    ubatch_size: finiteNumber(saved.ubatch_size, 512),
+    cache_ram_mib: finiteNumber(saved.cache_ram_mib, 8192),
+    context_checkpoints: finiteNumber(saved.context_checkpoints, 32),
   }
 }
 
@@ -245,6 +260,8 @@ export function deploymentToFormValues(
       saved.max_batched_tokens
       ?? finiteNumber(commandValue(command, '--max-num-batched-tokens'), 0)
     ) || undefined,
+    disable_cuda_graph: saved.disable_cuda_graph
+      ?? command.includes('--disable-cuda-graph'),
     quantization: saved.quantization
       ?? commandValue(command, '--quantization') as DeploymentFormValues['quantization'],
     trust_remote_code: saved.trust_remote_code ?? command.includes('--trust-remote-code'),

@@ -1015,7 +1015,8 @@ def test_resolve_spec_reuses_base_mount_for_same_root_draft(tmp_path):
     assert captured["volumes"] == {str(host_root): {"bind": "/models", "mode": "ro"}}
 
 
-def test_resolve_spec_uses_embedded_mtp_without_a_draft_mount(tmp_path):
+@pytest.mark.parametrize("runtime", ["vllm", "sglang"])
+def test_resolve_spec_uses_embedded_mtp_without_a_draft_mount(tmp_path, runtime):
     root = tmp_path / "models"
     host_root = Path("/srv/models")
     database = Database(f"sqlite:///{tmp_path / 'embedded-mtp.db'}")
@@ -1033,18 +1034,25 @@ def test_resolve_spec_uses_embedded_mtp_without_a_draft_mount(tmp_path):
         host_model_roots=(host_root,),
         capabilities=StaticRuntimeCapabilities(
             methods=["mtp"],
-            mapping={"mtp": "mtp"},
+            mapping={"mtp": "mtp" if runtime == "vllm" else "NEXTN"},
         ),
+    )
+    service.adapters["sglang"] = SGLangAdapter(
+        allowed_images={"sglang:test"}, model_roots=(root,),
     )
     spec = DeploymentSpec(
         name="Base",
         model_id=base_id,
         model_path="ignored",
         api_model_name="base",
-        runtime="vllm",
-        image="vllm:test",
+        runtime=runtime,
+        image=f"{runtime}:test",
         port=8100,
-        speculative={"method": "mtp", "num_speculative_tokens": 6},
+        speculative=(
+            {"method": "mtp", "num_speculative_tokens": 6}
+            if runtime == "vllm"
+            else {"method": "mtp", "num_steps": 3, "eagle_top_k": 1, "num_draft_tokens": 4}
+        ),
     )
     with database.session_factory() as db:
         resolved = service.resolve_spec(db, spec)
@@ -1058,13 +1066,19 @@ def test_resolve_spec_uses_embedded_mtp_without_a_draft_mount(tmp_path):
     service._run_container(
         type("Client", (), {"containers": containers})(),
         resolved,
-        service.adapter("vllm"),
+        service.adapter(runtime),
         "dgx-base",
     )
 
     command = captured["command"]
-    speculative = json.loads(command[command.index("--speculative-config") + 1])
-    assert speculative == {"method": "mtp", "num_speculative_tokens": 6}
+    if runtime == "vllm":
+        speculative = json.loads(command[command.index("--speculative-config") + 1])
+        assert speculative == {"method": "mtp", "num_speculative_tokens": 6}
+    else:
+        assert command[command.index("--speculative-algorithm") + 1] == "NEXTN"
+        assert command[command.index("--speculative-num-steps") + 1] == "3"
+        assert command[command.index("--speculative-num-draft-tokens") + 1] == "4"
+        assert "--speculative-draft-model-path" not in command
     assert resolved.resolved_draft_model_path is None
     assert captured["volumes"] == {str(host_root): {"bind": "/models", "mode": "ro"}}
 
@@ -2072,7 +2086,12 @@ def test_sglang_dspark_uses_repo_id_cache_root_and_dgx_spark_flags(tmp_path):
         ),
     )
 
+    (Path(spec.model_path) / "config.json").write_text(
+        json.dumps({"layer_types": ["linear_attention", "full_attention"]})
+    )
     command = adapter.command(spec)
+
+    assert command.count("--enable-cache-report") == 1
 
     assert command[command.index("--speculative-algorithm") + 1] == "DSPARK"
     assert command[command.index("--speculative-draft-model-path") + 1] == (
@@ -2433,6 +2452,7 @@ def test_runtime_commands_without_speculative_config_remain_unchanged(tmp_path):
         "8",
         "--weight-loader-prefetch-num-threads",
         "20",
+        "--enable-cache-report",
     ]
 
 
@@ -3012,60 +3032,112 @@ def test_create_handler_keeps_healthy_deployment_when_tps_benchmark_fails(
         assert model.benchmark_tested_at == previous_tested_at.replace(tzinfo=None)
 
 
-def test_tps_benchmark_uses_warmup_and_completion_token_throughput(monkeypatch):
+def _benchmark_stream_client(monkeypatch, frames):
+    import httpx
+
     requests = []
+    clock = [10.0]
+    real_client = httpx.Client
 
-    class Response:
-        def __init__(self, payload):
-            self.payload = payload
+    class Stream(httpx.SyncByteStream):
+        def __iter__(self):
+            for at, frame in frames:
+                clock[0] = at
+                data = frame if isinstance(frame, str) else json.dumps(frame)
+                yield f"data: {data}\n\n".encode()
 
-        def raise_for_status(self):
-            return None
+    def handle(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if not body["stream"]:
+            return httpx.Response(200, json={"usage": {"completion_tokens": 2}})
+        return httpx.Response(200, stream=Stream())
 
-        def json(self):
-            return self.payload
+    monkeypatch.setattr(
+        deployment_service.httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    monkeypatch.setattr(deployment_service.time, "perf_counter", lambda: clock[0])
+    return requests
 
-    class Client:
-        def __init__(self, **_kwargs):
-            return None
 
-        def __enter__(self):
-            return self
+def _benchmark_chunk(content="", tokens=None, finish_reason=None):
+    chunk = {"choices": [{"delta": {"content": content}, "finish_reason": finish_reason}]}
+    if tokens is not None:
+        chunk["usage"] = {"completion_tokens": tokens}
+    return chunk
 
-        def __exit__(self, *_args):
-            return None
 
-        def post(self, path, json):
-            requests.append((path, json))
-            if len(requests) == 1:
-                return Response({"usage": {"completion_tokens": 2}, "choices": [{}]})
-            return Response(
-                {
-                    "usage": {"completion_tokens": 256},
-                    "choices": [{"finish_reason": "length"}],
-                }
-            )
-
-    ticks = iter([10.0, 12.0])
-    monkeypatch.setattr(deployment_service.httpx, "Client", Client)
-    monkeypatch.setattr(deployment_service.time, "perf_counter", lambda: next(ticks))
-
+def test_tps_benchmark_excludes_first_token_wait_and_usage_trailer(monkeypatch):
+    requests = _benchmark_stream_client(monkeypatch, [
+        (70.0, _benchmark_chunk(tokens=0)),
+        (80.0, _benchmark_chunk("1,2", tokens=4)),
+        (82.0, _benchmark_chunk(",3,4", tokens=256)),
+        (85.0, _benchmark_chunk(tokens=256, finish_reason="length")),
+        (90.0, {"choices": [], "usage": {"completion_tokens": 256}}),
+        (95.0, "[DONE]"),
+    ])
     result = deployment_service.run_deployment_tps_benchmark(
         "http://127.0.0.1:8100", "base", "vllm"
     )
-
     assert result == {
         "status": "succeeded",
-        "tps": 128.0,
+        "tps": 126.0,
         "completion_tokens": 256,
         "duration_seconds": 2.0,
+        "measurement": "stream_decode",
+        "decode_tokens": 252,
+        "time_to_first_token_seconds": 70.0,
+        "request_duration_seconds": 85.0,
+        "request_tokens_per_second": 3.012,
         "finish_reason": "length",
         "max_tokens": 256,
     }
     assert len(requests) == 2
-    assert requests[0][1]["max_tokens"] == 16
-    assert requests[1][1]["max_tokens"] == 256
-    assert requests[1][1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert requests[0]["max_tokens"] == 16
+    assert requests[0]["stream"] is False
+    assert "stream_options" not in requests[0]
+    assert requests[1]["max_tokens"] == 256
+    assert requests[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert requests[1]["stream_options"] == {
+        "include_usage": True, "continuous_usage_stats": True,
+    }
+
+
+def test_tps_benchmark_without_continuous_usage_marks_estimate(monkeypatch):
+    requests = _benchmark_stream_client(monkeypatch, [
+        (20.0, _benchmark_chunk()),
+        (30.0, _benchmark_chunk("hello")),
+        (32.0, _benchmark_chunk("world")),
+        (35.0, _benchmark_chunk(tokens=101, finish_reason="length")),
+        (40.0, "[DONE]"),
+    ])
+    result = deployment_service.run_deployment_tps_benchmark(
+        "http://127.0.0.1:8100", "base", "sglang"
+    )
+    assert result["measurement"] == "stream_decode_estimate"
+    assert result["tps"] == 50.0
+    assert result["duration_seconds"] == 2.0
+    assert requests[1]["stream_options"] == {"include_usage": True}
+
+
+@pytest.mark.parametrize(("frames", "message"), [
+    ([(20, _benchmark_chunk("one", 1)), (21, _benchmark_chunk("two", 2))],
+     "did not finish"),
+    ([(20, _benchmark_chunk("one")), (21, _benchmark_chunk("two", finish_reason="stop")),
+      (22, "[DONE]")], "completion_tokens"),
+    ([(20, _benchmark_chunk("all at once", 256, "length")), (21, "[DONE]")],
+     "duration is invalid"),
+    ([(20, {"error": {"message": "request failed"}}), (21, "[DONE]")],
+     "stream returned an error"),
+])
+def test_tps_benchmark_rejects_incomplete_or_unmeasurable_stream(monkeypatch, frames, message):
+    _benchmark_stream_client(monkeypatch, frames)
+    with pytest.raises(RuntimeError, match=message):
+        deployment_service.run_deployment_tps_benchmark(
+            "http://127.0.0.1:8100", "base", "vllm"
+        )
 
 
 @pytest.mark.parametrize("failure_stage", ["cancel", "health", "commit"])
@@ -4708,7 +4780,10 @@ def test_start_action_waits_for_real_runtime_health(tmp_path, monkeypatch):
         assert updated.health == "healthy"
 
 
-def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, monkeypatch):
+@pytest.mark.parametrize("command_changed", [False, True])
+def test_update_handler_replaces_container_and_keeps_deployment_id(
+    tmp_path, monkeypatch, command_changed
+):
     model_root = tmp_path / "models"
     model_path = model_root / "qwen"
     model_path.mkdir(parents=True)
@@ -4808,9 +4883,7 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
         def check_control(self):
             return None
 
-    result = service.update_handler(
-        Context(),
-        {
+    payload = {
             "deployment_id": deployment_id,
             "spec": DeploymentSpec(
                 name="managed",
@@ -4823,8 +4896,16 @@ def test_update_handler_replaces_container_and_keeps_deployment_id(tmp_path, mon
                 port=8100,
                 context_length=8192,
             ).model_dump(),
-        },
-    )
+    }
+    if command_changed:
+        with database.session_factory() as db:
+            saved = db.get(Deployment, deployment_id)
+            requested = DeploymentSpec.model_validate(payload["spec"])
+            saved.config = service.preview(db, requested, exclude_deployment_id=deployment_id)
+            saved.config["command"].append("--obsolete-runtime-default")
+            db.commit()
+            assert service._deployment_matches_spec(saved, requested)
+    result = service.update_handler(Context(), payload)
 
     assert result["deployment_id"] == deployment_id
     assert result["benchmark"]["tps"] == 42.5
@@ -5495,3 +5576,55 @@ def test_launch_contract_cleanup_failure_keeps_committed_replacement(tmp_path):
         updated = db.get(Deployment, deployment_id)
         assert updated.container_id == replacement.id
         assert updated.status == "running" and updated.health == "healthy"
+
+
+def test_minicpm_dspark_low_memory_config_round_trip(tmp_path):
+    adapter = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path / "models",))
+    spec = resolved_speculative_spec(
+        tmp_path, runtime="sglang", method="dspark", runtime_method="DSPARK",
+        draft_container_path="/models/models--openbmb--MiniCPM5-2B-DSpark/snapshots/abc",
+    ).model_copy(update={
+        "context_length": 32768, "max_total_tokens": 32768,
+        "max_concurrency": 5, "disable_cuda_graph": True,
+    })
+    (Path(spec.model_path) / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaForCausalLM"], "torch_dtype": "bfloat16"})
+    )
+    (Path(spec.model_path) / "chat_template.jinja").write_text(
+        '<think><function name="fn"><param name="k">'
+    )
+    restored = ResolvedDeploymentSpec.model_validate_json(spec.model_dump_json())
+    command = adapter.command(restored)
+    assert "--disable-cuda-graph" in command
+    assert command[command.index("--max-total-tokens") + 1] == "32768"
+    assert command[command.index("--max-running-requests") + 1] == "5"
+    assert command[command.index("--dtype") + 1] == "bfloat16"
+    assert command[command.index("--speculative-algorithm") + 1] == "DSPARK"
+    assert "--kv-cache-dtype" not in command
+    assert "--mamba-ssm-dtype" not in command
+
+
+@pytest.mark.parametrize("selected", [True, False])
+def test_sglang_efficientthink_mixed_recipe_is_scoped(tmp_path, selected):
+    name = ("models--nerkyor--Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-"
+            "Grok4.6-GPT5.6Sol-SFT-SimPO-MTP-NVFP4") if selected else "other-model"
+    root = tmp_path / name / "snapshots" / "revision"
+    root.mkdir(parents=True)
+    (root / "config.json").write_text(json.dumps({
+        "quantization_config": {"quant_algo": "MIXED_PRECISION"},
+        "text_config": {"linear_num_value_heads": 48},
+    }))
+    adapter = SGLangAdapter(allowed_images={"sglang:test"}, model_roots=(tmp_path,))
+    command = adapter.command(ResolvedDeploymentSpec(
+        name="test", model_path=str(root), api_model_name="test", runtime="sglang",
+        image="sglang:test", context_length=262144, max_concurrency=5,
+        speculative={"method": "mtp", "num_steps": 3, "eagle_top_k": 1, "num_draft_tokens": 4},
+        speculative_runtime_method="NEXTN",
+    ))
+    assert ("--enable-linear-replayssm-spec" in command) == selected
+    assert ("--quantization" in command) == selected
+    assert command[command.index("--max-mamba-cache-size") + 1] == "25"
+    assert command[command.index("--context-length") + 1] == "262144"
+    if selected:
+        assert command[command.index("--quantization") + 1] == "modelopt_mixed"
+        assert command[command.index("--kv-cache-dtype") + 1] == "bfloat16"

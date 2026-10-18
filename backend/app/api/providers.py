@@ -1,6 +1,6 @@
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
@@ -38,7 +38,11 @@ class ProviderUpdate(BaseModel):
 
 
 @router.get("")
-def list_providers(request: Request, db: DbSession, _: Admin) -> list[dict[str, Any]]:
+def list_providers(
+    request: Request, response: Response, db: DbSession, _: Admin
+) -> list[dict[str, Any]]:
+    if sync := getattr(request.app.state, "magpie_provider_sync", None):
+        response.headers["X-Magpie-Sync"] = "ok" if sync.sync(db) else "unavailable"
     providers = db.scalars(select(Provider).order_by(Provider.name))
     return [request.app.state.provider_service.serialize(item) for item in providers]
 

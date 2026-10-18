@@ -1,265 +1,67 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { ConfigProvider } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
-import userEvent from '@testing-library/user-event'
-import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
 
 import { api } from '../api/client'
-import type { ApiKeyRecord, GatewayStats, UpstreamGateway, UpstreamTestResult } from '../api/types'
+import type { ApiKeyRecord } from '../api/types'
 import { GatewayPage } from './GatewayPage'
 
-
-const stats: GatewayStats = {
-  total_requests: 0,
-  failed_requests: 0,
-  error_rate: 0,
-  average_latency_ms: 0,
-  prompt_tokens: 0,
-  completion_tokens: 0,
-  requests_last_minute: 0,
-  tokens_per_second: 0,
-  throughput_window_seconds: 300,
-  active_requests: 0,
+const existingKey: ApiKeyRecord = {
+  id: 'existing-key',
+  name: '旧客户端',
+  prefix: 'dgx_123',
+  created_at: '2026-10-01T00:00:00Z',
+  last_used_at: '2026-10-17T00:00:00Z',
+  revoked_at: null,
 }
 
-const keys: ApiKeyRecord[] = []
-
-function renderPage(
-  upstream: UpstreamGateway,
-  options: { testResult?: UpstreamTestResult; putImpl?: (path: string, body: unknown) => Promise<unknown> } = {},
-) {
-  vi.spyOn(api, 'get').mockImplementation((path: string) => {
-    if (path === '/api/gateway/upstream') return Promise.resolve(upstream)
-    if (path === '/api/gateway/upstream/models') return Promise.resolve(discoveredModels)
-    if (path === '/api/gateway/stats') return Promise.resolve(stats)
-    return Promise.resolve(keys)
-  })
-  const putSpy = vi.spyOn(api, 'put').mockImplementation(
-    (options.putImpl ?? (() => Promise.resolve(upstream))) as never,
-  )
-  const postSpy = vi
-    .spyOn(api, 'post')
-    .mockResolvedValue((options.testResult ?? { status: 'ok', latency_ms: 0, model_count: 0, detail: null }) as never)
-  const queryClient = new QueryClient({
-    defaultOptions: {
-      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
-      mutations: { retry: false },
-    },
-  })
-  render(
-    <ConfigProvider locale={zhCN}>
-      <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={['/gateway']}>
-          <GatewayPage />
-        </MemoryRouter>
-      </QueryClientProvider>
-    </ConfigProvider>,
-  )
-  return { putSpy, postSpy, user: userEvent.setup() }
+function renderPage(status: 'ok' | 'unavailable' | Error = 'ok') {
+  const getSpy = vi.spyOn(api, 'get').mockImplementation((path) => status instanceof Error ? Promise.reject(status) : Promise.resolve(
+    path === '/api/magpie/status' ? { status, detail: status === 'unavailable' ? '服务暂时离线' : undefined } : [existingKey],
+  ))
+  const deleteSpy = vi.spyOn(api, 'delete').mockResolvedValue(undefined)
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  render(<ConfigProvider locale={zhCN}><QueryClientProvider client={queryClient}><GatewayPage /></QueryClientProvider></ConfigProvider>)
+  return { getSpy, deleteSpy, user: userEvent.setup() }
 }
 
-const unsetUpstream: UpstreamGateway = {
-  base_url: null,
-  api_key_configured: false,
-  source: 'unset',
-  enabled: false,
-  expose_all: true,
-  selected_models: [],
-}
-
-const configuredUpstream: UpstreamGateway = {
-  base_url: 'https://upstream.example/v1',
-  api_key_configured: true,
-  source: 'database',
-  enabled: true,
-  expose_all: true,
-  selected_models: [],
-}
-
-const discoveredModels = {
-  status: 'ok' as const,
-  detail: null,
-  models: [
-    { id: 'gpt-6-astra', exposed: true },
-    { id: 'gpt-5.6-luna', exposed: true },
-  ],
-}
-
-
-describe('GatewayPage upstream section', () => {
-  it('invites configuration when no upstream is set', async () => {
-    renderPage(unsetUpstream)
-
-    expect(await screen.findByText('未配置上游网关')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '配置上游' })).toBeInTheDocument()
+describe('GatewayPage Magpie management', () => {
+  it('embeds the gateway with the existing public API address and a full-page link', async () => {
+    renderPage()
+    const frame = await screen.findByTitle('Magpie API 网关')
+    expect(frame).toHaveAttribute('src', '/magpie/?view=gateway')
+    expect(screen.getByText(`${window.location.origin}/v1`)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '在新窗口打开' })).toHaveAttribute('href', '/magpie/?view=gateway')
+    fireEvent.load(frame)
+    expect(screen.getByText('已连接')).toBeInTheDocument()
+    expect(screen.queryByText('正在加载 Magpie…')).not.toBeInTheDocument()
   })
 
-  it('shows the configured base URL, key state and source', async () => {
-    renderPage(configuredUpstream)
-
-    expect(await screen.findByText('https://upstream.example/v1')).toBeInTheDocument()
-    expect(screen.getByText('已配置')).toBeInTheDocument()
-    expect(screen.getByText('面板配置')).toBeInTheDocument()
+  it('keeps Magpie errors recoverable without removing access-key management', async () => {
+    const { getSpy, user } = renderPage('unavailable')
+    expect(await screen.findByText('服务暂时离线')).toBeInTheDocument()
+    expect(screen.queryByTitle('Magpie API 网关')).not.toBeInTheDocument()
+    getSpy.mockImplementation((path) => Promise.resolve(path === '/api/magpie/status' ? { status: 'ok' } : [existingKey]))
+    await user.click(screen.getByRole('button', { name: /重\s*试/ }))
+    expect(await screen.findByTitle('Magpie API 网关')).toBeInTheDocument()
+    expect(screen.getByText('现有访问密钥')).toBeInTheDocument()
   })
 
-  it('labels environment-sourced configuration', async () => {
-    renderPage({ ...configuredUpstream, source: 'environment' })
-
-    expect(await screen.findByText('环境变量')).toBeInTheDocument()
+  it('shows a failed readiness request instead of a blank frame', async () => {
+    renderPage(new Error('服务连接失败'))
+    expect(await screen.findByText('服务连接失败')).toBeInTheDocument()
+    expect(screen.queryByTitle('Magpie API 网关')).not.toBeInTheDocument()
   })
 
-  it('renders the discovered model count after a successful test', async () => {
-    const { postSpy, user } = renderPage(configuredUpstream, {
-      testResult: { status: 'ok', latency_ms: 128, model_count: 37, detail: null },
-    })
-
-    await user.click(await screen.findByRole('button', { name: /测试连接/ }))
-
-    expect(postSpy).toHaveBeenCalledWith('/api/gateway/upstream/test')
-    expect(await screen.findByText('连接正常 · 发现 37 个模型 · 128 ms')).toBeInTheDocument()
-  })
-
-  it('renders the bounded reason after a failed test', async () => {
-    const { user } = renderPage(configuredUpstream, {
-      testResult: {
-        status: 'unavailable',
-        latency_ms: 12,
-        model_count: 0,
-        detail: 'ConnectError: connection refused',
-      },
-    })
-
-    await user.click(await screen.findByRole('button', { name: /测试连接/ }))
-
-    expect(await screen.findByText('上游网关不可用')).toBeInTheDocument()
-    expect(screen.getByText('ConnectError: connection refused')).toBeInTheDocument()
-  })
-
-  it('disables the test action when no upstream is configured', async () => {
-    renderPage(unsetUpstream)
-
-    expect(await screen.findByRole('button', { name: /测试连接/ })).toBeDisabled()
-  })
-
-  it('rejects a base URL without an http scheme', async () => {
-    const { putSpy, user } = renderPage(unsetUpstream)
-
-    await user.click(await screen.findByRole('button', { name: '配置上游' }))
-    await user.type(await screen.findByLabelText('Base URL'), 'upstream.example/v1')
-    await user.click(screen.getByRole('button', { name: /保\s*存/ }))
-
-    expect(await screen.findByText('地址必须以 http:// 或 https:// 开头')).toBeInTheDocument()
-    expect(putSpy).not.toHaveBeenCalled()
-  })
-
-  it('saves the base URL and omits an empty API key', async () => {
-    const { putSpy, user } = renderPage(
-      unsetUpstream,
-      { putImpl: () => Promise.resolve(configuredUpstream) },
-    )
-
-    await user.click(await screen.findByRole('button', { name: '配置上游' }))
-    await user.type(await screen.findByLabelText('Base URL'), 'https://upstream.example/v1')
-    await user.click(screen.getByRole('button', { name: /保\s*存/ }))
-
-    await waitFor(() => {
-      expect(putSpy).toHaveBeenCalledWith('/api/gateway/upstream', {
-        base_url: 'https://upstream.example/v1',
-      })
-    })
-  })
-
-describe('GatewayPage upstream model exposure', () => {
-  it('offers every discovered model and locks the individual switches in "all" mode', async () => {
-    renderPage(configuredUpstream)
-
-    expect(await screen.findByText('当前提供上游解析出的全部 2 个模型。')).toBeInTheDocument()
-    const switches = await screen.findAllByRole('switch')
-    expect(switches).toHaveLength(2)
-    for (const item of switches) {
-      expect(item).toBeChecked()
-      expect(item).toBeDisabled()
-    }
-  })
-
-  it('enables per-model选择 after switching to "仅提供所选"', async () => {
-    const { user } = renderPage(configuredUpstream)
-
-    await user.click(await screen.findByText('仅提供所选'))
-
-    const target = screen.getByRole('switch', { name: '在本网关提供 gpt-6-astra' })
-    expect(target).toBeEnabled()
-    expect(await screen.findByText('已选择 0 / 2 个模型。')).toBeInTheDocument()
-  })
-
-  it('keeps saving disabled until the selection changes', async () => {
-    const { user } = renderPage(configuredUpstream)
-
-    const saveButton = await screen.findByRole('button', { name: /保\s*存范围/ })
-    expect(saveButton).toBeDisabled()
-
-    await user.click(screen.getByText('仅提供所选'))
-
-    expect(saveButton).toBeEnabled()
-  })
-
-  it('saves the remaining selection after deselecting a model', async () => {
-    const { putSpy, user } = renderPage({
-      ...configuredUpstream,
-      expose_all: false,
-      selected_models: ['gpt-6-astra', 'gpt-5.6-luna'],
-    })
-
-    await user.click(await screen.findByRole('switch', { name: '在本网关提供 gpt-5.6-luna' }))
-    await user.click(screen.getByRole('button', { name: /保\s*存范围/ }))
-
-    await waitFor(() => {
-      expect(putSpy).toHaveBeenCalledWith('/api/gateway/upstream/exposure', {
-        expose_all: false,
-        selected_models: ['gpt-6-astra'],
-      })
-    })
-  })
-
-  it('warns when the selection would expose no model at all', async () => {
-    const { user } = renderPage({
-      ...configuredUpstream,
-      expose_all: false,
-      selected_models: ['gpt-6-astra'],
-    })
-
-    await user.click(await screen.findByRole('switch', { name: '在本网关提供 gpt-6-astra' }))
-
-    expect(await screen.findByText('当前没有选择任何模型')).toBeInTheDocument()
-  })
-
-  it('restores the stored selection for a partially exposed upstream', async () => {
-    renderPage({
-      ...configuredUpstream,
-      expose_all: false,
-      selected_models: ['gpt-6-astra'],
-    })
-
-    expect(await screen.findByText('已选择 1 / 2 个模型。')).toBeInTheDocument()
-    expect(screen.getByRole('switch', { name: '在本网关提供 gpt-6-astra' })).toBeChecked()
-    expect(screen.getByRole('switch', { name: '在本网关提供 gpt-5.6-luna' })).not.toBeChecked()
-    expect(screen.getByText('不提供')).toBeInTheDocument()
-  })
-})
-
-  it('clears the configuration after confirmation', async () => {
-    const { putSpy, user } = renderPage(configuredUpstream, {
-      putImpl: () => Promise.resolve(unsetUpstream),
-    })
-
-    await user.click(await screen.findByRole('button', { name: '修改配置' }))
-    await user.click(await screen.findByRole('button', { name: '清除配置' }))
-    await user.click(await screen.findByRole('button', { name: /确\s*定/ }))
-
-    await waitFor(() => {
-      expect(putSpy).toHaveBeenCalledWith('/api/gateway/upstream', { base_url: null })
-    })
+  it('preserves revocation of existing keys behind explicit confirmation', async () => {
+    const { deleteSpy, user } = renderPage()
+    await user.click(screen.getByText('现有访问密钥'))
+    await user.click(await screen.findByRole('button', { name: /吊\s*销/ }))
+    expect(deleteSpy).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: /确\s*定/ }))
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('/api/keys/existing-key'))
   })
 })

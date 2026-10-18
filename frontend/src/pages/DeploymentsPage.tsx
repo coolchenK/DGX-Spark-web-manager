@@ -72,7 +72,7 @@ import {
   type DeploymentFormValues,
   type SpeculativeSettings,
 } from '../utils/deployments'
-import { formatBytes } from '../utils/format'
+import { formatBytes, formatDate } from '../utils/format'
 
 
 interface DeploymentWizardValues extends DeploymentFormValues {
@@ -80,6 +80,8 @@ interface DeploymentWizardValues extends DeploymentFormValues {
 }
 
 function benchmarkDisplay(item: Deployment) {
+  if (item.runtime === 'viggle') return <Tag>图片生成 · TPS 不适用</Tag>
+  if (item.runtime === 'laya') return <Tag>决策模型 · TPS 不适用</Tag>
   if (item.benchmark_status === 'succeeded' && item.benchmark_tps != null) {
     const details = [
       item.benchmark_completion_tokens != null
@@ -89,7 +91,7 @@ function benchmarkDisplay(item: Deployment) {
         ? `${item.benchmark_duration_seconds.toFixed(3)} 秒`
         : null,
       item.benchmark_tested_at
-        ? new Date(item.benchmark_tested_at).toLocaleString('zh-CN')
+        ? formatDate(item.benchmark_tested_at)
         : null,
     ].filter(Boolean).join(' · ')
     return (
@@ -123,7 +125,7 @@ function memoryDisplay(item: Deployment) {
       ? '未检测到 NVIDIA 推理进程，显示容器内存占用'
       : '实例已停止，当前不占用推理内存'
   const measured = item.memory_measured_at
-    ? ` · ${new Date(item.memory_measured_at).toLocaleString('zh-CN')}`
+    ? ` · ${formatDate(item.memory_measured_at)}`
     : ''
   return (
     <Tooltip title={`${source}${measured}`}>
@@ -141,6 +143,7 @@ const defaultValues: Partial<DeploymentWizardValues> = {
   context_length: 32768,
   memory_fraction: 0.8,
   max_concurrency: 8,
+  disable_cuda_graph: false,
   trust_remote_code: false,
   generation_defaults: {},
   chat_template_kwargs: {},
@@ -744,6 +747,13 @@ export function DeploymentsPage() {
         continuous_batching: deploymentValues.llama_cpp?.continuous_batching !== false,
         mtp_enabled: deploymentValues.llama_cpp?.mtp_enabled === true,
         mtp_tokens: deploymentValues.llama_cpp?.mtp_tokens ?? 3,
+        flash_attention: deploymentValues.llama_cpp?.flash_attention ?? 'auto',
+        cache_type_k: deploymentValues.llama_cpp?.cache_type_k ?? 'f16',
+        cache_type_v: deploymentValues.llama_cpp?.cache_type_v ?? 'f16',
+        batch_size: deploymentValues.llama_cpp?.batch_size ?? 2048,
+        ubatch_size: deploymentValues.llama_cpp?.ubatch_size ?? 512,
+        cache_ram_mib: deploymentValues.llama_cpp?.cache_ram_mib ?? 8192,
+        context_checkpoints: deploymentValues.llama_cpp?.context_checkpoints ?? 32,
       } : null,
       recommendation: provenance,
       resource_warning_acknowledged: deploymentValues.resource_warning_acknowledged === true,
@@ -753,6 +763,9 @@ export function DeploymentsPage() {
     }
     if (runtime !== 'sglang' || result.max_total_tokens === undefined) {
       delete result.max_total_tokens
+    }
+    if (runtime !== 'sglang') {
+      result.disable_cuda_graph = false
     }
     // The backend rejects an empty object here, and "no defaults" is the
     // common case, so send the key only when something is actually set.
@@ -928,9 +941,15 @@ export function DeploymentsPage() {
       const restored = form.getFieldValue('speculative')
       form.setFieldValue('speculative', {
         method: 'mtp',
-        num_speculative_tokens: restored?.method === 'mtp'
-          ? restored.num_speculative_tokens ?? 6
-          : 6,
+        ...(runtime === 'sglang' ? {
+          num_steps: restored?.method === 'mtp' ? restored.num_steps ?? 3 : 3,
+          eagle_top_k: restored?.method === 'mtp' ? restored.eagle_top_k ?? 1 : 1,
+          num_draft_tokens: restored?.method === 'mtp' ? restored.num_draft_tokens ?? 4 : 4,
+        } : {
+          num_speculative_tokens: restored?.method === 'mtp'
+            ? restored.num_speculative_tokens ?? 6
+            : 6,
+        }),
         manual_review_acknowledged: false,
       })
     } else {
@@ -1249,12 +1268,13 @@ export function DeploymentsPage() {
         />
       </Tooltip>
       {item.managed && <>
-        <Tooltip title="编辑部署参数">
+        {!['laya', 'viggle'].includes(item.runtime) && <><Tooltip title="编辑部署参数">
           <Button size={mobile ? 'middle' : 'small'} icon={<EditOutlined />} onClick={() => openFromDeployment(item, 'edit')} aria-label="编辑部署参数" />
         </Tooltip>
         <Tooltip title="克隆部署">
           <Button size={mobile ? 'middle' : 'small'} icon={<CopyOutlined />} onClick={() => openFromDeployment(item, 'clone')} aria-label="克隆部署" />
         </Tooltip>
+        </>}
         <Popconfirm
           title={`卸载服务 ${item.name}`}
           description="将删除服务容器、部署记录和网关路由，但保留模型文件。"

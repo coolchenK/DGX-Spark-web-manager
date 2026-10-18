@@ -38,6 +38,7 @@ def get_settings(request: Request, db: DbSession, _: Admin) -> dict[str, Any]:
         },
         "models": {"roots": [str(path) for path in settings.model_root_paths]},
         "runtimes": {
+            "laya": sorted(settings.laya_images),
             "vllm": sorted(settings.vllm_images),
             "sglang": sorted(settings.sglang_images),
             "llama_cpp": sorted(settings.llama_cpp_images),

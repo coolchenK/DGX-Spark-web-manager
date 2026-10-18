@@ -149,12 +149,23 @@ class LlamaCppAdapter(RuntimeAdapter):
             "--port",
             "8000",
             "--ctx-size",
-            str(spec.context_length),
+            # Panel context_length is per request; llama.cpp divides this pool by slots.
+            str(spec.context_length * spec.max_concurrency),
+            "--no-kv-unified",
             "--gpu-layers",
             str(config.gpu_layers),
             "--parallel",
             str(spec.max_concurrency),
         ]
+        command.extend([
+            "--flash-attn", config.flash_attention,
+            "--cache-type-k", config.cache_type_k,
+            "--cache-type-v", config.cache_type_v,
+            "--batch-size", str(config.batch_size),
+            "--ubatch-size", str(config.ubatch_size),
+            "--cache-ram", str(config.cache_ram_mib),
+            "--ctx-checkpoints", str(config.context_checkpoints),
+        ])
         if mmproj_file is not None:
             command.extend(["--mmproj", str(container_model_root / mmproj_file.name)])
         command.append("--jinja" if config.jinja else "--no-jinja")
@@ -178,8 +189,12 @@ class LlamaCppAdapter(RuntimeAdapter):
                 [
                     "--spec-type",
                     "draft-mtp",
-                    "--spec-draft-model",
-                    container_model,
+                    # Embedded MTP shares the target weights; an external draft path
+                    # would load a second copy of this 27B model.
+                    "--spec-draft-type-k",
+                    config.cache_type_k,
+                    "--spec-draft-type-v",
+                    config.cache_type_v,
                     "--spec-draft-n-max",
                     str(config.mtp_tokens),
                 ]

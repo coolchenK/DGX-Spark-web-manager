@@ -122,6 +122,12 @@ tool-call format and `muse_glimmer` reasoning protocol when the dedicated ARM64 
 Nemotron-H checkpoints additionally receive the official DGX Spark Marlin MoE, FP8 KV cache,
 FlashInfer Mamba, aligned Mamba cache, prefix-cache, `nemotron_v3` reasoning, and `qwen3_coder`
 tool-call settings.
+Gemma4 MoE checkpoints using ModelOpt NVFP4 are accepted only with the patched `-awq` vLLM
+image. The adapter forces the Marlin MoE backend, uses FP8 E4M3 KV cache, enables chunked prefill
+and prefix caching, selects the `gemma4` tool/reasoning parsers, uses host IPC, and mounts
+`gemma4_patched.py` plus `serving_chat_patched.py` from a sibling `supergemma4-patches`
+directory. Preview fails when the image or either patch is missing instead of starting a runtime
+that can silently emit corrupted tokens.
 Deployment-level
 `chat_template_kwargs` can set template defaults such as thinking mode and reasoning effort.
 

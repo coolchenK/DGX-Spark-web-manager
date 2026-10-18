@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     # Upstream OpenAI-compatible gateway used for models this manager does not
     # host. Requests for unknown model routes are forwarded verbatim so a single
     # provider can expose both local and remote models.
+    magpie_enabled: bool = False
+    magpie_web_key: str = ""
+    magpie_gateway_key: str = ""
+    magpie_bridge_key: str = ""
     fallback_base_url: str | None = None
     fallback_api_key: str | None = None
     upstream_models_cache_seconds: int = Field(default=30, ge=5, le=600)
@@ -49,22 +53,30 @@ class Settings(BaseSettings):
     memory_reserve_fraction: float = Field(default=0.10, ge=0.05, le=0.30)
     memory_reserve_min_bytes: int = Field(default=8 * 1024**3, ge=1024**3)
     allowed_vllm_images: str = (
+        "dgx-local/orcarouter-flash-next:v030-spark-20261010,"
+        "vllm/vllm-openai:v0.30.0,"
+        "vllm/vllm-openai:v0.30.0@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90,"
         "vllm/vllm-openai:v0.27.1,vllm/vllm-openai:muse-glimmer,vllm/vllm-openai:latest,"
         "ghcr.io/aeon-7/aeon-vllm-ultimate:latest,"
         "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-07-reasoning-eos,"
         "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-11-v0.29.0-omni,"
+        "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-18-v0.29.0-omni,"
+        "dgx-local/aeon-vllm-ultimate:2026-09-18-dflash2-fix,"
         "dgx-local/aeon-vllm-ultimate:2026-09-11-dflash2-fix,"
         "ghcr.io/lancelind/qwen38-flash-dgx:latest,"
         "dgx-local/qwen38-shinrali-fp8-lmhead:870a7fc,"
         "dgx-local/supergemma4-awq:c4b36f"
     )
     allowed_sglang_images: str = (
+        "dgx-local/sglang-ornith-dflash:0.5.18-cu130-r2,"
         "dgx-local/sglang-qwen38-dflash2:61fa64a,lmsysorg/sglang:qwen38-27b,"
         "sglang-inkling:specforge,"
         "lmsysorg/sglang:dev-cu13-inkling-dspark,"
         "dgx-local/sglang-ssd-stream:5aeffa3-sm121-r3"
     )
     allowed_llama_cpp_images: str = "nvidia/cuda:12.9.0-devel-ubuntu24.04"
+    allowed_laya_images: str = "dgx-local/laya:0.3.4-cu130"
+    allowed_viggle_images: str = "dgx-local/viggle-image:0.2.1-cu130"
     llama_cpp_host_dir: Path = Path("/opt/llamacpp")
     llama_cpp_manager_dir: Path = Path("/llamacpp-runtime")
 
@@ -107,6 +119,14 @@ class Settings(BaseSettings):
     @property
     def sglang_images(self) -> set[str]:
         return self._csv_set(self.allowed_sglang_images)
+
+    @property
+    def laya_images(self) -> set[str]:
+        return self._csv_set(self.allowed_laya_images)
+
+    @property
+    def viggle_images(self) -> set[str]:
+        return self._csv_set(self.allowed_viggle_images)
 
     @property
     def llama_cpp_images(self) -> set[str]:

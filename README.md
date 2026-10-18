@@ -2,23 +2,25 @@
 
 面向 NVIDIA DGX Spark 的中文模型部署与运维面板。在一个界面中查看主机资源、下载 Hugging Face 模型、管理推理容器，并通过统一的 OpenAI 兼容接口连接聊天客户端和开发工具。
 
-项目面向 ARM64 / GB10 环境，支持 **SGLang、vLLM 和 llama.cpp**。管理服务使用 FastAPI、SQLite 和 React 19，界面提供桌面与移动端布局，以及浅色、深色和跟随系统主题。
+本 README 对应 2026-10-19 的源码。项目面向 ARM64 / GB10 环境，支持 **SGLang、vLLM 和 llama.cpp**，并提供专用生图与 Laya 运行时适配。管理服务使用 FastAPI、SQLite 和 React 19，界面提供桌面与移动端布局，以及浅色、深色和跟随系统主题。
 
 ## 功能概览
 
 | 页面 | 主要功能 |
 | --- | --- |
-| 系统概览 | 查看 CPU、统一内存、磁盘、GPU、温度、功耗和驱动状态 |
+| 系统概览 | 查看 CPU、统一内存、磁盘、GPU、温度、功耗和驱动状态；推理服务仅展示运行中的实例 |
 | Hugging Face | 搜索模型、查看兼容性与模型卡、下载文件，支持任务暂停、恢复和取消 |
 | 模型库 | 扫描本地模型与 Hugging Face 缓存，查看模型能力、历史测速结果和删除任务 |
 | 部署实例 | 创建、预览、启动、停止、重启、编辑、克隆和卸载部署，查看日志、内存和 TPS |
-| API 网关 | 管理 API Key、模型路由、OpenAI 兼容请求和调用指标 |
-| 在线 AI 服务 | 配置、测试 OpenAI 兼容的远程 AI 服务，供部署建议和运维诊断使用 |
+| API 网关与 AI 服务 | 在一个 Magpie 界面管理 API Key、服务商、模型路由和调用记录；保留旧访问密钥的查看与吊销 |
+| 图片生成 | 文生图、1–3 张参考图编辑、历史结果与下载，选中满意的结果后进行 Real-ESRGAN / SUPIR 超分 |
 | AI 运维助手 | 根据主机、容器、日志和任务信息诊断问题，生成可审阅的执行计划 |
 | 任务中心 / 日志与审计 | 跟踪持久化任务、执行结果与管理操作 |
 | 系统设置 | 管理 Hugging Face 凭据等系统配置 |
 
-管理器启动时会发现已有推理容器，不会因此重建或重启它们。外部容器标记为非托管实例；只有带有 `com.dgx-spark-manager.managed=true` 标记、由管理器创建的容器，才能通过面板卸载。
+管理器启动时会发现已有推理容器，不会因此重建或重启它们。外部容器标记为非托管实例；卸载外部实例需要确认当前容器名。停止或卸载实例与永久删除模型文件是不同操作。
+
+原“API 网关”和“在线 AI 服务”已合并：导航只保留 **API 网关与 AI 服务**，旧 `/providers` 地址自动跳转到 `/gateway`。日志和任务时间按浏览器本地时区显示。
 
 ## 快速安装
 
@@ -47,7 +49,7 @@ cd DGX-Spark-web-manager
 
 安装脚本会安装 Host Agent、生成或补全 `.env`、创建数据目录、构建管理器镜像、启动服务，并等待 `/api/health` 就绪。首次安装生成随机管理员密码，默认用户名为 `admin`；密码保存在权限为 `0600` 的 `.env` 文件中，脚本不会直接打印密码。
 
-浏览器打开 `http://<DGX-SPARK-IP>:3000`。登录后可以先查看已有模型和部署，再配置下载或创建新实例。
+浏览器打开 `http://<DGX-SPARK-IP>:3000`。登录后可以先查看已有模型和部署，再配置下载或创建新实例。**该脚本只安装管理器与 Host Agent；合并后的网关页面还需要下面的 Magpie 接入配置。** 模型权重、专用推理镜像和生图运行时需要另外准备。
 
 需要复用现有模型目录时，在安装前指定路径：
 
@@ -96,14 +98,53 @@ journalctl --user -u dgx-spark-web-manager.service -n 100 --no-pager
 
 原生安装使用 `.venv-native/`、`data/native.env` 和用户级 `dgx-spark-web-manager.service`，当前脚本将服务绑定到 `0.0.0.0:3000`。与 Compose 安装不同，它不会自动安装 Host Agent；需要主机诊断和执行功能时，另行运行 `install-ops-agent.sh --apply`（需要 root 权限），为服务用户配置 `dgx-spark-ops` 组权限，并在 `data/native.env` 中将 `DGX_OPS_AGENT_KEY_FILE` 指向 `/etc/dgx-spark-manager/ops-agent.key`。组权限变更后需重新建立用户会话。
 
+## 接入 Magpie
+
+Magpie 是独立服务，管理器通过后端代理嵌入其管理页，并把公共 `/v1` 请求连接到它。安装来源和上游说明见 [Magpie 官网](https://usemagpie.ai/zh/) 与 [官方发行页](https://github.com/yetone/magpie-releases)。本仓库包含接入代码，**不包含 Magpie 二进制、安装器或自动更新服务**。
+
+### 服务与凭据
+
+1. 在同一主机安装支持 ARM64 的 Magpie，使用独立服务账户并持久化其配置。当前适配固定连接 API `127.0.0.1:3425`、管理页 `127.0.0.1:3430`，管理器 Compose 已使用主机网络。
+2. 在 Magpie 配置固定的 `MAGPIE_WEB_KEY`（至少 16 个 URL 安全字符），开启网关的局域网共享以接受代理请求；`MAGPIE_TRUST_PROXY` 保持关闭，让 Magpie 验证每个外部 API Key。两个监听端口只需向本机开放，公网入口走管理器。
+3. 在 Magpie 创建专用网关 Key，供旧 Key 兼容转发和运维助手使用；再生成一个独立随机密钥作为本地模型桥接凭据。它们都不是客户端应共用的密钥。
+4. 将下表配置写入管理器 `.env`（原生安装写入 `data/native.env`），重建或重启管理器使配置生效。不要把真实密钥写入 Git。
+
+| 管理器变量 | 配置内容 |
+| --- | --- |
+| `DGX_MAGPIE_ENABLED` | `true` |
+| `DGX_MAGPIE_WEB_KEY` | 与 Magpie 的 `MAGPIE_WEB_KEY` 一致 |
+| `DGX_MAGPIE_GATEWAY_KEY` | 上一步创建的专用 Magpie 网关 Key |
+| `DGX_MAGPIE_BRIDGE_KEY` | 独立随机桥接凭据 |
+| `DGX_FALLBACK_BASE_URL` | `http://127.0.0.1:3425/v1`，用于旧 Key 的上游模型发现 |
+| `DGX_FALLBACK_API_KEY` | 与 `DGX_MAGPIE_GATEWAY_KEY` 一致 |
+
+已通过管理 API 保存的上游配置优先于环境变量；升级旧安装时需同时核对 `/api/gateway/upstream`，详见 [API 文档](docs/API.md)。
+
+### 注册本地模型
+
+在 Magpie 创建 OpenAI 兼容服务商，**服务商 ID 固定为 `dgx-local`**：
+
+| 项目 | 默认端口下的配置 |
+| --- | --- |
+| Base URL | `http://127.0.0.1:3000/_magpie/local/v1` |
+| API Key | `DGX_MAGPIE_BRIDGE_KEY` 的值 |
+| 模型目录 | 从此 Base URL 的 `/models` 拉取，部署启停后刷新 |
+| 模型 ID 显示 | 使用带服务商前缀的 ID，关闭裸模型 ID（`bareModelIDs=false`），避免重复目录 |
+
+管理器监听端口改变时，同步修改桥接 URL。该桥接仅访问本地健康实例，不能指回公共 `/v1`，否则会形成循环转发。当前面板接入不会安装定时刷新任务，目录刷新频率按 Magpie 配置或外部调度决定。
+
+完成后登录面板，进入 **API 网关与 AI 服务**。新增对外 Key 在 Magpie 的网关密钥页面创建；远程厂商 API Key 在 Magpie 服务商页面配置。下方“现有访问密钥”用于查看、吊销旧 `dgx_` Key；旧客户端可以继续使用原地址和 Key。旧 Key 的 Magpie 调用记录归到兼容转发 Key，新的 Magpie Key 可分别统计。
+
+`DGX_MAGPIE_ENABLED=false` 时原生后端网关仍可使用，但合并页面会显示 Magpie 未连接，不会恢复旧的两个管理页面。独立的第三方插件沙箱页面不通过面板管理代理开放。升级 Magpie 后应复核登录、模型目录、创建 / 吊销 Key 和流式调用；其管理页面变动可能需要调整代理适配。
+
 ## 从下载模型到客户端调用
 
-1. **准备模型。** 在“系统设置”保存可选的 Hugging Face Token，然后在“Hugging Face”搜索和下载；也可以扫描已有模型目录。下载和恢复进度在“任务中心”查看。
+1. **准备模型。** 在“系统设置”保存可选的 Hugging Face Token，然后在“Hugging Face”搜索和下载；也可以扫描已有模型目录。aria2 下载最多同时处理 3 个文件、每文件 16 连接，保留分片控制文件以断点续传；实际连接数和速度取决于下载源。下载和恢复进度在“任务中心”查看。
 2. **创建部署。** 从“部署实例”选择模型、运行时和允许使用的镜像。管理器读取模型卡、本地配置、镜像能力和当前资源，给出附带来源与置信度的参数建议。
-3. **选择加速方式。** 如模型与运行时支持，可选择 Draft Model、DSpark、DFlash 或嵌入式 MTP。以对应模型卡和镜像探测结果为依据，各模型不共用一套固定推测参数。
+3. **选择加速方式。** 如模型与运行时支持，可选择 Draft Model、DSpark、DFlash 或嵌入式 MTP。以对应模型卡和镜像探测结果为依据，各模型不共用一套固定推测参数。开启选项不等于已有加速收益，应结合运行时日志和投机接受率验证。
 4. **审阅部署预览。** 核对启动命令、目录挂载、端口、内存估计和能力限制；修改表单后需重新预览。需要复核的候选项和资源提示会要求确认。
 5. **等待健康检查与测速。** 部署任务在服务就绪后预热并测速。测速失败会记录原因，不会仅因此回滚已健康的服务。
-6. **接入客户端。** 在“API 网关”创建 Key，设置客户端 Base URL 为 `http://<DGX-SPARK-IP>:3000/v1`，并从 `/v1/models` 返回结果中选择模型 ID。
+6. **接入客户端。** 在“API 网关与 AI 服务”的 Magpie 中创建 Key，设置客户端 Base URL 为 `http://<DGX-SPARK-IP>:3000/v1`，并从 `/v1/models` 返回结果中选择模型 ID。
 
 主机端口留空时，从 `8000` 起选择最小可用端口，同时检查管理器预留和 Docker 端口绑定。已停止但未卸载的托管实例仍保留端口；克隆实例会分配新的端口。
 
@@ -117,7 +158,9 @@ journalctl --user -u dgx-spark-web-manager.service -n 100 --no-pager
 | vLLM | 工具 / 思考解析器、Draft Model、部分模型的嵌入式 MTP，以及模型相关推测配置 | 镜像版本、模型权重和探测出的参数能力一致 |
 | llama.cpp | GGUF、原生 ARM64/CUDA `llama-server`、上下文与并行槽配置、对应模板和 MTP 参数 | 主机已有兼容的 llama.cpp 运行文件；通用 CUDA 镜像本身不提供模型实现 |
 
-镜像名称必须通过服务端允许列表。带 `dgx-local/` 前缀的镜像是本机构建镜像，安装管理器不会自动构建所有推理镜像。部分构建配方位于 [`deploy/images/`](deploy/images/)，允许列表与默认路径见 [`backend/app/config.py`](backend/app/config.py)。
+另有 `viggle`（Qwen-Image-2.1 Viggle Turbo）和 `laya` 专用适配器，它们使用各自的接口，不是通用聊天运行时。
+
+镜像名称必须通过服务端允许列表。带 `dgx-local/` 前缀的镜像是本机构建镜像，安装管理器不会自动构建所有推理镜像。部分构建配方位于 [`deploy/images/`](deploy/images/)（含 [Laya](deploy/images/laya/README.md)），允许列表与默认路径见 [`backend/app/config.py`](backend/app/config.py)。
 
 ### Qwen3.8、MiniCPM 与推测解码
 
@@ -135,10 +178,13 @@ DGX Spark 的系统与 GPU 共用统一内存。部署时应同时考虑模型�
 | 配置 | 含义 |
 | --- | --- |
 | `context_length` | 配置的上下文长度，不等于运行时一定能分配出的缓存容量 |
-| `max_concurrency` | 最大并发请求数；SGLang 映射为 `--max-running-requests` |
+| `max_concurrency` | 调度并发上限；SGLang 映射为 `--max-running-requests`，不保证每个会话同时使用完整上下文 |
 | `memory_fraction` | 运行时内存比例；SGLang 映射为 `--mem-fraction-static` |
 | `max_total_tokens` | SGLang“运行时总 Token 槽”，用于限制整个实例的 Token 池；当前校验要求不超过 `context_length` |
 | `generation_defaults.max_tokens` | 单次生成的默认输出上限，与上下文长度、实例总缓存容量不同 |
+| `disable_cuda_graph` | SGLang 可关闭 CUDA Graph 来减少捕获开销；可能影响性能，需按模型实测 |
+
+共享 Token 池或显式 KV 预算由多个会话共用；请求输入、工具定义和预留输出均计入上下文。配置 256K / 并发 5 并不代表能够同时容纳五个 256K 请求。部分 Flash Next 专用配置还使用只读 PLE 文件映射和固定 KV 预算，必须与对应镜像及 checkpoint 匹配。
 
 资源估算默认预留总内存的 10%，且至少 8 GiB。**这是部署预检的估算余量，不是操作系统层面的硬隔离。** 降低并发、内存比例或总 Token 槽后，需要通过部署更新让运行时重新分配资源。
 
@@ -146,7 +192,9 @@ DGX Spark 的系统与 GPU 共用统一内存。部署时应同时考虑模型�
 
 ### TPS 测速口径
 
-内置测速先执行短预热，再发送固定的数字序列任务，最多生成 `256` tokens。结果按 **`completion_tokens / 整次测速请求耗时`** 计算，因此包含请求和预填充等开销，不等同于仅统计解码阶段的 tok/s。
+内置测速先执行短预热，再发送固定的**流式**数字序列任务，最多生成 `256` tokens。TPS 按 **`(总输出 tokens − 首块 tokens) / (末块时间 − 首块时间)`** 计算，排除首 token 之前的排队和预填充时间。缺少逐块 usage 时，按首块 1 token 估算，并在任务结果标记 `stream_decode_estimate`；投机解码的大块输出会影响估算精度。
+
+任务结果另外记录首 token 延迟和整次请求吞吐。未结束、缺少 usage 或没有有效解码区间的流不会保存为成功测速。`/v1/models` 中本地模型的 `tokensPerSecond` 是**最近成功测速值，不是实时速度**；Magpie 原生目录是否展示这些扩展字段取决于其版本。
 
 最新成功结果保存到部署和模型资产；卸载部署后，模型库仍可保留该模型的最近成功结果。不同上下文、思考设置、并发量、缓存状态和推测参数会影响读数，内置 TPS 也不代表回答质量评分。
 
@@ -160,16 +208,14 @@ DGX Spark 的系统与 GPU 共用统一内存。部署时应同时考虑模型�
 | `GET /v1/models/{model}` | 获取指定路由的信息 |
 | `POST /v1/chat/completions` | 聊天、工具调用和 SSE 流式响应 |
 | `POST /v1/completions` | 文本补全 |
+| `POST /v1/responses` | Responses 请求，经 Magpie 或本地适配处理 |
 | `POST /v1/embeddings` | 向支持嵌入能力的实例发送请求 |
 
-网关 Key 在创建时返回原文，数据库仅保存哈希；它与 Hugging Face Token、在线 AI 服务密钥分别管理。
+启用 Magpie 后，原生 Magpie Key 使用它的目录和路由，模型 ID 通常为 `dgx-local/<本地路由名>` 或其他服务商前缀。旧 `dgx_` Key 保留管理器的本地上下文、输出上限和测速元数据；与上游合并目录时会去掉同一本地模型的重复前缀条目。以调用 `/v1/models` 实际返回的 ID 为准，不要手工拼接显示名称。新 Key 的权限、配额和模型开放范围在 Magpie 管理。
 
-本机没有的模型可以转发到上游 OpenAI 兼容网关：在「API 网关」页配置 Base URL 与密钥后，
-`/v1/models` 会同时列出上游模型（标记 `dgx_source: upstream`），本机同名路由优先；上游不可用时
-本地模型列表不受影响。未配置上游时，请求未知模型仍返回 404。
+旧网关 Key 创建时只返回一次原文，管理器数据库仅保存哈希；Magpie 原生 Key 由 Magpie 管理。它们与 Hugging Face Token、服务商密钥、内部桥接凭据分别管理。
 
-上游解析出的模型默认全部提供，可以在同一页按「提供全部 / 仅提供所选」切换并逐个开关选择。
-未提供的模型不会出现在 `/v1/models`，调用也返回 404，因此客户端即使知道模型名也无法绕过。请求显式提供的生成参数优先，部署保存的默认值仅填充未提供且运行时支持的字段。
+本地聊天 / 补全请求的 **采样参数以部署保存的默认值为准**：客户端传入的 temperature、top-p、top-k、min-p、重复惩罚等采样字段会被丢弃。客户端的输出上限、stop 和思考选项保留原有处理逻辑；这些字段仍受模型与运行时能力限制。远程模型按对应服务商规则处理。
 
 ### Python 流式调用
 
@@ -206,15 +252,26 @@ print()
 
 ### 工具调用与多模态
 
-工具调用使用 OpenAI `tools` / `tool_calls` 协议。工具实际执行由客户端负责，网关负责路由和协议兼容。流式路径逐事件增量输出，长请求提供 15 秒 SSE 保活，上游读取超时为 30 分钟。
+工具调用使用 OpenAI `tools` / `tool_calls` 协议。工具实际执行由客户端负责，网关负责路由和协议兼容。本地桥接的流式路径提供 15 秒 SSE 保活，读取超时为 30 分钟；Magpie 代理层读取超时为 10 分钟，外部反向代理也可能有自己的限制。
 
 图像和视频需要模型、处理器资产与运行时同时支持。网关接受 OpenAI `image_url`、运行时兼容的 `video_url` 和 data URL，并规范化常见 `input_image` / `input_video` 别名；文本专用路由不会接收媒体请求。可通过 `/v1/models` 的 `input_modalities` 确认已声明能力。
 
 更多调用示例见 [`examples/`](examples/)，管理与推理接口说明见 [`docs/API.md`](docs/API.md)。
 
+## 图片生成与超分
+
+“图片生成”页面对应 `viggle` 运行时。先准备 Qwen-Image-2.1 基础权重、Viggle Turbo v0.2.1 LoRA / 调度器以及兼容的专用镜像，再从“部署实例”启动服务。当前适配固定基础 revision，详见 [`image_schema.py`](backend/app/image_schema.py) 与 [`viggle.py`](backend/app/runtime/viggle.py)。**仓库仅包含面板、请求协议和运行时适配；`/opt/viggle/server.py`、量化编码器、Real-ESRGAN / SUPIR 权重及执行环境需由专用镜像提供，通用管理器镜像无法替代。**
+
+- 文生图支持提示词、1024 / 1536 / 2048 分辨率档、宽高比、自定义尺寸、4 / 6 / 8 步和 seed。
+- 图生图支持上传 1–3 张 PNG / JPEG / WebP，每张最多 16 MiB；编辑使用 1024 或 1536 档。
+- 满意的历史结果可以再执行 Real-ESRGAN 快速超分或 SUPIR-F 细节重建，目标长边为 2048 / 4096；可调分块参数，SUPIR 另有步数、CFG 与约束强度。结果另存，保留原图。
+- 当前队列最多接收 4 个待处理或运行中的图片任务，使用独立任务通道；输入和结果保存于 `data/image-studio/`。
+
+超分依赖对应算法和权重，生成式细节可能改变原图，不能保证无损还原。内存拒绝启动提示来自图片运行时；其模型加载策略和系统余量与管理器的部署预检是两套配置。并存多个模型前要按实际任务测量峰值，单看空闲内存无法保证 4K 超分可运行。
+
 ## AI 运维助手
 
-在“在线 AI 服务”中配置远程 OpenAI 兼容服务的 Base URL、API Key、默认模型和超时。项目的运维工作流面向 DeepSeek 等远程服务，本地推理实例作为诊断对象。连接测试分别检查服务可达性、模型列表与默认模型结构化响应。
+在“API 网关与 AI 服务”的 Magpie 中配置远程服务商。启用 Magpie 后，部署建议与运维助手会同步已启用的聊天模型，调用经 Magpie 转发，不在管理器中额外保存一份厂商密钥。本地 `dgx-local` 服务商不加入这份远程诊断服务列表。连接测试分别检查服务可达性、模型列表与默认模型结构化响应。
 
 运维助手可读取管理器库存、Docker 状态、GPU / 内存、端口、日志、任务和网关指标。涉及主机 Shell 的操作会形成持久化计划，显示具体命令、工作目录、超时、影响和回滚方式，由管理员在面板批准后交给 Host Agent 执行。
 
@@ -243,9 +300,10 @@ Compose 的常用配置位于 `.env`，完整示例见 [`.env.example`](.env.exa
 | `PUID` / `PGID` | 管理器进程用户与用户组 |
 | `DOCKER_GID` / `OPS_AGENT_GID` | Docker socket 和 Host Agent 访问组 |
 | `DGX_DEPLOYMENT_STARTUP_TIMEOUT_SECONDS` | 模型部署启动等待时间，默认 `1200` 秒 |
-| `DGX_FALLBACK_BASE_URL` / `DGX_FALLBACK_API_KEY` | 上游 OpenAI 兼容网关的默认值；通常直接在面板「API 网关」页配置，面板值优先且无需重启容器 |
+| `DGX_MAGPIE_*` | 合并网关页面与本地桥接配置，见上方 Magpie 接入说明 |
+| `DGX_FALLBACK_BASE_URL` / `DGX_FALLBACK_API_KEY` | 旧网关上游默认值；通过管理 API 保存的配置优先 |
 | `DGX_UPSTREAM_MODELS_CACHE_SECONDS` | 上游模型列表缓存时间，默认 `30` 秒 |
-| `DGX_GATEWAY_THROUGHPUT_WINDOW_SECONDS` | API 网关 Token 吞吐的采样窗口，默认 `300` 秒；面板标签会显示该窗口 |
+| `DGX_GATEWAY_THROUGHPUT_WINDOW_SECONDS` | 原生网关统计 API 的 Token 吞吐窗口，默认 `300` 秒；与模型 decode TPS 不是同一指标 |
 
 Compose 数据库位于 `./data/manager.db`，模型文件保存在配置的宿主机目录。其他后端设置见 [`backend/app/config.py`](backend/app/config.py)；新增环境配置时，也需要将其显式传给 Compose 服务，不能仅假定写入 `.env` 就会进入容器。
 
@@ -271,7 +329,7 @@ curl -fsS http://127.0.0.1:3000/api/health
 ./scripts/restore.sh backups/dgx-manager-YYYYMMDDTHHMMSSZ.tar.gz
 ```
 
-Compose 备份通过 SQLite backup API 创建一致性副本，并将副本与 `.env` 打包；不包含模型权重、Docker 镜像和 Host Agent 的密钥或任务数据。恢复脚本会停止管理器、还原数据库与环境文件，再启动服务。
+Compose 备份通过 SQLite backup API 创建一致性副本，并将副本与 `.env` 打包；不包含模型权重、Docker 镜像、图片输入 / 结果、Magpie 配置和 Host Agent 的密钥或任务数据。这些目录和凭据需另行备份，尤其是 `data/image-studio/` 与独立 Magpie 的持久化目录。恢复脚本会停止管理器、还原数据库与环境文件，再启动服务。
 
 原生安装使用独立更新流程，它会先备份 SQLite 数据库：
 
@@ -301,11 +359,15 @@ sudo ./scripts/uninstall-ops-agent.sh --apply
 
 ## 常见问题
 
-**面板能打开，客户端却看不到模型。** `/v1/models` 只发布运行且健康的路由。检查实例状态、启动日志、API Key 和客户端 Base URL 中的 `/v1`，模型 ID 使用接口返回值或配置的路由别名。
+**面板能打开，客户端却看不到模型。** 本地桥接只发布运行且健康的路由；Magpie 原生目录可能还需刷新。检查实例状态、网关 Key 的模型权限、`dgx-local` 的桥接地址和客户端 Base URL 中的 `/v1`，模型 ID 使用接口返回值。
+
+**在哪里创建对外 API Key？** 进入“API 网关与 AI 服务”内的 Magpie 网关密钥管理。页面下方“现有访问密钥”只维护旧 Key；不要向客户端分发内部桥接凭据。
+
+**合并页面提示 Magpie 加载失败。** 先确认独立 Magpie 服务已启动、3425 / 3430 端口可达，管理器启用了 `DGX_MAGPIE_ENABLED` 且 Web Key 一致。单独运行管理器安装脚本不会安装 Magpie。
 
 **上下文设得很大，实际容量较小。** 配置上限、运行时可分配 Token 池和单次输出上限是不同指标。检查 SGLang 启动结果、总 Token 槽和网关公布的有效上下文；增加上限本身不会增加统一内存。
 
-**模型思考或执行工具后不再输出。** 分别检查客户端的工具执行结果、`finish_reason`、实际输出上限及容器日志。模型可能返回正常 `stop` 但没有有效回答，客户端也可能遇到工具命令错误；不能仅凭界面停止判断为 OOM。网关兼容重试有触发条件和次数限制。
+**模型思考或执行工具后不再输出。** 分别检查客户端的工具执行结果、`finish_reason`、实际输出上限及容器日志。模型可能返回正常 `stop` 但没有有效回答，客户端也可能遇到工具命令错误；不能仅凭界面停止判断为 OOM。网关不会通过语义重试自动改写回答。
 
 **删除模型后磁盘仍然占用很多。** 模型文件、Hugging Face 下载缓存、Docker 镜像层、构建缓存和容器日志是不同存储来源。删除模型任务不等于清理全部 Docker 镜像和构建缓存；可先用 `df -h`、`docker system df -v` 及任务结果核对实际占用。
 
@@ -327,7 +389,7 @@ mkdir -p data
 alembic upgrade head
 
 pytest backend/tests -q
-ruff check backend/app backend/tests
+ruff check backend host_agent
 uvicorn app.main:app --app-dir backend --reload --port 3000
 ```
 
@@ -343,7 +405,7 @@ pnpm build
 pnpm dev
 ```
 
-Vite 默认监听 `5173`，将 `/api` 和 `/v1` 代理到 `127.0.0.1:3000`。Docker 和 GPU 相关集成功能需要相应主机环境。
+Vite 默认监听 `5173`，将 `/api` 和 `/v1` 代理到 `127.0.0.1:3000`。调试嵌入式 Magpie 时使用后端提供的构建页面（`pnpm build` 后打开 3000 端口），保证同源认证和代理路径一致。Docker 和 GPU 相关集成功能需要相应主机环境。
 
 ```text
 backend/app/        API、部署服务、运行时适配和网关

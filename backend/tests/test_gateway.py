@@ -1556,6 +1556,7 @@ def test_responses_non_streaming_maps_text_and_usage(client):
                     "prompt_tokens": 11,
                     "completion_tokens": 4,
                     "completion_tokens_details": {"reasoning_tokens": 2},
+                    "prompt_tokens_details": {"cached_tokens": 8},
                 },
             },
         )
@@ -1581,6 +1582,7 @@ def test_responses_non_streaming_maps_text_and_usage(client):
     assert payload["usage"]["input_tokens"] == 11
     assert payload["usage"]["output_tokens"] == 4
     assert payload["usage"]["total_tokens"] == 15
+    assert payload["usage"]["input_tokens_details"]["cached_tokens"] == 8
     assert payload["usage"]["output_tokens_details"]["reasoning_tokens"] == 2
 
     forwarded = json.loads(route.calls[0].request.content)
@@ -1836,7 +1838,8 @@ def test_responses_streams_reasoning_message_and_tool_call_events(client):
         ),
         {
             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-            "usage": {"prompt_tokens": 7, "completion_tokens": 8},
+            "usage": {"prompt_tokens": 7, "completion_tokens": 8,
+                      "prompt_tokens_details": {"cached_tokens": 4}},
         },
     )
     respx.post("http://127.0.0.1:8001/v1/chat/completions").mock(
@@ -1885,6 +1888,7 @@ def test_responses_streams_reasoning_message_and_tool_call_events(client):
     assert kinds == ["reasoning", "message", "function_call"]
     assert completed["response"]["usage"]["input_tokens"] == 7
     assert completed["response"]["usage"]["output_tokens"] == 8
+    assert completed["response"]["usage"]["input_tokens_details"]["cached_tokens"] == 4
 
 
 @respx.mock

@@ -85,9 +85,12 @@ class GatewayActivity:
 
 
 def require_gateway_key(
+    request: Request,
     db: GatewayDb,
     authorization: Annotated[str | None, Header()] = None,
-) -> ApiKey:
+) -> ApiKey | None:
+    if getattr(request.state, "magpie_local_only", False):
+        return None
     if not authorization or not authorization.startswith("Bearer "):
         raise_gateway_auth()
     value = authorization.removeprefix("Bearer ").strip()
@@ -365,6 +368,10 @@ def deployment_context_limits(deployment: Deployment) -> dict[str, int | None]:
     max_output_tokens = defaults.get("max_tokens")
     if not isinstance(max_output_tokens, int) or isinstance(max_output_tokens, bool):
         max_output_tokens = None
+    if deployment.runtime in {"laya", "viggle"}:
+        max_output_tokens = 0
+    if deployment.runtime == "viggle":
+        context_length = configured_context = runtime_capacity = None
     max_input_tokens = (
         max(context_length - max_output_tokens, 0)
         if context_length is not None and max_output_tokens is not None
@@ -407,6 +414,8 @@ def _model_catalog_entry(
         deployment.capabilities if capability_names is None else capability_names
     )
     text_generation = bool(capability_set.intersection({"chat", "completion"}))
+    decision = "decision" in capability_set
+    image_generation = "image_generation" in capability_set
     vision = "image" in capability_set
     video = "video" in capability_set
     modalities = input_modalities(capability_set)
@@ -420,9 +429,20 @@ def _model_catalog_entry(
         "name": deployment.name,
         "display_name": deployment.name,
         "description": f"{deployment.name} via DGX Spark Web Manager",
-        "apiFormat": "openai-chat",
-        "api_format": "openai-chat",
-        "api": "openai-compatible chat/completions",
+        **(
+            {"context_windows": {"english": 512, "multilingual": 1024, "typed-decisions": 1024}}
+            if decision
+            else {}
+        ),
+        "apiFormat": "dgx-image-studio"
+        if image_generation
+        else ("laya-decisions" if decision else "openai-chat"),
+        "api_format": "dgx-image-studio"
+        if image_generation
+        else ("laya-decisions" if decision else "openai-chat"),
+        "api": "/api/images (panel session)"
+        if image_generation
+        else ("laya /v1/decisions" if decision else "openai-compatible chat/completions"),
         "context_length": context_length,
         "contextWindow": context_length,
         "configured_context_length": configured_context_length,
@@ -436,7 +456,15 @@ def _model_catalog_entry(
         },
         "modalities": {
             "input": modalities,
-            "output": (["text", "image"] if "image_generation" in capability_set else ["text"]),
+            "output": (
+                ["image"]
+                if image_generation
+                else ["json"]
+                if decision
+                else ["text", "image"]
+                if "image_generation" in capability_set
+                else ["text"]
+            ),
         },
         "input_modalities": modalities,
         "multimodal_parameters": multimodal_parameters,
@@ -448,9 +476,10 @@ def _model_catalog_entry(
         "attachment": vision or video,
         "tool_call": text_generation,
         "toolCall": text_generation,
-        "structured_output": text_generation,
+        "structured_output": text_generation or decision,
         "reasoning": text_generation,
         "capabilities": {
+            **({"decision": True} if decision else {}),
             "vision": vision,
             "video": video,
             "functionCalling": text_generation,
@@ -686,8 +715,10 @@ async def _merge_upstream_models(
     An unreachable upstream must never break local model discovery, so failures
     only surface through the additive `upstream` status field.
     """
-    config = resolve_upstream_gateway(
-        db, request.app.state.secret_box, request.app.state.settings
+    config = (
+        None
+        if getattr(request.state, "magpie_local_only", False)
+        else resolve_upstream_gateway(db, request.app.state.secret_box, request.app.state.settings)
     )
     if config is None:
         return {"status": "unset", "detail": None}
@@ -701,9 +732,16 @@ async def _merge_upstream_models(
             return {"status": "unavailable", "detail": bounded_probe_detail(exc)}
         cache.set(config.cache_key, models)
 
+    # Magpie's DGX provider points back to these same local deployments.
+    magpie_local_aliases = (
+        {f"dgx-local/{name}" for name in routes}
+        if request.app.state.settings.magpie_enabled
+        and config.base_url.rstrip("/") in {"http://127.0.0.1:3425", "http://127.0.0.1:3425/v1"}
+        else set()
+    )
     for raw in models:
         route_name = raw["id"]
-        if route_name in routes:
+        if route_name in routes or route_name in magpie_local_aliases:
             continue
         if not config.allows_model(route_name):
             # Hidden upstream models are neither advertised nor served.
@@ -807,6 +845,15 @@ async def _dispatch_proxy(
                 f"runtime parameters: {requested}",
                 status_code=400,
             )
+        if select_routed_deployment(db, str(model), "image_generation") is not None:
+            return openai_error("请在面板的图片生成页面调用此模型", status_code=400)
+        if select_routed_deployment(db, str(model), "decision") is not None:
+            return openai_error(
+                "Laya accepts state + questions at /v1/decisions, not chat generation",
+                status_code=400,
+            )
+        if required_capability == "decision":
+            return openai_error("Decision model is unavailable", status_code=404)
         # Not hosted here: forward to the configured upstream gateway.
         return await _proxy_fallback(
             request, db, endpoint, normalized_body, on_finished=on_finished
@@ -870,8 +917,10 @@ async def _proxy_fallback(
     verbatim. `authorization` is supplied by the fallback key when configured,
     otherwise the caller's own bearer token is reused.
     """
-    config = resolve_upstream_gateway(
-        db, request.app.state.secret_box, request.app.state.settings
+    config = (
+        None
+        if getattr(request.state, "magpie_local_only", False)
+        else resolve_upstream_gateway(db, request.app.state.secret_box, request.app.state.settings)
     )
     requested_model = str(body.get("model"))
     if config is None or not config.allows_model(requested_model):
@@ -889,7 +938,16 @@ async def _proxy_fallback(
     forward_headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in {"host", "content-length", "authorization", "accept-encoding"}
+        if key.lower()
+        not in {
+            "host",
+            "content-length",
+            "authorization",
+            "accept-encoding",
+            "cookie",
+            "x-api-key",
+            "x-csrf-token",
+        }
     }
     forward_headers.update(fallback_headers)
     if "authorization" not in forward_headers:
@@ -979,6 +1037,11 @@ async def chat_completions(
 @router.post("/v1/completions")
 async def completions(request: Request, _: GatewayKey, db: GatewayDb):
     return await _proxy("/v1/completions", request, db, "completion")
+
+
+@router.post("/v1/decisions")
+async def decisions(request: Request, _: GatewayKey, db: GatewayDb) -> Any:
+    return await _proxy("/v1/decisions", request, db, "decision")
 
 
 @router.post("/v1/embeddings")

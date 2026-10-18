@@ -105,6 +105,10 @@ def hf_snapshot_is_complete(repository_path: Path, snapshot_path: Path) -> bool:
 
 def infer_runtime(image: str, command: list[str]) -> str | None:
     haystack = " ".join([image, *command]).lower()
+    if "viggle" in haystack:
+        return "viggle"
+    if "laya" in haystack:
+        return "laya"
     if "sglang" in haystack:
         return "sglang"
     if "vllm" in haystack:
@@ -309,6 +313,10 @@ class DiscoveryService:
             return {"health": "unhealthy"}
 
     def _deployment_capabilities(self, db: Session, deployment: Deployment) -> list[str]:
+        if deployment.runtime == "viggle":
+            return ["image_generation", "image_editing", "image"]
+        if deployment.runtime == "laya":
+            return ["decision"]
         model_capabilities: set[str] = set()
         if deployment.model_id:
             model = db.get(ModelAsset, deployment.model_id)

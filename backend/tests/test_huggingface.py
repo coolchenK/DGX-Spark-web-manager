@@ -607,7 +607,10 @@ def test_huggingface_cli_errors_are_sanitized():
     assert result == "Permission denied [REDACTED_HF_TOKEN]"
 
 
-def test_aria2_download_resumes_staging_and_publishes_snapshot(tmp_path, monkeypatch):
+@pytest.mark.parametrize("full_sized_partial", [False, True])
+def test_aria2_download_resumes_staging_and_publishes_snapshot(
+    tmp_path, monkeypatch, full_sized_partial
+):
     cache_dir = tmp_path / "hub"
     service = huggingface.HuggingFaceService(cache_dir, token="hf_test_token")
     monkeypatch.setattr(
@@ -664,13 +667,17 @@ def test_aria2_download_resumes_staging_and_publishes_snapshot(tmp_path, monkeyp
         )
         destination = directory / filename
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if full_sized_partial and filename == "model.safetensors":
+            destination.write_bytes(b"abc")
         chunks = [b"d", b"ef"] if filename == "model.safetensors" else [b"{", b"}"]
         return CompletedProcess(destination, chunks)
 
     monkeypatch.setattr(huggingface.subprocess, "Popen", fake_popen)
     staging = cache_dir / ".dgx-aria2" / "models--org--model" / "abc"
     (staging / "model.safetensors").parent.mkdir(parents=True, exist_ok=True)
-    (staging / "model.safetensors").write_bytes(b"abc")
+    (staging / "model.safetensors").write_bytes(b"abc\x00\x00f" if full_sized_partial else b"abc")
+    if full_sized_partial:
+        (staging / "model.safetensors.aria2").write_bytes(b"missing middle pieces")
     updates = []
 
     class Context:
@@ -686,18 +693,19 @@ def test_aria2_download_resumes_staging_and_publishes_snapshot(tmp_path, monkeyp
     )
 
     assert len(calls) == 2
+    assert all("--max-connection-per-server=16" in command for command in calls)
+    assert all("--split=16" in command for command in calls)
     assert all("--continue=true" in command for command in calls)
     assert all("--always-resume=true" in command for command in calls)
-    assert any(
-        value == "--out=model.safetensors"
-        for value in calls[0]
-    )
+    assert {next(value for value in command if value.startswith("--out="))
+            for command in calls} == {"--out=model.safetensors", "--out=config.json"}
     snapshot = Path(result["local_path"])
     assert (snapshot / "model.safetensors").read_bytes() == b"abcdef"
     assert (snapshot / "config.json").read_bytes() == b"{}"
     assert (cache_dir / "models--org--model" / "refs" / "main").read_text() == "abc"
     assert not staging.exists()
-    assert any(update.get("completed_bytes") == 4 for update in updates)
+    assert any(0 < update.get("completed_bytes", 0) < 8 for update in updates)
+    assert updates[-1]["completed_bytes"] == 8
     assert updates[-1]["progress"] == 100
 
 

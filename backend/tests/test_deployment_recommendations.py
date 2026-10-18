@@ -1753,3 +1753,33 @@ def test_recommendation_endpoint_reports_invalid_provider_selection(
         assert event is not None
         assert event.outcome == "failed"
         assert event.details["provider_used"] is False
+
+
+@pytest.mark.parametrize("runtime", ["vllm", "sglang"])
+@pytest.mark.parametrize("has_head,supported", [(True, True), (True, False), (False, True)])
+def test_embedded_mtp_recommendation_requires_head_and_runtime_support(
+    settings, tmp_path, runtime, has_head, supported
+):
+    database = Database(settings.database_url)
+    database.create_schema()
+    model_path = tmp_path / "native-mtp"
+    model_path.mkdir()
+    add_asset(database, model_path)
+    target = evidence(str(model_path), config={"max_position_embeddings": 262144})
+    target = target.model_copy(update={"embedded_mtp_available": has_head})
+    caps = capabilities(runtime=runtime).model_copy(
+        update={"speculative_methods": ["mtp"] if supported else []}
+    )
+    service = DeploymentRecommendationService(
+        evidence_loader=FakeEvidenceLoader(target),
+        runtime_capability_service=FakeCapabilities(caps),
+        resource_estimator=FakeEstimator(),
+        draft_service=FakeDraftService([]),
+        system_snapshot=lambda: {
+            "memory": {"total_bytes": 128 * GiB, "available_bytes": 100 * GiB}
+        },
+    )
+    with database.session_factory() as db:
+        result = service.recommend(db, "target", runtime, f"{runtime}:test")
+    assert result.embedded_mtp_available == (has_head and supported)
+    database.dispose()
