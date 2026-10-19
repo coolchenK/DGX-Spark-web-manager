@@ -215,6 +215,8 @@ DGX Spark 的系统与 GPU 共用统一内存。部署时应同时考虑模型�
 
 旧网关 Key 创建时只返回一次原文，管理器数据库仅保存哈希；Magpie 原生 Key 由 Magpie 管理。它们与 Hugging Face Token、服务商密钥、内部桥接凭据分别管理。
 
+对于已识别的原生 Flash Next（`Qwen4ExpForConditionalGeneration`）和 Qwen Fixed 模板，本地模型目录公布 `reasoning_levels` / `supported_reasoning_levels` 为 `low / medium / xhigh`；`high` 兼容映射到 `xhigh`。Chat Completions 与 Responses 均保留这些档位，`enable_thinking` 不会把此类模型降为只有开关。Magpie 可用 `magpie model efforts dgx-local/<模型ID> low,medium,xhigh` 保存相同档位；更新后需让客户端重新发现模型。此设置不适用于只有思考开关的模型。
+
 本地聊天 / 补全请求的 **采样参数以部署保存的默认值为准**：客户端传入的 temperature、top-p、top-k、min-p、重复惩罚等采样字段会被丢弃。客户端的输出上限、stop 和思考选项保留原有处理逻辑；这些字段仍受模型与运行时能力限制。远程模型按对应服务商规则处理。
 
 ### Python 流式调用

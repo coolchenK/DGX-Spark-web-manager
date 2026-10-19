@@ -202,6 +202,21 @@ prepared separately; this repository only supplies the panel-side integration.
 
 ## Deployment management
 
+### Reasoning levels
+
+Verified native Flash Next deployments (`chat_template: "model"` with saved
+`Qwen4ExpForConditionalGeneration` compatibility) and the Qwen Fixed profile publish
+`reasoning_levels: ["low", "medium", "xhigh"]` and corresponding
+`supported_reasoning_levels: [{"effort": "low"}, ...]`. A shared route advertises only tiers
+all its members support. Chat Completions (including `chat_template_kwargs`) maps `high`
+to `xhigh`; Responses retains graded effort even when `enable_thinking` is configured.
+Boolean-only models retain their existing on/off behavior. The native Flash Next template
+uses `xhigh` by default; listing capabilities does not change the deployment defaults.
+
+Magpie's independent catalog may need an explicit persistent per-model effort setting.
+After changing it, refresh the client's cached model list. Do not infer effort support merely
+from a model display name or a generic `reasoning: true` flag.
+
 ### Deployment TPS benchmarks
 
 After a newly created deployment passes its runtime health check, the same task sends one warmup

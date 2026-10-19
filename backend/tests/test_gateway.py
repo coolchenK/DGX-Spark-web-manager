@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import respx
 from app.api import gateway
 from app.gateway import proxy as gateway_proxy
@@ -21,6 +22,7 @@ def _create_gateway_key(client):
 def _seed_deployment(
     client,
     *,
+    name="qwen",
     config=None,
     capabilities=None,
     api_model_name="qwen-upstream",
@@ -29,7 +31,7 @@ def _seed_deployment(
 ):
     with client.app.state.database.session_factory() as db:
         deployment = Deployment(
-            name="qwen",
+            name=name,
             runtime=runtime,
             endpoint_url=endpoint_url,
             api_model_name=api_model_name,
@@ -1088,6 +1090,76 @@ def test_gateway_normalizes_max_effort_to_qwen_supported_xhigh(client):
     forwarded = json.loads(route.calls[0].request.content)
     assert forwarded["reasoning_effort"] == "xhigh"
     assert forwarded["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+
+
+def _flash_reasoning_config(profile="model"):
+    return {
+        "spec": {
+            "chat_template": profile,
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+        "compatibility": {"architectures": ["Qwen4ExpForConditionalGeneration"]},
+    }
+
+
+@pytest.mark.parametrize("profile", ["model", "qwen-fixed-v22.4"])
+@pytest.mark.parametrize("transport", ["chat", "template_kwargs", "responses"])
+@respx.mock
+def test_flash_next_preserves_effort_with_thinking_enabled(client, profile, transport):
+    key = _create_gateway_key(client)
+    _seed_deployment(client, runtime="vllm", config=_flash_reasoning_config(profile))
+    route = respx.post("http://127.0.0.1:8001/v1/chat/completions").respond(
+        200, json={"choices": [{"message": {"content": "ok"}}]}
+    )
+    for requested, expected in [
+        ("low", "low"), ("medium", "medium"), ("high", "xhigh"), ("xhigh", "xhigh"),
+    ]:
+        body = {"model": "qwen-upstream"}
+        if transport == "responses":
+            endpoint = "/v1/responses"
+            body.update(input="hi", reasoning={"effort": requested})
+        else:
+            endpoint = "/v1/chat/completions"
+            body["messages"] = [{"role": "user", "content": "hi"}]
+            if transport == "template_kwargs":
+                body["chat_template_kwargs"] = {"reasoning_effort": requested}
+            else:
+                body["reasoning_effort"] = requested
+        response = client.post(endpoint, headers={"Authorization": f"Bearer {key}"}, json=body)
+        assert response.status_code == 200, response.text
+        forwarded = json.loads(route.calls[-1].request.content)
+        assert forwarded["chat_template_kwargs"]["reasoning_effort"] == expected
+        if transport != "template_kwargs":
+            assert forwarded["reasoning_effort"] == expected
+
+
+def test_flash_next_catalog_reports_native_efforts_without_inventing_other_models(client):
+    key = _create_gateway_key(client)
+    _seed_deployment(client, runtime="vllm", config=_flash_reasoning_config())
+    _seed_deployment(
+        client, name="MiniCPM", api_model_name="MiniCPM5-2B",
+        config={"spec": {"chat_template_kwargs": {"enable_thinking": True}}},
+    )
+    headers = {"Authorization": f"Bearer {key}"}
+    models = client.get("/v1/models", headers=headers).json()["data"]
+    flash = next(model for model in models if model["id"] == "qwen-upstream")
+    assert flash["reasoning_levels"] == ["low", "medium", "xhigh"]
+    assert flash["supported_reasoning_levels"] == [
+        {"effort": "low"}, {"effort": "medium"}, {"effort": "xhigh"},
+    ]
+    assert client.get("/v1/models/qwen-upstream", headers=headers).json()[
+        "supported_reasoning_levels"
+    ] == flash["supported_reasoning_levels"]
+    mini = next(model for model in models if model["id"] == "MiniCPM5-2B")
+    assert "supported_reasoning_levels" not in mini
+    # One shared route must not promise tiers an unrelated member cannot implement.
+    _seed_deployment(
+        client, name="other", api_model_name="other-upstream",
+        config={"route_alias": "qwen-upstream", "spec": {"chat_template": "model"}},
+    )
+    shared = client.get("/v1/models/qwen-upstream", headers=headers).json()
+    assert shared["instances"] == 2
+    assert "supported_reasoning_levels" not in shared
 
 
 @respx.mock

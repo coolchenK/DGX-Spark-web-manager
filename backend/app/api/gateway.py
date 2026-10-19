@@ -258,10 +258,27 @@ def requested_multimodal_runtime(body: Mapping[str, Any]) -> str | None:
     return None
 
 
+def deployment_reasoning_levels(deployment: Deployment) -> tuple[str, ...]:
+    config = deployment.config if isinstance(deployment.config, Mapping) else {}
+    spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
+    compatibility = config.get("compatibility")
+    architectures = (
+        compatibility.get("architectures", []) if isinstance(compatibility, Mapping) else []
+    )
+    # The native Flash Next template has graded effort despite its thinking toggle.
+    if spec.get("chat_template") == QWEN_FIXED_CHAT_TEMPLATE_PROFILE or (
+        spec.get("chat_template") == "model"
+        and isinstance(architectures, list)
+        and "Qwen4ExpForConditionalGeneration" in architectures
+    ):
+        return ("low", "medium", "xhigh")
+    return ()
+
+
 def normalize_reasoning_effort(
     body: dict[str, Any],
     *,
-    chat_template: str | None = None,
+    deployment: Deployment,
 ) -> dict[str, Any]:
     """Translate standard reasoning_effort to model-compatible template fields."""
     normalized = dict(body)
@@ -274,7 +291,7 @@ def normalize_reasoning_effort(
             "minimal": "low",
             "off": "none",
         }
-        if chat_template == QWEN_FIXED_CHAT_TEMPLATE_PROFILE
+        if deployment_reasoning_levels(deployment)
         else {"high": "medium"}
     )
 
@@ -632,11 +649,12 @@ async def openai_models(
     # discovery metadata so OpenAI-compatible clients can read context
     # limits and modalities without extra round trips.
     for route in routes.values():
-        deployment = next(
+        members = [
             candidate
             for candidate in deployments
             if deployment_route_name(candidate) == route["id"]
-        )
+        ]
+        deployment = members[0]
         capability_names = list(route["capabilities"])
         route.update(
             _model_catalog_entry(
@@ -696,6 +714,17 @@ async def openai_models(
             "max_concurrency": route["max_concurrency"],
         }
         route["capability_names"] = capability_names
+        levels = deployment_reasoning_levels(deployment)
+        if levels and "chat" in capability_names:
+            common_levels = [
+                level for level in levels
+                if all(level in deployment_reasoning_levels(member) for member in members)
+            ]
+            if common_levels:
+                route["reasoning_levels"] = common_levels
+                route["supported_reasoning_levels"] = [
+                    {"effort": level} for level in common_levels
+                ]
 
     upstream_status = await _merge_upstream_models(request, db, routes)
     return {
@@ -861,11 +890,9 @@ async def _dispatch_proxy(
     adapter = adapter_for_runtime(deployment.runtime)
     normalized_body = adapter.adapt_request(endpoint, normalized_body).body
     defaults, supported = deployment_generation_settings(deployment)
-    config = deployment.config if isinstance(deployment.config, Mapping) else {}
-    spec = config.get("spec") if isinstance(config.get("spec"), Mapping) else {}
     normalized_body = normalize_reasoning_effort(
         normalized_body,
-        chat_template=spec.get("chat_template"),
+        deployment=deployment,
     )
     merged_body, applied = merge_generation_defaults(
         endpoint,
@@ -1133,7 +1160,10 @@ async def _dispatch_responses(
         chat_body, _ = responses_to_chat_request(
             body,
             model=deployment.api_model_name,
-            thinking_toggle=uses_thinking_toggle(spec.get("chat_template_kwargs")),
+            thinking_toggle=(
+                not deployment_reasoning_levels(deployment)
+                and uses_thinking_toggle(spec.get("chat_template_kwargs"))
+            ),
         )
     except ResponsesTranslationError as exc:
         return openai_error(str(exc), status_code=400)
@@ -1145,7 +1175,7 @@ async def _dispatch_responses(
     routing_body = adapter.adapt_request(RESPONSES_ENDPOINT, routing_body).body
     normalized_body = normalize_reasoning_effort(
         routing_body,
-        chat_template=spec.get("chat_template"),
+        deployment=deployment,
     )
 
     upstream_body = {"model": deployment.api_model_name, **normalized_body}
