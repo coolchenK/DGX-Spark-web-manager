@@ -1,4 +1,5 @@
 import httpx
+import pytest
 import respx
 from app.api import gateway
 from app.models import Deployment
@@ -42,6 +43,36 @@ def test_invalid_native_key_is_not_trusted_as_local(client):
         assert (
             client.get("/v1/models", headers={"Authorization": "Bearer wrong"}).status_code == 401
         )
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses"])
+@pytest.mark.parametrize("session_header", [
+    "session_id", "session-id", "X-Session-ID", "X-Magpie-Session",
+    "X-OpenCode-Session", "X-Session-Affinity", "X-Claude-Code-Session-ID",
+    "X-Conversation-ID", "X-DeepSeek-Harness-Session-ID",
+])
+def test_independent_tasks_keep_session_identity_through_magpie(client, endpoint, session_header):
+    enable(client)
+    content = [{"role": "user", "content": "<environment_context>shared</environment_context>"}]
+    body = {
+        "model": "group/tasks",
+        "input" if endpoint.endswith("responses") else "messages": content,
+    }
+    with respx.mock() as mock:
+        route = mock.post("http://127.0.0.1:3425" + endpoint).respond(200, json={"ok": True})
+        for session in ("task-a", "task-b"):
+            response = client.post(endpoint, json=body, headers={
+                "Authorization": "Bearer sk-magpie-key-example",
+                session_header: session,
+                "Cookie": "dgx_session=private",
+                "X-Magpie-Account": "unrequested-account-pin",
+            })
+            assert response.status_code == 200
+    assert [call.request.headers[session_header] for call in route.calls] == ["task-a", "task-b"]
+    assert route.calls[0].request.content == route.calls[1].request.content
+    for call in route.calls:
+        assert "cookie" not in call.request.headers
+        assert "x-magpie-account" not in call.request.headers
 
 
 def test_bridge_requires_secret_and_never_discovers_upstream(client, monkeypatch):
@@ -118,11 +149,16 @@ def test_legacy_inference_is_authenticated_before_magpie(authenticated_client):
         response = client.post(
             "/v1/chat/completions",
             json={"model": "local", "messages": []},
-            headers={"Authorization": "Bearer " + key, "X-API-Key": "wrong"},
+            headers={
+                "Authorization": "Bearer " + key,
+                "X-API-Key": "wrong",
+                "session_id": "legacy-task",
+            },
         )
     assert response.status_code == 200
     assert upstream.calls[0].request.headers["authorization"] == "Bearer sk-magpie-key-internal"
     assert "x-api-key" not in upstream.calls[0].request.headers
+    assert upstream.calls[0].request.headers["session_id"] == "legacy-task"
 
 
 def test_live_local_route_works_before_magpie_catalog_refresh(client):

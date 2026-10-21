@@ -182,6 +182,13 @@ Magpie itself is not installed by the manager's install script.
   existing `dgx_` keys. `/api/gateway/upstream*` remains available for legacy configuration; its
   saved settings take priority over the fallback environment variables.
 
+The public proxy preserves Magpie's recognized session headers, including Codex's `session_id`,
+for native and legacy keys. Distinct tasks can therefore retain distinct routing affinity even
+when their first user message is the same environment description. A fronting Nginx must allow
+underscores (`underscores_in_headers on;` in the relevant server block). This preserves identity;
+spreading new tasks also requires a routing policy such as `rotate`. Setting `stays=turn` alone
+keeps the group's existing selection policy. Cookies and account-pinning headers remain filtered.
+
 ## Image studio
 
 All image studio routes require an administrator session; mutations also require CSRF.

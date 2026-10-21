@@ -22,6 +22,16 @@ FORWARD_HEADERS = {
     "content-type",
     "accept",
     "user-agent",
+    # Magpie otherwise hashes the first user message, shared by some agent tasks.
+    "x-magpie-session",
+    "x-opencode-session",
+    "x-session-affinity",
+    "x-session-id",
+    "session_id",
+    "session-id",
+    "x-claude-code-session-id",
+    "x-conversation-id",
+    "x-deepseek-harness-session-id",
 }
 
 
